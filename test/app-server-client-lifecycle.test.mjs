@@ -240,6 +240,21 @@ test("terminal polling resolves one unobserved replacement turn in an otherwise 
   assert.equal(client.protocolEvents().some((event) => event.method === "turn-id-alias" && event.resolvedTurnId === "server-turn"), true);
 });
 
+test("independent read-only probe resolves a terminal turn when the primary App Server view stays stale", async () => {
+  let probes = 0;
+  const client = clientWithWritableStdin({ fallbackReadTimeoutMs: 30 });
+  client.terminalPollIntervalMs = 1_000;
+  client.independentProbeDelayMs = 1;
+  client.independentThreadRead = async ({ threadId }) => {
+    probes += 1;
+    return { thread: { id: threadId, turns: [{ id: "durable-turn", status: "interrupted", items: [] }] } };
+  };
+  const turn = await client.waitForTurn("thread-1", "requested-turn", 100);
+  assert.deepEqual({ id: turn.id, status: turn.status }, { id: "durable-turn", status: "interrupted" });
+  assert.equal(probes, 1);
+  assert.equal(client.protocolEvents().some((event) => event.method === "turn-id-alias" && event.resolvedTurnId === "durable-turn"), true);
+});
+
 test("thread/read never aliases an unobserved terminal turn when multiple turns exist", async () => {
   const client = clientWithWritableStdin({
     fallbackReadTimeoutMs: 30,

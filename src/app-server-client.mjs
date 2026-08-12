@@ -60,13 +60,15 @@ function safeEvent({ direction, message = {}, extra = {} }) {
 }
 
 export class AppServerClient extends EventEmitter {
-  constructor({ cwd, serviceName = "codex-swarm-router", requestTimeoutMs = 30_000, fallbackReadTimeoutMs = 2_500, terminalPollIntervalMs = 10_000, spawnProcess = spawn, appServerLauncher = appServerInvocation, platform = process.platform, terminate = terminateProcessTree } = {}) {
+  constructor({ cwd, serviceName = "codex-swarm-router", requestTimeoutMs = 30_000, fallbackReadTimeoutMs = 2_500, terminalPollIntervalMs = 10_000, independentProbeDelayMs = 25_000, independentThreadRead = null, spawnProcess = spawn, appServerLauncher = appServerInvocation, platform = process.platform, terminate = terminateProcessTree } = {}) {
     super();
     this.cwd = cwd;
     this.serviceName = serviceName;
     this.requestTimeoutMs = requestTimeoutMs;
     this.fallbackReadTimeoutMs = fallbackReadTimeoutMs;
     this.terminalPollIntervalMs = terminalPollIntervalMs;
+    this.independentProbeDelayMs = independentProbeDelayMs;
+    this.independentThreadRead = independentThreadRead ?? ((args) => this.#readThreadFromIndependentServer(args));
     this.spawnProcess = spawnProcess;
     this.appServerLauncher = appServerLauncher;
     this.platform = platform;
@@ -148,6 +150,31 @@ export class AppServerClient extends EventEmitter {
     return attempt;
   }
 
+  async #readThreadFromIndependentServer({ threadId, timeoutMs = this.fallbackReadTimeoutMs }) {
+    // A real App Server child can occasionally retain a stale turn view while
+    // a newly connected App Server can read the durable terminal state. This
+    // probe never starts a turn; it is one bounded read per awaited turn.
+    const probe = new AppServerClient({
+      cwd: this.cwd,
+      serviceName: `${this.serviceName}-terminal-probe`,
+      requestTimeoutMs: timeoutMs,
+      fallbackReadTimeoutMs: timeoutMs,
+      terminalPollIntervalMs: this.terminalPollIntervalMs,
+      independentProbeDelayMs: 0,
+      independentThreadRead: async () => null,
+      spawnProcess: this.spawnProcess,
+      appServerLauncher: this.appServerLauncher,
+      platform: this.platform,
+      terminate: this.terminate
+    });
+    try {
+      await probe.connect();
+      return await probe.readThread({ threadId, includeTurns: true }, { timeoutMs });
+    } finally {
+      await probe.shutdown();
+    }
+  }
+
   waitForTurn(threadId, turnId, timeoutMs = 600_000) {
     const key = `${threadId}:${turnId}`;
     const completed = this.completedTurns.get(key);
@@ -155,6 +182,7 @@ export class AppServerClient extends EventEmitter {
     return new Promise((resolve, reject) => {
       let settled = false;
       let polling = false;
+      let independentProbeStarted = false;
       const awaited = { requestedTurnId: turnId, observedTurnIds: new Set() };
       this.#registerAwaitedTurn(threadId, awaited);
       const settle = (callback, value) => {
@@ -166,6 +194,7 @@ export class AppServerClient extends EventEmitter {
       const cleanup = () => {
         clearTimeout(timeout);
         clearInterval(poll);
+        clearTimeout(independentProbe);
         this.off("notification", listener);
         this.off("fatal", onFatal);
         this.off("exit", onExit);
@@ -194,6 +223,18 @@ export class AppServerClient extends EventEmitter {
         finally { polling = false; }
       };
       const poll = setInterval(pollTerminal, Math.max(1_000, this.terminalPollIntervalMs));
+      const probeIndependentTerminal = async () => {
+        if (settled || independentProbeStarted || !this.independentThreadRead) return;
+        independentProbeStarted = true;
+        try {
+          const result = await this.independentThreadRead({ threadId, turnId, timeoutMs: this.fallbackReadTimeoutMs });
+          const terminal = this.#terminalTurnFromThread(result, threadId, turnId);
+          if (terminal) settle(resolve, terminal.turn);
+        } catch (error) {
+          this.#record({ direction: "probe", extra: { method: "thread/read-independent", errorMessage: error?.message } });
+        }
+      };
+      const independentProbe = setTimeout(() => { void probeIndependentTerminal(); }, Math.max(1, this.independentProbeDelayMs));
       const timeout = setTimeout(async () => {
         try {
           const fallback = await this.readTerminalTurn(threadId, turnId);
