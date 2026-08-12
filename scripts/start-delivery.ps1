@@ -20,10 +20,6 @@ $blockingDirty = @($dirty | Where-Object {
 })
 if ($blockingDirty) { throw "Refusing to start: commit or stash code/product working-tree changes first.`n$($blockingDirty -join "`n")" }
 
-Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRoot -ArgumentList @(
-  '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScript, '-IntervalMs', $IntervalMs
-)
-
 function Get-DeliveryStatus {
   # Windows PowerShell can promote Node's harmless experimental SQLite warning
   # to NativeCommandError when the launcher uses ErrorActionPreference=Stop.
@@ -45,13 +41,18 @@ if ($LASTEXITCODE -ne 0) { throw "Could not recover stale delivery state" }
 if ($recovery) { Write-Host ($recovery -join "`n") }
 
 $status = Get-DeliveryStatus
+$monitor = Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRoot -PassThru -ArgumentList @(
+  '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScript, '-IntervalMs', $IntervalMs
+)
+if (-not $monitor) { throw 'Could not start the live delivery monitor.' }
+Write-Host "Live monitor started in a separate PowerShell window (PID $($monitor.Id))."
 $terminal = @('completed_merged', 'completed_candidate_ready', 'failed', 'interrupted', 'blocked_budget', 'blocked_quota', 'blocked_credentials', 'blocked_ci', 'blocked_branch_protection', 'conflict_blocked')
 $resumable = @('interrupted', 'blocked_credentials', 'blocked_ci', 'blocked_branch_protection', 'running', 'awaiting_human', 'awaiting_human_remote_handoff')
 $resume = $status.deliveryRun -and ($resumable -contains $status.deliveryRun.state)
 $deliveryArgs = @('src/index.mjs', 'deliver')
 if ($resume) { $deliveryArgs += '--resume' } else { $deliveryArgs += @('--source', $source) }
 
-Write-Host "Live monitor opened in a separate PowerShell window. Main window will print stage and budget progress. Starting autonomous delivery."
+Write-Host "Main window will print stage and budget progress. Starting autonomous delivery."
 & node @deliveryArgs
 $deliveryExitCode = $LASTEXITCODE
 if ($deliveryExitCode -ne 0) { Write-Host "Delivery command ended non-zero; reading persisted final summary before returning." }
