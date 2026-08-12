@@ -63,12 +63,14 @@ function proposalFor(question) {
 function authorizationForQuestion(question, registry, strictClaims = false) {
   const proposal = proposalFor(question);
   const base = { evidenceId: `evidence-policy-${sha256(question.questionId).slice(0, 20)}`, targetKind: "unresolved_question", targetId: question.questionId, affectedRequirementIds: [...question.requiredForRequirementIds].sort() };
-  if (!proposal.policyId && !proposal.version && !proposal.digest && !proposal.value) return { ...base, state: "unresolved", reason: "no_trusted_policy_proposal" };
   if (!registry.valid) return { ...base, state: "unresolved", reason: registry.reason, proposedPolicyId: proposal.policyId };
-  const policy = registry.policies.find((item) => item.policyId === proposal.policyId);
-  if (!policy) return { ...base, state: "unresolved", reason: "policy_not_found", proposedPolicyId: proposal.policyId };
-  if (policy.version !== proposal.version || policy.digest !== proposal.digest || policy.resolvedValue !== proposal.value) return { ...base, state: "unresolved", reason: "policy_claim_mismatch", proposedPolicyId: proposal.policyId };
-  if (!policy.scope.questionIds.includes(question.questionId) || !sameIds(policy.affectedRequirementIds, question.requiredForRequirementIds) || (strictClaims && (!sameIds(policy.scope.claimIds, question.sourceClaimIds)))) return { ...base, state: "unresolved", reason: "policy_scope_mismatch", proposedPolicyId: proposal.policyId };
+  const scopeMatches = (policy) => policy.scope.questionIds.includes(question.questionId) && sameIds(policy.affectedRequirementIds, question.requiredForRequirementIds) && (!strictClaims || sameIds(policy.scope.claimIds, question.sourceClaimIds));
+  const hasProposal = Boolean(proposal.policyId || proposal.version || proposal.digest || proposal.value);
+  const matches = registry.policies.filter(scopeMatches);
+  const policy = hasProposal ? registry.policies.find((item) => item.policyId === proposal.policyId) : matches.length === 1 ? matches[0] : null;
+  if (!policy) return { ...base, state: "unresolved", reason: hasProposal ? "policy_not_found" : matches.length ? "policy_scope_ambiguous" : "no_trusted_policy_match", proposedPolicyId: proposal.policyId };
+  if (hasProposal && (policy.version !== proposal.version || policy.digest !== proposal.digest || policy.resolvedValue !== proposal.value)) return { ...base, state: "unresolved", reason: "policy_claim_mismatch", proposedPolicyId: proposal.policyId };
+  if (!scopeMatches(policy)) return { ...base, state: "unresolved", reason: "policy_scope_mismatch", proposedPolicyId: proposal.policyId };
   return { ...base, state: "resolved_by_policy", reason: "trusted_policy_match", policyId: policy.policyId, policyVersion: policy.version, policyDigest: policy.digest, claimIds: question.sourceClaimIds ?? [], resolvedValue: policy.resolvedValue, registryDigest: registry.digest };
 }
 export function validateProductBlueprint(value, { sourceDocuments = null, sourceResolver = null, sourceClaimManifest = null } = {}) {

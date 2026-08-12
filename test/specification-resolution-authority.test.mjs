@@ -57,6 +57,12 @@ test("a valid trusted policy resolution is scoped and produces controller ADR/ev
   assert.deepEqual(specificationBlockers(resolved), []); assert.equal(resolved.unresolvedQuestions[0].status, "resolved_by_policy"); assert.equal(resolved.resolutionAuthority.records[0].registryDigest.length, 64); assert.match(resolved.decisions[0].rationale, /^Controller-authorized policy region-default@2026\.1$/);
 });
 
+test("one exact controller policy resolves a declared question even without an agent proposal", () => {
+  const policy = trustedPolicy();
+  const resolved = authorize(claims({ unresolvedQuestions: [{ questionId: "region-choice", description: "Deployment region is absent.", requiredForRequirementIds: ["req-must"] }] }), { schemaVersion: 1, policies: [policy] });
+  assert.deepEqual(specificationBlockers(resolved), []); assert.equal(resolved.unresolvedQuestions[0].status, "resolved_by_policy"); assert.equal(resolved.resolutionAuthority.records[0].policyId, policy.policyId);
+});
+
 test("wrong policy identity, digest, version, value, affected requirements, or scope fails closed", () => {
   const cases = [
     ["id", (policy) => proposedQuestion(policy, { proposedPolicyId: "other-policy" }), policy => policy],
