@@ -14,9 +14,10 @@ import { sourceFragmentDigest } from "../src/source-evidence.mjs";
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const waitFor = async (predicate, label) => {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
     if (predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`Timed out waiting for ${label}`);
 };

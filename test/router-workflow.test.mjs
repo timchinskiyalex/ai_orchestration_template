@@ -26,6 +26,8 @@ test("project workflow refuses to queue Planner without a persisted ProductBluep
   try {
     const bootstrap = router.startProject();
     assert.equal(bootstrap.role, "bootstrap");
+    assert.match(bootstrap.prompt, /sourceClaimIds and sourceRefs are an immutable pair/);
+    assert.match(bootstrap.prompt, /copy every sourceRefs object.*verbatim/);
     router.store.transition(bootstrap.id, "preparing");
     router.store.transition(bootstrap.id, "running");
     router.store.transition(bootstrap.id, "awaiting_human");

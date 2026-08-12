@@ -473,7 +473,7 @@ export class SwarmRouter extends EventEmitter {
     return this.enqueue({
       role: "bootstrap",
       title: `Bootstrap ${this.config.project.name}`,
-      prompt: `Read ${this.config.project.documentationDir}/inventory.json, ${this.config.project.documentationDir}/source-claims.json, and the Markdown files the inventory lists. Produce the required structured blueprint for project '${this.config.project.name}'. Every declaration claim must have an explicit sourceClaimIds disposition.`,
+      prompt: `Read ${this.config.project.documentationDir}/inventory.json, ${this.config.project.documentationDir}/source-claims.json, and the Markdown files the inventory lists. Produce the required structured blueprint for project '${this.config.project.name}'. Every declaration claim must have exactly one explicit sourceClaimIds disposition. For every requirement, sourceClaimIds and sourceRefs are an immutable pair: choose its declaration claim IDs, then copy every sourceRefs object from exactly those claims verbatim (same documentId, startLine, endLine, and excerptDigest); do not cite a subrange, superset, paraphrased reference, or unclaimed source reference. A mandatory claim must be closed by one mandatory requirement with acceptance criteria, or explicitly represented as an unresolved question or contradiction when the specification genuinely cannot be resolved.`,
     });
   }
 
