@@ -95,9 +95,42 @@ foreach ($stage in $plan.stages) {
   )
   if ($child.ExitCode -ne 0) { throw "Stage $($stage.id) failed. The pipeline stopped; inspect $logPath." }
 
-  Invoke-Checked 'Running npm test' { npm.cmd test }
-  Invoke-Checked 'Running App Server schema preflight' { npm.cmd run test:app-server-schema }
-  Invoke-Checked 'Checking Git diff' { git -C $projectRoot diff --check }
+  $verificationFailed = $null
+  try {
+    Invoke-Checked 'Running npm test' { npm.cmd test }
+    Invoke-Checked 'Running App Server schema preflight' { npm.cmd run test:app-server-schema }
+    Invoke-Checked 'Checking Git diff' { git -C $projectRoot diff --check }
+  } catch {
+    $verificationFailed = $_.Exception.Message
+  }
+  if ($verificationFailed) {
+    # One bounded corrective pass prevents an implementation agent's focused
+    # tests from silently missing a full-suite regression. A second failure is
+    # surfaced rather than retried indefinitely.
+    $repairPromptPath = Join-Path $runtimeRoot ("$($stage.id).verification-repair.md")
+    @"
+# Verification repair — $($stage.id)
+
+Work only in `$projectRoot` on `main`. The prior implementation for this stage is uncommitted. Do not commit, push, create a PR, run live quota-spending E2E, remove runtime/generated files, or modify `docs/PROMPT_AUTONOMOUS_DELIVERY_LOOP.md`.
+
+The required full deterministic verification failed after the stage implementation: $verificationFailed
+
+Inspect the current uncommitted diff and failing tests. Repair the defect without discarding the original stage requirements from:
+`$promptPath`
+
+Run the affected focused tests. The controller will rerun the complete verification once. Report changed files and exact results.
+"@ | Set-Content -LiteralPath $repairPromptPath -Encoding utf8
+    $repairLogPath = Join-Path $runtimeRoot ("$($stage.id).verification-repair.log")
+    $repairCommand = "& $(& $quote $stageScript) -PromptPath $(& $quote $repairPromptPath) -StageId $(& $quote "$($stage.id)-verification-repair") -LogPath $(& $quote $repairLogPath)"
+    Write-Host "[remediation] Full verification failed; starting one corrective Codex pass for $($stage.id)."
+    $repairChild = Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRoot -PassThru -Wait -ArgumentList @(
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $repairCommand
+    )
+    if ($repairChild.ExitCode -ne 0) { throw "Stage $($stage.id) and its corrective pass failed. Inspect $repairLogPath." }
+    Invoke-Checked 'Re-running npm test after corrective pass' { npm.cmd test }
+    Invoke-Checked 'Re-running App Server schema preflight after corrective pass' { npm.cmd run test:app-server-schema }
+    Invoke-Checked 'Re-checking Git diff after corrective pass' { git -C $projectRoot diff --check }
+  }
 
   $changes = Get-ChangedPaths
   $newChanges = @($changes | Where-Object { $preexisting -notcontains $_ })
