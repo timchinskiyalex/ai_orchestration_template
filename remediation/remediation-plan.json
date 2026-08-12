@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "repository": "ai_orchestration_template",
+  "stages": [
+    {
+      "id": "01-fanin-topology",
+      "prompt": "remediation/prompts/01-fanin-topology.md",
+      "commitMessage": "fix: close fan-in topology deadlock"
+    },
+    {
+      "id": "02-product-evidence",
+      "prompt": "remediation/prompts/02-product-evidence.md",
+      "commitMessage": "feat: add production product evidence executor"
+    },
+    {
+      "id": "03-source-claim-extraction",
+      "prompt": "remediation/prompts/03-source-claim-extraction.md",
+      "commitMessage": "feat: generate source claims from raw documentation"
+    },
+    {
+      "id": "04-source-claim-audit",
+      "prompt": "remediation/prompts/04-source-claim-audit.md",
+      "commitMessage": "feat: audit generated source claim manifests"
+    },
+    {
+      "id": "05-project-mode-contract",
+      "prompt": "remediation/prompts/05-project-mode-contract.md",
+      "commitMessage": "fix: separate greenfield and brownfield delivery"
+    },
+    {
+      "id": "06-iterative-waves",
+      "prompt": "remediation/prompts/06-iterative-waves.md",
+      "commitMessage": "feat: reconcile iterative execution waves"
+    },
+    {
+      "id": "07-stack-adapters",
+      "prompt": "remediation/prompts/07-stack-adapters.md",
+      "commitMessage": "feat: add blueprint-driven stack adapters"
+    },
+    {
+      "id": "08-final-acceptance-audit",
+      "prompt": "remediation/prompts/08-final-acceptance-audit.md",
+      "commitMessage": "test: prove autonomous remediation acceptance"
+    }
+  ]
+}

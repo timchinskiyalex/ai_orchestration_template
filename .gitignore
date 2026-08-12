@@ -1,5 +1,6 @@
 runtime/
 runtime/e2e-runs/
+runtime/remediation-pipeline/
 config/swarm.config.json
 *.sqlite
 *.sqlite-shm
