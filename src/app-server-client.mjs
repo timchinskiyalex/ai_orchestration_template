@@ -60,12 +60,13 @@ function safeEvent({ direction, message = {}, extra = {} }) {
 }
 
 export class AppServerClient extends EventEmitter {
-  constructor({ cwd, serviceName = "codex-swarm-router", requestTimeoutMs = 30_000, fallbackReadTimeoutMs = 2_500, spawnProcess = spawn, appServerLauncher = appServerInvocation, platform = process.platform, terminate = terminateProcessTree } = {}) {
+  constructor({ cwd, serviceName = "codex-swarm-router", requestTimeoutMs = 30_000, fallbackReadTimeoutMs = 2_500, terminalPollIntervalMs = 10_000, spawnProcess = spawn, appServerLauncher = appServerInvocation, platform = process.platform, terminate = terminateProcessTree } = {}) {
     super();
     this.cwd = cwd;
     this.serviceName = serviceName;
     this.requestTimeoutMs = requestTimeoutMs;
     this.fallbackReadTimeoutMs = fallbackReadTimeoutMs;
+    this.terminalPollIntervalMs = terminalPollIntervalMs;
     this.spawnProcess = spawnProcess;
     this.appServerLauncher = appServerLauncher;
     this.platform = platform;
@@ -140,6 +141,10 @@ export class AppServerClient extends EventEmitter {
       } };
     });
     this.terminalReadAttempts.set(key, attempt);
+    attempt.then(
+      (result) => { if (!result.terminal && this.terminalReadAttempts.get(key) === attempt) this.terminalReadAttempts.delete(key); },
+      () => { if (this.terminalReadAttempts.get(key) === attempt) this.terminalReadAttempts.delete(key); }
+    );
     return attempt;
   }
 
@@ -149,6 +154,7 @@ export class AppServerClient extends EventEmitter {
     if (completed) return Promise.resolve(completed);
     return new Promise((resolve, reject) => {
       let settled = false;
+      let polling = false;
       const awaited = { requestedTurnId: turnId, observedTurnIds: new Set() };
       this.#registerAwaitedTurn(threadId, awaited);
       const settle = (callback, value) => {
@@ -159,6 +165,7 @@ export class AppServerClient extends EventEmitter {
       };
       const cleanup = () => {
         clearTimeout(timeout);
+        clearInterval(poll);
         this.off("notification", listener);
         this.off("fatal", onFatal);
         this.off("exit", onExit);
@@ -177,6 +184,16 @@ export class AppServerClient extends EventEmitter {
       };
       const onFatal = (error) => settle(reject, error);
       const onExit = ({ code, signal }) => settle(reject, new Error(`App Server exited during turn ${turnId} (code: ${code}, signal: ${signal})`));
+      const pollTerminal = async () => {
+        if (settled || polling) return;
+        polling = true;
+        try {
+          const fallback = await this.readTerminalTurn(threadId, turnId);
+          if (fallback.terminal) settle(resolve, fallback.terminal);
+        } catch {}
+        finally { polling = false; }
+      };
+      const poll = setInterval(pollTerminal, Math.max(1_000, this.terminalPollIntervalMs));
       const timeout = setTimeout(async () => {
         try {
           const fallback = await this.readTerminalTurn(threadId, turnId);
@@ -303,10 +320,16 @@ export class AppServerClient extends EventEmitter {
     if (active.requestedTurnId !== requestedTurnId) return null;
     const turns = result?.thread?.turns ?? result?.turns ?? [];
     const candidate = turns.find((turn) => TERMINAL_TURN_STATUSES.has(turn?.status) && this.#allowsAlias(threadId, active, turn.id));
-    if (!candidate) return null;
-    this.#recordTurnAlias(threadId, requestedTurnId, candidate.id);
-    this.completedTurns.set(`${threadId}:${requestedTurnId}`, candidate);
-    return { threadId: result?.thread?.id ?? threadId, turn: candidate };
+    if (candidate) {
+      this.#recordTurnAlias(threadId, requestedTurnId, candidate.id);
+      this.completedTurns.set(`${threadId}:${requestedTurnId}`, candidate);
+      return { threadId: result?.thread?.id ?? threadId, turn: candidate };
+    }
+    const onlyTurn = turns.length === 1 && TERMINAL_TURN_STATUSES.has(turns[0]?.status) ? turns[0] : null;
+    if (!onlyTurn) return null;
+    this.#recordTurnAlias(threadId, requestedTurnId, onlyTurn.id);
+    this.completedTurns.set(`${threadId}:${requestedTurnId}`, onlyTurn);
+    return { threadId: result?.thread?.id ?? threadId, turn: onlyTurn };
   }
 
   #recordTurnAlias(threadId, requestedTurnId, resolvedTurnId) {

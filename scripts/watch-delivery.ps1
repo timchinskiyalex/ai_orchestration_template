@@ -31,6 +31,20 @@ function Show-Snapshot {
   Write-Host ('Concurrency: {0} active turn(s): {1}' -f $Snapshot.realConcurrency, @($Snapshot.activeTurns).Count)
   Write-Host ''
 
+  Write-Host 'CONTROLLER / TURN HEALTH' -ForegroundColor Cyan
+  $now = [DateTimeOffset]::UtcNow
+  $heartbeatAge = if ($run -and $run.heartbeatAt) { [math]::Round(($now - [DateTimeOffset]::Parse($run.heartbeatAt)).TotalSeconds) } else { $null }
+  Write-Host ('Controller heartbeat: {0} ({1})' -f $(if ($run) { $run.heartbeatAt } else { 'none' }), $(if ($null -ne $heartbeatAge) { "$heartbeatAge sec ago" } else { 'not running' }))
+  $activeTaskIds = @($Snapshot.activeTurns | ForEach-Object { $_.taskId })
+  $turnEvents = @($Snapshot.lifecycle | Where-Object { $activeTaskIds -contains $_.taskId })
+  $lastTurnEvent = @($turnEvents | Select-Object -Last 1)[0]
+  if ($lastTurnEvent) {
+    $eventAge = [math]::Round(($now - [DateTimeOffset]::Parse($lastTurnEvent.createdAt)).TotalSeconds)
+    Write-Host ('Last active-turn event: {0} at {1} ({2} sec ago)' -f $lastTurnEvent.type, $lastTurnEvent.createdAt, $eventAge)
+    if ($state -eq 'running' -and $eventAge -gt 20) { Write-Host ('No App Server activity observed for {0} sec. The controller will reconcile a terminal turn through thread/read polling.' -f $eventAge) -ForegroundColor Yellow }
+  } else { Write-Host 'Last active-turn event: none' -ForegroundColor Yellow }
+  Write-Host ''
+
   Write-Host 'LOCAL TOKEN BUDGET' -ForegroundColor Cyan
   Write-Host ('Actual: {0:N0} | Reserved: {1:N0} | Remaining: {2:N0} / {3:N0} ({4:N1}% used)' -f $budget.usedTokens, $budget.reservedTokens, $budget.remainingTokens, $budget.weeklyTokenLimit, $budget.usedPercent)
   Write-Host ('Forecast: P50 {0:N0} | P90 {1:N0} | samples: {2}' -f $forecast.p50Tokens, $forecast.p90Tokens, $forecast.sampleSize)

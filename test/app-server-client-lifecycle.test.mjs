@@ -226,6 +226,33 @@ test("thread/read fallback resolves an observed terminal turn alias", async () =
   assert.equal((await waiting).id, "resolved-B");
 });
 
+test("terminal polling resolves one unobserved replacement turn in an otherwise empty thread", async () => {
+  const client = clientWithWritableStdin({
+    fallbackReadTimeoutMs: 30,
+    onWrite(message, instance) {
+      if (message.method !== "thread/read") return;
+      setImmediate(() => instance.ingestProtocolMessage({ id: message.id, result: { thread: { id: "thread-1", turns: [{ id: "server-turn", status: "interrupted", items: [] }] } } }));
+    }
+  });
+  client.terminalPollIntervalMs = 1;
+  const turn = await client.waitForTurn("thread-1", "requested-turn", 100);
+  assert.deepEqual({ id: turn.id, status: turn.status }, { id: "server-turn", status: "interrupted" });
+  assert.equal(client.protocolEvents().some((event) => event.method === "turn-id-alias" && event.resolvedTurnId === "server-turn"), true);
+});
+
+test("thread/read never aliases an unobserved terminal turn when multiple turns exist", async () => {
+  const client = clientWithWritableStdin({
+    fallbackReadTimeoutMs: 30,
+    onWrite(message, instance) {
+      if (message.method !== "thread/read") return;
+      setImmediate(() => instance.ingestProtocolMessage({ id: message.id, result: { thread: { id: "thread-1", turns: [{ id: "older-turn", status: "completed", items: [] }, { id: "other-turn", status: "interrupted", items: [] }] } } }));
+    }
+  });
+  client.terminalPollIntervalMs = 1_000;
+  await assert.rejects(client.waitForTurn("thread-1", "requested-turn", 5), /found no terminal turn/);
+  assert.equal(client.protocolEvents().some((event) => event.method === "turn-id-alias"), false);
+});
+
 test("Router result extraction uses the resolved turn ID", () => {
   const response = { thread: { turns: [
     { id: "requested-A", items: [] },
