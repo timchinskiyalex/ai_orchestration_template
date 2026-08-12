@@ -19,19 +19,26 @@ if (-not (Test-Path -LiteralPath $PromptPath -PathType Leaf)) { throw "Prompt is
 $logDirectory = Split-Path -Parent $LogPath
 New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
 $prompt = Get-Content -LiteralPath $PromptPath -Raw -Encoding utf8
+$stderrPath = "$LogPath.stderr"
 Write-Host "[remediation] Codex stage $StageId started. Output is also saved to $LogPath"
 
-$previousErrorActionPreference = $ErrorActionPreference
-$ErrorActionPreference = 'Continue'
 try {
   $prompt | & $codex.Source exec `
     --dangerously-bypass-approvals-and-sandbox `
     --cd $projectRoot `
     --output-last-message "$LogPath.final.txt" `
-    --color always 2>&1 | Tee-Object -LiteralPath $LogPath
+    --color always 2>$stderrPath | Tee-Object -LiteralPath $LogPath
   $exitCode = $LASTEXITCODE
-} finally {
-  $ErrorActionPreference = $previousErrorActionPreference
+}
+finally {
+  # Codex writes informational progress (for example, stdin intake) to stderr.
+  # Keep it in the stage log without allowing PowerShell to turn it into a
+  # NativeCommandError that masks the process's actual exit code.
+  if (Test-Path -LiteralPath $stderrPath) {
+    Add-Content -LiteralPath $LogPath -Value "`n--- Codex stderr ---" -Encoding utf8
+    Get-Content -LiteralPath $stderrPath -Encoding utf8 | Add-Content -LiteralPath $LogPath -Encoding utf8
+    Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+  }
 }
 
 if ($exitCode -ne 0) { throw "Codex stage '$StageId' exited with code $exitCode. See $LogPath" }
