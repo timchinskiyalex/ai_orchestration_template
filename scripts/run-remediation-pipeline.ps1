@@ -46,6 +46,18 @@ function Save-State($State) {
   $State.updatedAt = (Get-Date).ToUniversalTime().ToString('o')
   $State | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $statePath -Encoding utf8
 }
+function Wait-ForStageProcess($Process, [string]$StageId) {
+  $startedAt = Get-Date
+  while (-not $Process.HasExited) {
+    Start-Sleep -Seconds 15
+    $Process.Refresh()
+    if (-not $Process.HasExited) {
+      $elapsed = [math]::Floor(((Get-Date) - $startedAt).TotalSeconds)
+      Write-Host "[remediation] Stage $StageId is still running (PID $($Process.Id), ${elapsed}s elapsed)."
+    }
+  }
+  $Process.WaitForExit()
+}
 
 if (-not (Test-Path -LiteralPath $planPath -PathType Leaf)) { throw "Remediation plan is missing: $planPath" }
 $plan = Get-Content -LiteralPath $planPath -Raw -Encoding utf8 | ConvertFrom-Json
@@ -90,9 +102,10 @@ foreach ($stage in $plan.stages) {
   $stageScript = Join-Path $projectRoot 'scripts\run-remediation-stage.ps1'
   $quote = { param([string]$value) "'" + $value.Replace("'", "''") + "'" }
   $childCommand = "& $(& $quote $stageScript) -PromptPath $(& $quote $promptPath) -StageId $(& $quote $stage.id) -LogPath $(& $quote $logPath)"
-  $child = Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRoot -PassThru -Wait -ArgumentList @(
+  $child = Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRoot -PassThru -ArgumentList @(
     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $childCommand
   )
+  Wait-ForStageProcess $child $stage.id
   if ($child.ExitCode -ne 0) { throw "Stage $($stage.id) failed. The pipeline stopped; inspect $logPath." }
 
   $verificationFailed = $null
@@ -123,9 +136,10 @@ Run the affected focused tests. The controller will rerun the complete verificat
     $repairLogPath = Join-Path $runtimeRoot ("$($stage.id).verification-repair.log")
     $repairCommand = "& $(& $quote $stageScript) -PromptPath $(& $quote $repairPromptPath) -StageId $(& $quote "$($stage.id)-verification-repair") -LogPath $(& $quote $repairLogPath)"
     Write-Host "[remediation] Full verification failed; starting one corrective Codex pass for $($stage.id)."
-    $repairChild = Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRoot -PassThru -Wait -ArgumentList @(
+    $repairChild = Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRoot -PassThru -ArgumentList @(
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $repairCommand
     )
+    Wait-ForStageProcess $repairChild "$($stage.id)-verification-repair"
     if ($repairChild.ExitCode -ne 0) { throw "Stage $($stage.id) and its corrective pass failed. Inspect $repairLogPath." }
     Invoke-Checked 'Re-running npm test after corrective pass' { npm.cmd test }
     Invoke-Checked 'Re-running App Server schema preflight after corrective pass' { npm.cmd run test:app-server-schema }
