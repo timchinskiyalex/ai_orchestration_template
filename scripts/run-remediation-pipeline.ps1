@@ -31,7 +31,10 @@ function Get-ChangedPaths {
     ForEach-Object { Normalize-Path $_ } |
     Where-Object { $_ } |
     Sort-Object -Unique
-  return @($tracked + $untracked | Sort-Object -Unique)
+  $all = @()
+  $all += $tracked
+  $all += $untracked
+  return @($all | Sort-Object -Unique)
 }
 function Invoke-Checked([string]$Label, [scriptblock]$Command) {
   Write-Host "[remediation] $Label"
@@ -80,9 +83,15 @@ foreach ($stage in $plan.stages) {
 
   Write-Host "`n========== REMEDIATION STAGE: $($stage.id) =========="
   $logPath = Join-Path $runtimeRoot ("$($stage.id).log")
+  # Start-Process joins ArgumentList before creating the child process. Passing
+  # a Unicode path with spaces through -File therefore splits it into several
+  # arguments on Windows. Invoke the script through one explicitly quoted
+  # PowerShell command instead.
+  $stageScript = Join-Path $projectRoot 'scripts\run-remediation-stage.ps1'
+  $quote = { param([string]$value) "'" + $value.Replace("'", "''") + "'" }
+  $childCommand = "& $(& $quote $stageScript) -PromptPath $(& $quote $promptPath) -StageId $(& $quote $stage.id) -LogPath $(& $quote $logPath)"
   $child = Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRoot -PassThru -Wait -ArgumentList @(
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $projectRoot 'scripts\run-remediation-stage.ps1'),
-    '-PromptPath', $promptPath, '-StageId', $stage.id, '-LogPath', $logPath
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $childCommand
   )
   if ($child.ExitCode -ne 0) { throw "Stage $($stage.id) failed. The pipeline stopped; inspect $logPath." }
 
