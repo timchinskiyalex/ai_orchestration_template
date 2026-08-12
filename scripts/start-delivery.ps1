@@ -45,6 +45,9 @@ $monitor = Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRo
   '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScript, '-IntervalMs', $IntervalMs
 )
 if (-not $monitor) { throw 'Could not start the live delivery monitor.' }
+Start-Sleep -Milliseconds 750
+$monitor.Refresh()
+if ($monitor.HasExited) { throw 'Live delivery monitor exited during startup; delivery was not started.' }
 Write-Host "Live monitor started in a separate PowerShell window (PID $($monitor.Id))."
 $terminal = @('completed_merged', 'completed_candidate_ready', 'failed', 'interrupted', 'blocked_budget', 'blocked_quota', 'blocked_credentials', 'blocked_ci', 'blocked_branch_protection', 'conflict_blocked')
 $resumable = @('interrupted', 'blocked_credentials', 'blocked_ci', 'blocked_branch_protection', 'running', 'awaiting_human', 'awaiting_human_remote_handoff')
