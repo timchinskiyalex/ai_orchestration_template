@@ -19,35 +19,35 @@ if (-not (Test-Path -LiteralPath $PromptPath -PathType Leaf)) { throw "Prompt is
 $logDirectory = Split-Path -Parent $LogPath
 New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
 $prompt = Get-Content -LiteralPath $PromptPath -Raw -Encoding utf8
+$promptTempPath = "$LogPath.prompt"
+$stdoutPath = "$LogPath.stdout"
 $stderrPath = "$LogPath.stderr"
 Write-Host "[remediation] Codex stage $StageId started. Output is also saved to $LogPath"
 
 try {
-  $prompt | & $codex.Source exec `
-    --dangerously-bypass-approvals-and-sandbox `
-    --cd $projectRoot `
-    --output-last-message "$LogPath.final.txt" `
-    --color always 2>$stderrPath | Tee-Object -LiteralPath $LogPath
+  # Do not invoke the npm .cmd shim through a PowerShell pipeline. Windows
+  # PowerShell can fabricate NativeCommandError/non-zero wrapper exits after a
+  # successful Codex run. cmd.exe owns stdin/stdout/stderr and its exit code.
+  [System.IO.File]::WriteAllText($promptTempPath, $prompt, [System.Text.UTF8Encoding]::new($false))
+  $quoteCmd = { param([string]$value) '"' + $value.Replace('"', '""') + '"' }
+  $command = "$(& $quoteCmd $codex.Source) exec --dangerously-bypass-approvals-and-sandbox --cd $(& $quoteCmd $projectRoot) --output-last-message $(& $quoteCmd "$LogPath.final.txt") --color always < $(& $quoteCmd $promptTempPath) > $(& $quoteCmd $stdoutPath) 2> $(& $quoteCmd $stderrPath)"
+  & cmd.exe /d /s /c $command
   $exitCode = $LASTEXITCODE
 }
 finally {
-  # Codex writes informational progress (for example, stdin intake) to stderr.
-  # Keep it in the stage log without allowing PowerShell to turn it into a
-  # NativeCommandError that masks the process's actual exit code.
+  if (Test-Path -LiteralPath $stdoutPath) {
+    Move-Item -LiteralPath $stdoutPath -Destination $LogPath -Force
+  }
   if (Test-Path -LiteralPath $stderrPath) {
     Add-Content -LiteralPath $LogPath -Value "`n--- Codex stderr ---" -Encoding utf8
     Get-Content -LiteralPath $stderrPath -Encoding utf8 | Add-Content -LiteralPath $LogPath -Encoding utf8
     Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
   }
+  Remove-Item -LiteralPath $promptTempPath -Force -ErrorAction SilentlyContinue
 }
 
 if (-not (Test-Path -LiteralPath "$LogPath.final.txt" -PathType Leaf)) {
   throw "Codex stage '$StageId' produced no final message (exit code $exitCode). See $LogPath"
 }
-if ($exitCode -ne 0) {
-  # The npm PowerShell shim can return a false non-zero code after a completed
-  # Codex run. The final response plus the pipeline's full deterministic test
-  # suite is the trustworthy success condition.
-  Write-Warning "Codex stage '$StageId' returned $exitCode after writing its final message; continuing to verification."
-}
+if ($exitCode -ne 0) { throw "Codex stage '$StageId' exited with code $exitCode. See $LogPath" }
 Write-Host "[remediation] Codex stage $StageId completed."
