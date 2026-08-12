@@ -12,7 +12,7 @@ import { StateStore } from "./state-store.mjs";
 import { WorktreeManager } from "./worktree-manager.mjs";
 import { extractOrchestrationJson, validateBootstrap, validateLocalIntegrationCheckpoint, validatePlan } from "./workflow-contract.mjs";
 import { BudgetAccountAdapter } from "./budget-account-adapter.mjs";
-import { commandCwd, commandsForPaths, generateProjectOverlay, loadProjectOverlay, projectOverlayExecutionSnapshot } from "./project-overlay.mjs";
+import { assertProjectOverlayAdapterIntegrity, commandCwd, commandsForPaths, generateProjectOverlay, loadProjectOverlay, projectOverlayExecutionSnapshot } from "./project-overlay.mjs";
 import { WorktreeFinalizer } from "./worktree-finalizer.mjs";
 import { Integrator } from "./integrator.mjs";
 import { remediationScope, validateQualityGateReport } from "./quality-gate.mjs";
@@ -27,7 +27,8 @@ import { SourceClaimAuditExecutor, admitAuditedSourceClaims, auditSubjectFromExt
 import { PRODUCT_ACCEPTANCE_KIND, PRODUCT_ACCEPTANCE_SCHEMA_VERSION, productAcceptancePasses } from "./final-acceptance.mjs";
 import { compileWriteSurfaceTopology } from "./write-surface.mjs";
 import { assertRepositoryBaselineCurrent, captureRepositoryBaselineDraft, finalizeRepositoryBaseline, repositoryBaselineStatus, validateTaskBaselineBehaviorIds } from "./repository-baseline.mjs";
-import { configuredProjectMode, sameProjectMode, validateProjectMode } from "./project-mode.mjs";
+import { configuredProjectMode, projectModeFor, sameProjectMode, validateProjectMode } from "./project-mode.mjs";
+import { architectureBlueprintFromProductRoots, validateArchitectureBlueprint } from "./architecture-blueprint.mjs";
 
 const gitSha = (repository, ref) => execFileSync("git", ["-C", repository, "rev-parse", "--verify", `${ref}^{commit}`], { encoding: "utf8" }).trim();
 
@@ -85,6 +86,17 @@ export class SwarmRouter extends EventEmitter {
     if (this.projectMode) {
       this.config.project.projectMode = this.projectMode;
       this.config.project.repositoryMode = this.projectMode.mode;
+    }
+    try {
+      this.architectureBlueprint = config.project.architectureBlueprint
+        ? validateArchitectureBlueprint(config.project.architectureBlueprint, { projectMode: this.projectMode })
+        : architectureBlueprintFromProductRoots(config.project.productRoots ?? [], this.projectMode ?? projectModeFor("greenfield"));
+      this.config.project.architectureBlueprint = this.architectureBlueprint;
+      this.config.project.productRoots = this.architectureBlueprint.components.map((component) => ({ id: component.id, path: component.path, adapter: component.adapter.id, adapterVersion: component.adapter.version }));
+      this.stackAdapterAdmissionError = null;
+    } catch (error) {
+      this.architectureBlueprint = null;
+      this.stackAdapterAdmissionError = String(error.message ?? error);
     }
     this.store = new StateStore(join(config.runtimeDir, "swarm.sqlite"), { readOnly, faultHooks: config.faultHooks });
     this.governor = new BudgetGovernor(config.router);
@@ -365,6 +377,7 @@ export class SwarmRouter extends EventEmitter {
   assertRunSourceCompleteness(run) { return this.#assertRunSourceCompleteness(run); }
   assertBootstrapSourceIntake(run) { return this.#assertBootstrapSourceIntake(run); }
   sourceCompletenessReason(error) { return this.#safeSpecificationReason(error); }
+  stackAdapterReason(error) { return this.#safeStackAdapterReason(error); }
   blockRunForSourceCompleteness(run, error) {
     const reason = this.#safeSpecificationReason(error);
     return this.store.blockDeliveryForSpecification(run.id, {
@@ -487,7 +500,15 @@ export class SwarmRouter extends EventEmitter {
   }
 
   async ensureProjectOverlay() {
-    return generateProjectOverlay({ repository: this.config.repository, baseRef: this.config.baseRef, generatedDir: this.config.project.generatedDir, project: this.config.project });
+    if (this.stackAdapterAdmissionError) throw new Error(this.stackAdapterAdmissionError);
+    const result = await generateProjectOverlay({ repository: this.config.repository, baseRef: this.config.baseRef, generatedDir: this.config.project.generatedDir, project: this.config.project });
+    assertProjectOverlayAdapterIntegrity(result.overlay, { architectureBlueprint: this.architectureBlueprint, projectMode: this.projectMode ?? null });
+    return result;
+  }
+
+  assertStackAdapterIntegrity(overlay) {
+    if (this.stackAdapterAdmissionError) throw new Error(this.stackAdapterAdmissionError);
+    return assertProjectOverlayAdapterIntegrity(overlay, { architectureBlueprint: this.architectureBlueprint, projectMode: this.projectMode ?? null });
   }
 
   async integrateFinalized(taskIds) {
@@ -670,6 +691,14 @@ export class SwarmRouter extends EventEmitter {
   }
 
   async runUntilIdle({ deliveryRunId = this.activeDeliveryRunId } = {}) {
+    // Selection validation is a pre-worker admission barrier, but never
+    // creates an Overlay here: existing worker admission intentionally
+    // verifies that its controller-generated Overlay is already present.
+    if (this.stackAdapterAdmissionError) {
+      const error = new Error(this.stackAdapterAdmissionError);
+      if (deliveryRunId) return this.store.blockDeliveryForSpecification(deliveryRunId, { reason: this.#safeStackAdapterReason(error), recovery: { action: "Declare one supported controller-owned ArchitectureBlueprint stack and start a fresh delivery." } });
+      throw error;
+    }
     // No scheduler admission may race startup reconciliation. This includes
     // direct `run` callers that did not go through DeliveryCoordinator.
     try { await this.recoverStaleDeliveries(); }
@@ -1524,6 +1553,11 @@ export class SwarmRouter extends EventEmitter {
       "source_claim_contract:audited_manifest_rebuild_mismatch"
     ];
     return codes.find((code) => message.includes(code)) ?? "source_claim_contract:source_completeness_validation_failed";
+  }
+
+  #safeStackAdapterReason(error) {
+    const code = String(error?.message ?? error).match(/(?:unsupported_stack|ambiguous_stack):[a-z0-9_:-]+/i)?.[0];
+    return code ? code.slice(0, 220) : "unsupported_stack:architecture_blueprint_integrity_invalid";
   }
 
   #safeRepositoryBaselineReason(error) {

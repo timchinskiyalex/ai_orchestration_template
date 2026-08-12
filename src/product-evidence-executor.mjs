@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { relative, resolve, sep } from "node:path";
-import { commandCwd, loadProjectOverlay } from "./project-overlay.mjs";
+import { assertProjectOverlayAdapterIntegrity, commandCwd, loadProjectOverlay } from "./project-overlay.mjs";
+import { assertAdapterVerificationCommand } from "./stack-adapter.mjs";
 
 const SHA = /^[a-f0-9]{40,64}$/i;
 const stable = (value) => typeof value === "string" && value.trim().length > 0;
@@ -27,31 +28,36 @@ function exactCandidateWorktree(worktree, candidate) {
   return cwd;
 }
 
-function allowedCommand(command, overlay) {
+function allowedCommand(command, overlay, architectureBlueprint = null, projectMode = null) {
   if (!command || !stable(command.id) || !stable(command.executable) || !Array.isArray(command.args) || !command.args.every((arg) => typeof arg === "string")) return false;
-  if (!(overlay.verificationCommands ?? []).some((item) => item.id === command.id && item.executable === command.executable && JSON.stringify(item.args) === JSON.stringify(command.args) && item.cwd === command.cwd)) return false;
-  const component = (overlay.components ?? []).find((item) => item.id === command.component);
-  const adapter = component?.adapter ?? overlay.stack?.adapter;
-  if (!component && !["node", "next-node"].includes(adapter)) return false;
-  if (["node", "next-node"].includes(adapter)) {
+  let blueprint;
+  try { blueprint = assertProjectOverlayAdapterIntegrity(overlay, { architectureBlueprint, projectMode }); }
+  catch { return false; }
+  // Pre-Stage-07 programmatic fixtures have no configured product roots or
+  // versioned ProjectMode. They remain a read-compatible generic Node seam;
+  // config-loaded and persisted deliveries always carry an admitted blueprint.
+  if (!blueprint.components.length) {
     const match = command.id.match(/(?:^|:)package-script:([a-z][a-z0-9:_-]*)$/i);
     if (!match) return false;
-    const rendered = `${overlay.stack?.packageManager?.name ?? component?.packageManager?.name ?? ""} run ${match[1]}`;
     return process.platform === "win32"
-      ? command.executable.toLowerCase().endsWith("cmd.exe") && JSON.stringify(command.args) === JSON.stringify(["/d", "/s", "/c", rendered])
+      ? command.executable.toLowerCase().endsWith("cmd.exe") && JSON.stringify(command.args) === JSON.stringify(["/d", "/s", "/c", `${overlay.stack?.packageManager?.name ?? "npm"} run ${match[1]}`])
       : ["npm", "pnpm", "yarn"].includes(command.executable) && JSON.stringify(command.args) === JSON.stringify(["run", match[1]]);
   }
-  return adapter === "dotnet" && command.executable === "dotnet" && command.args.length === 3 && command.args[0] === "test" && command.args[2] === "--nologo" && /\.(?:sln|csproj)$/i.test(command.args[1]);
+  if (!(overlay.verificationCommands ?? []).some((item) => item.id === command.id && item.executable === command.executable && JSON.stringify(item.args) === JSON.stringify(command.args) && item.cwd === command.cwd)) return false;
+  const component = blueprint.components.find((item) => item.id === command.component);
+  if (!component) return false;
+  try { return assertAdapterVerificationCommand(command, component); }
+  catch { return false; }
 }
 
 // This is deliberately a controller-generated contract.  It contains no worker
 // text and turns the selected stack adapter's command objects into one explicit
 // criterion mapping per acceptance criterion.
-export function generateVerificationManifest({ overlay, blueprint, integration }) {
+export function generateVerificationManifest({ overlay, blueprint, integration, architectureBlueprint = null, projectMode = null }) {
   if (!overlay || overlay.schemaVersion !== 1 || !blueprint?.blueprintId || !SHA.test(integration?.candidateSha ?? "") || !stable(integration?.id)) throw new Error("VerificationManifest requires a supported ProjectOverlay, blueprint, and candidate integration manifest");
   const criteria = blueprint.requirements.flatMap((requirement) => (requirement.acceptanceCriteria ?? []).map((criterion) => ({ requirementId: requirement.requirementId, criterionId: criterion.criterionId })));
   const commands = overlay.verificationCommands ?? [];
-  if (!criteria.length || !commands.length || commands.some((command) => !allowedCommand(command, overlay))) throw new Error("VerificationManifest has no supported allowlisted product verification commands");
+  if (!criteria.length || !commands.length || commands.some((command) => !allowedCommand(command, overlay, architectureBlueprint, projectMode))) throw new Error("VerificationManifest has no supported allowlisted product verification commands");
   const seenCommands = new Set();
   if (commands.some((command) => seenCommands.has(command.id) || !seenCommands.add(command.id))) throw new Error("VerificationManifest contains duplicate command ids");
   const mappings = criteria.map((criterion, index) => {
@@ -74,7 +80,7 @@ export class ProductEvidenceExecutor {
       const stored = run?.blueprintId ? this.router.store.productBlueprint(run.blueprintId) : null;
       if (!run || !stored) throw new Error("Product evidence requires the persisted delivery run and blueprint");
       const { overlay } = loadProjectOverlay(this.router.config.repository, this.router.config.project.generatedDir);
-      const verification = generateVerificationManifest({ overlay, blueprint: stored.blueprint, integration });
+      const verification = generateVerificationManifest({ overlay, blueprint: stored.blueprint, integration, architectureBlueprint: this.router.architectureBlueprint, projectMode: this.router.projectMode });
       const worktree = exactCandidateWorktree(integration.worktree, candidate);
       const identity = { deliveryRunId, integrationManifestId: integration.id, candidateSha: candidate.sha, blueprintId: stored.blueprint.blueprintId, blueprintDigest: stored.digest, verificationManifestId: verification.id, verificationManifestDigest: verification.digest, worktree };
       const prior = this.router.store.productEvidenceExecutionForIdentity(identity);

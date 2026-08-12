@@ -3,6 +3,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { ROLES } from "./domain.mjs";
 import { validateTrustedPolicyRegistry } from "./product-blueprint.mjs";
 import { configuredProjectMode } from "./project-mode.mjs";
+import { architectureBlueprintFromProductRoots, validateArchitectureBlueprint } from "./architecture-blueprint.mjs";
 
 export function loadConfig(configPath) {
   if (!existsSync(configPath)) throw new Error(`Missing config: ${configPath}. Copy config/swarm.config.example.json first.`);
@@ -13,6 +14,7 @@ export function loadConfig(configPath) {
   config.project.documentationDir ??= "docs/orchestration-input";
   config.project.generatedDir ??= "docs/orchestration-generated";
   config.project.productRoots ??= [];
+  config.project.architectureBlueprint ??= null;
   config.project.repositoryMode ??= null;
   config.project.repositoryBaselineDeclaration ??= null;
   config.repository = resolve(base, config.repository);
@@ -94,20 +96,27 @@ export function loadConfig(configPath) {
     throw new Error("project.repositoryBaselineDeclaration is only allowed in brownfield mode");
   }
   if (!Array.isArray(config.project.productRoots)) throw new Error("project.productRoots must be an allowlisted array");
-  const supportedProductAdapters = new Set(["next-node", "dotnet"]);
   const productIds = new Set();
   const productPaths = new Set();
   config.project.productRoots = config.project.productRoots.map((entry, index) => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`project.productRoots[${index}] must be an object`);
     const { id, path, adapter } = entry;
     if (typeof id !== "string" || !/^[a-z][a-z0-9-]{0,31}$/.test(id) || productIds.has(id)) throw new Error("project.productRoots ids must be unique safe identifiers");
-    if (!supportedProductAdapters.has(adapter)) throw new Error(`project.productRoots[${index}].adapter is not allowlisted`);
     const normalizedPath = safeProjectPath(`project.productRoots[${index}].path`, path);
     if (productPaths.has(normalizedPath) || normalizedPath === config.project.documentationDir || normalizedPath === config.project.generatedDir) throw new Error("project.productRoots paths must be unique and outside controller directories");
-    if ((id === "frontend") !== (adapter === "next-node") || (id === "backend") !== (adapter === "dotnet")) throw new Error("project.productRoots must use frontend/next-node and backend/dotnet identities");
+    if (typeof adapter !== "string") throw new Error(`project.productRoots[${index}].adapter must be a controller allowlist identity`);
     productIds.add(id); productPaths.add(normalizedPath);
     return { id, path: normalizedPath, adapter };
   });
+  try {
+    const legacyBlueprint = architectureBlueprintFromProductRoots(config.project.productRoots, config.project.projectMode);
+    config.project.architectureBlueprint = config.project.architectureBlueprint === null
+      ? legacyBlueprint
+      : validateArchitectureBlueprint(config.project.architectureBlueprint, { projectMode: config.project.projectMode });
+    const blueprintRoots = config.project.architectureBlueprint.components.map((component) => ({ id: component.id, path: component.path, adapter: component.adapter.id, adapterVersion: component.adapter.version }));
+    if (config.project.productRoots.length && JSON.stringify(config.project.productRoots.map(({ id, path, adapter }) => ({ id, path, adapter }))) !== JSON.stringify(blueprintRoots.map(({ id, path, adapter }) => ({ id, path, adapter })))) throw new Error("project.productRoots must exactly match the admitted ArchitectureBlueprint");
+    config.project.productRoots = blueprintRoots;
+  } catch (error) { throw new Error(String(error.message)); }
   if (!["deny", "auto"].includes(config.router.approvalMode)) throw new Error("router.approvalMode must be deny or auto");
   if (!["autonomous", "manual"].includes(config.autonomy.mode)) throw new Error("autonomy.mode must be autonomous or manual");
   for (const key of ["autoApproveWorkflowGates", "autoRemediate", "autoPush", "autoCreatePullRequest", "autoMerge"]) {

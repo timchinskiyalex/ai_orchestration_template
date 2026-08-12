@@ -2,6 +2,8 @@ import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 
 import { join, relative, resolve, sep } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { architectureBlueprintFromProductRoots, validateArchitectureBlueprint } from "./architecture-blueprint.mjs";
+import { assertAdapterVerificationCommand, controllerStackAdapterRegistry, inspectWithAdapter } from "./stack-adapter.mjs";
 
 const exec = promisify(execFile);
 const OVERLAY_VERSION = 1;
@@ -12,9 +14,9 @@ const nodeVerificationScripts = new Set(["test", "test:unit", "test:integration"
 const toPosix = (value) => value.split(sep).join("/");
 
 export const STACK_ADAPTERS = Object.freeze({
-  node: { productionReady: true, packageManagers: [...packageManagers.keys()] },
-  "next-node": { productionReady: true, packageManagers: [...packageManagers.keys()] },
-  dotnet: { productionReady: true, commands: ["dotnet test"] },
+  node: { productionReady: false, reason: "root inference is diagnostic-only; admit an ArchitectureBlueprint" },
+  "next-node": { productionReady: true, version: 1, packageManagers: [...packageManagers.keys()] },
+  dotnet: { productionReady: true, version: 1, commands: ["dotnet test"] },
   python: { productionReady: false, reason: "a Python adapter is required before verification can run" },
   go: { productionReady: false, reason: "a Go adapter is required before verification can run" }
 });
@@ -78,7 +80,13 @@ function dotnetComponent(component, root, ledger) {
   const source = `${component.path}/${target}`; evidence(ledger, source, solutions.length ? "solution" : "project", "file-name", target, "verified");
   return { id: component.id, root: component.path, adapter: component.adapter, state: "scaffolded", solution: solutions[0] ? source : null, project: solutions[0] ? null : source, verificationCommands: [{ id: `${component.id}:dotnet-test`, component: component.id, cwd: component.path, executable: "dotnet", args: ["test", target, "--nologo"], source, confidence: "verified", timeoutMs: 120000 }] };
 }
-function componentFor(configured, inspectionRoot, ledger) { return configured.adapter === "next-node" ? nodeComponent(configured, inspectionRoot, ledger) : dotnetComponent(configured, inspectionRoot, ledger); }
+function componentFor(configured, inspectionRoot, ledger) {
+  const adapter = typeof configured.adapter === "string" ? { id: configured.adapter, version: configured.adapterVersion ?? 1 } : configured.adapter;
+  const component = { ...configured, adapter };
+  const detected = inspectWithAdapter(component, inspectionRoot);
+  for (const fingerprint of detected.fingerprints ?? []) evidence(ledger, fingerprint.source ?? component.path, fingerprint.kind, "stack-adapter", fingerprint, "verified");
+  return { ...detected, id: component.id, root: component.path, adapter: adapter.id, adapterVersion: adapter.version };
+}
 function legacyNode(files, root, ledger) {
   const packagePath = files.find((path) => path === "package.json"); if (!packagePath) throw new Error("Unsupported repository stack: no package.json. Add a stack adapter before orchestration.");
   const packageJson = JSON.parse(safeRead(join(root, packagePath))); const manager = detectPackageManager(packageJson, files, ledger, packagePath);
@@ -91,13 +99,19 @@ export async function generateProjectOverlay({ repository, baseRef = "HEAD", gen
   const root = await git(repository, ["rev-parse", "--show-toplevel"]); const inspected = resolve(inspectionRoot);
   const [baseSha, branch, status] = await Promise.all([git(root, ["rev-parse", baseRef]), git(root, ["branch", "--show-current"]), git(root, ["status", "--porcelain"])]);
   const files = walk(inspected); const ledger = []; evidence(ledger, ".git", "rev-parse --show-toplevel", "git", root, "verified"); evidence(ledger, ".git", `rev-parse ${baseRef}`, "git", baseSha, "verified");
-  const configuredRoots = project.productRoots ?? []; const discovery = configuredRoots.length ? configuredRoots.map((item) => componentFor(item, inspected, ledger)) : null;
+  const architectureBlueprint = project.architectureBlueprint
+    ? validateArchitectureBlueprint(project.architectureBlueprint, { projectMode: project.projectMode })
+    : project.projectMode
+      ? architectureBlueprintFromProductRoots(project.productRoots ?? [], project.projectMode)
+      : null;
+  const configuredRoots = architectureBlueprint?.components ?? (project.productRoots ?? []);
+  const discovery = configuredRoots.length ? configuredRoots.map((item) => componentFor(item, inspected, ledger)) : null;
   const legacy = discovery ? null : legacyNode(files, inspected, ledger);
   const components = discovery ?? legacy.components; const verificationCommands = discovery ? components.flatMap((component) => component.verificationCommands ?? []) : legacy.verificationCommands;
   const modules = discovery ? Object.fromEntries(components.map((component) => [component.id, productModule(component)])) : Object.fromEntries(Object.entries({ backend: /(^|\/)(server|api|backend|routes|controllers)(\/|$)/i, frontend: /(^|\/)(src\/)?(?:components|pages|app|frontend)(\/|$)/i, database: /(^|\/)(migrations?|schema|database|db)(\/|$)/i, infrastructure: /(^|\/)(infra|terraform|k8s|helm|docker|\.github)(\/|$)/i }).map(([name, pattern]) => [name, { present: files.some((path) => pattern.test(path)), paths: files.filter((path) => pattern.test(path)).slice(0, 25), confidence: files.some((path) => pattern.test(path)) ? "inferred" : "unknown" }]));
   const sensitivePaths = files.filter((path) => sensitiveName.test(path)).map((path) => ({ path, classification: "sensitive-name", contentRead: false, confidence: "verified" }));
   const pathPolicies = { denyWrite: sensitivePaths.map((item) => item.path), approvalRequired: files.filter((path) => /(^\.github\/workflows\/|(^|\/)(migrations?|infra|terraform|k8s|helm)\/)/i.test(path)), generatedDoNotEdit: [], contextExclude: sensitivePaths.map((item) => item.path) };
-  const overlay = { schemaVersion: OVERLAY_VERSION, generatedAt: new Date().toISOString(), repository: { gitRoot: root, baseSha, branch: branch || "detached", clean: !status, dirtyPaths: status ? status.split(/\r?\n/).map((line) => line.slice(3)) : [] }, stack: discovery ? { adapter: "multi-stack", adapterSupport: "production-ready", components: components.map(({ id, root: componentRoot, adapter, state }) => ({ id, root: componentRoot, adapter, state })) } : legacy.stack, components, scripts: legacy?.scripts ?? [], verificationCommands, workflows: workflowMetadata(inspected, files, ledger), agents: agents(files), modules, pathPolicies, sensitivePaths, evidenceLedger: ledger };
+  const overlay = { schemaVersion: OVERLAY_VERSION, generatedAt: new Date().toISOString(), repository: { gitRoot: root, baseSha, branch: branch || "detached", clean: !status, dirtyPaths: status ? status.split(/\r?\n/).map((line) => line.slice(3)) : [] }, architectureBlueprint: architectureBlueprint ? { schemaVersion: architectureBlueprint.schemaVersion, kind: architectureBlueprint.kind, projectMode: architectureBlueprint.projectMode, digest: architectureBlueprint.digest, registryVersion: architectureBlueprint.registryVersion, components: architectureBlueprint.components } : null, stack: discovery ? { adapter: "multi-stack", adapterSupport: "production-ready", registryVersion: 1, components: components.map(({ id, root: componentRoot, adapter, adapterVersion, state, fingerprints }) => ({ id, root: componentRoot, adapter, adapterVersion, state, fingerprints: fingerprints ?? [] })) } : { ...legacy.stack, adapterSupport: "diagnostic-only" }, components, scripts: legacy?.scripts ?? [], verificationCommands, workflows: workflowMetadata(inspected, files, ledger), agents: agents(files), modules, pathPolicies, sensitivePaths, evidenceLedger: ledger };
   const destination = join(root, generatedDir, "project-overlay.v1.json"); mkdirSync(resolve(destination, ".."), { recursive: true }); writeFileSync(destination, JSON.stringify(overlay, null, 2) + "\n", "utf8");
   return { overlay, path: toPosix(relative(root, destination)) };
 }
@@ -112,5 +126,29 @@ export function commandCwd(worktree, command) { return command.cwd && command.cw
 export function loadProjectOverlay(repository, generatedDir = "docs/orchestration-generated") { const path = join(repository, generatedDir, "project-overlay.v1.json"); if (!existsSync(path)) throw new Error(`Missing ProjectOverlay: ${path}`); const overlay = JSON.parse(safeRead(path)); if (overlay.schemaVersion !== OVERLAY_VERSION) throw new Error(`Unsupported ProjectOverlay schema version: ${overlay.schemaVersion}`); return { overlay, path: toPosix(relative(repository, path)) }; }
 export function projectOverlayExecutionSnapshot(overlay) {
   if (!overlay || overlay.schemaVersion !== OVERLAY_VERSION) throw new Error("Cannot create execution snapshot from an unsupported ProjectOverlay");
-  return { schemaVersion: 1, sourceOverlayVersion: overlay.schemaVersion, baseSha: overlay.repository?.baseSha ?? null, stack: { adapter: overlay.stack?.adapter ?? null, adapterSupport: overlay.stack?.adapterSupport ?? null, components: (overlay.components ?? []).map((component) => ({ id: component.id, root: component.root, adapter: component.adapter, state: component.state })) }, verificationCommands: (overlay.verificationCommands ?? []).map(({ id, component, cwd, executable, args, confidence }) => ({ id, component, cwd, executable, args, confidence })), agents: (overlay.agents ?? []).map((agent) => ({ path: agent.path, scope: agent.scope, confidence: agent.confidence })), pathPolicies: { approvalRequired: overlay.pathPolicies?.approvalRequired ?? [], generatedDoNotEdit: overlay.pathPolicies?.generatedDoNotEdit ?? [] }, modules: Object.fromEntries(Object.entries(overlay.modules ?? {}).map(([name, value]) => [name, { present: Boolean(value?.present), confidence: value?.confidence ?? "unknown" }])) };
+  return { schemaVersion: 1, sourceOverlayVersion: overlay.schemaVersion, baseSha: overlay.repository?.baseSha ?? null, architectureBlueprint: overlay.architectureBlueprint ? { digest: overlay.architectureBlueprint.digest, registryVersion: overlay.architectureBlueprint.registryVersion } : null, stack: { adapter: overlay.stack?.adapter ?? null, adapterSupport: overlay.stack?.adapterSupport ?? null, components: (overlay.components ?? []).map((component) => ({ id: component.id, root: component.root, adapter: component.adapter, adapterVersion: component.adapterVersion ?? null, state: component.state })) }, verificationCommands: (overlay.verificationCommands ?? []).map(({ id, component, cwd, executable, args, confidence }) => ({ id, component, cwd, executable, args, confidence })), agents: (overlay.agents ?? []).map((agent) => ({ path: agent.path, scope: agent.scope, confidence: agent.confidence })), pathPolicies: { approvalRequired: overlay.pathPolicies?.approvalRequired ?? [], generatedDoNotEdit: overlay.pathPolicies?.generatedDoNotEdit ?? [] }, modules: Object.fromEntries(Object.entries(overlay.modules ?? {}).map(([name, value]) => [name, { present: Boolean(value?.present), confidence: value?.confidence ?? "unknown" }])) };
+}
+
+// Persisted overlays are untrusted input on resume.  Re-derive the immutable
+// blueprint from controller configuration and check every adapter object and
+// command instead of accepting a historic adapter name or executable path.
+export function assertProjectOverlayAdapterIntegrity(overlay, { architectureBlueprint, projectMode } = {}) {
+  if (!overlay || overlay.schemaVersion !== OVERLAY_VERSION) throw new Error("unsupported_stack:overlay_schema_invalid");
+  const expected = validateArchitectureBlueprint(architectureBlueprint ?? overlay.architectureBlueprint, { projectMode: projectMode ?? architectureBlueprint?.projectMode ?? overlay.architectureBlueprint?.projectMode });
+  if (!overlay.architectureBlueprint || overlay.architectureBlueprint.digest !== expected.digest || overlay.architectureBlueprint.registryVersion !== expected.registryVersion) throw new Error("unsupported_stack:overlay_architecture_blueprint_integrity_invalid");
+  const legacyDiagnosticOnly = !expected.components.length;
+  const actual = new Map((overlay.components ?? []).map((component) => [component.id, component]));
+  if (actual.size !== expected.components.length) throw new Error("unsupported_stack:overlay_component_selection_mismatch");
+  for (const component of expected.components) {
+    const observed = actual.get(component.id);
+    if (!observed || observed.root !== component.path || observed.adapter !== component.adapter.id || observed.adapterVersion !== component.adapter.version) throw new Error("unsupported_stack:overlay_component_selection_mismatch");
+    for (const command of observed.verificationCommands ?? []) assertAdapterVerificationCommand(command, component);
+  }
+  for (const command of overlay.verificationCommands ?? []) {
+    const component = expected.components.find((item) => item.id === command.component);
+    if (!component && legacyDiagnosticOnly) continue;
+    if (!component) throw new Error("unsupported_stack:overlay_verification_component_invalid");
+    assertAdapterVerificationCommand(command, component);
+  }
+  return expected;
 }

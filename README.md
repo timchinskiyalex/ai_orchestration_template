@@ -80,6 +80,12 @@ The controller root is not a product root. Configure allowlisted product roots:
 
 Greenfield repositories are valid before either root exists. Planner must create `scaffold-product`; every product task directly depends on it. After scaffold, the controller refreshes the ProjectOverlay from the scaffold worktree. Frontend verification runs only declared scripts in `frontend/package.json`; backend verification runs allowlisted `dotnet test` against the discovered solution/project in `backend/`. A scaffolded component without a declared/allowlisted verification command blocks integration rather than passing empty QA.
 
+### Stack adapters (Stage 07)
+
+`ArchitectureBlueprint` v1 is controller-owned and versioned. It is the only source of a component's adapter selection; worker output, plugins, external registries, executable paths, and shell probing cannot select or replace an adapter. The closed registry currently supports `next-node@1` and `dotnet@1`, in both `greenfield` and `brownfield` modes. Fixture tests cover deterministic detection, scaffold output, component roots, safe write roots, and verification-command propagation into ProductEvidence.
+
+`python` and `go` are explicitly unsupported: `unsupported_stack:<id>:no_controller_owned_adapter_with_deterministic_fixture_verification`. No adapter is registered until a local, toolchain-free fixture contract can prove detection, scaffold, verification, and evidence behavior. Multiple .NET solutions/projects are refused with a bounded `ambiguous_stack:dotnet:*` diagnostic before Planner, workers, or App Server admission.
+
 ## Brownfield repository baselines
 
 `project.repositoryMode` defaults to `legacy`. `greenfield` remains baseline-free. Set `brownfield` only for an existing repository and provide one configured, repository-relative `repositoryBaselineDeclaration` file. The controller captures its exact `baseRef` SHA and tracked tree before Bootstrap, then finalizes an immutable baseline only after the ProductBlueprint is persisted.

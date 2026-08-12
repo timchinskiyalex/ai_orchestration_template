@@ -33,7 +33,12 @@ export class DeliveryCoordinator {
     });
     if (cancelled.length) this.router.store.recordEvent(null, "delivery/fresh-start-cleanup", { previousDeliveryRunId: current?.id ?? null, cancelledTaskIds: cancelled.map((task) => task.id) });
     const intake = ingestDocumentation({ source, repository: this.router.config.repository, destinationRelative: this.router.config.project.documentationDir });
-    const overlay = await this.router.ensureProjectOverlay();
+    let overlay;
+    try { overlay = await this.router.ensureProjectOverlay(); }
+    catch (error) {
+      const blocked = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: null, confirmRemotePush: false, sourceClaimInputMode: intake.sourceClaimInput, repositoryMode: this.router.projectMode?.mode, projectMode: this.router.projectMode, repositoryBaseSha: null });
+      return this.router.store.blockDeliveryForSpecification(blocked.id, { reason: this.router.stackAdapterReason?.(error) ?? "unsupported_stack:architecture_blueprint_integrity_invalid", recovery: { action: "Declare one supported controller-owned ArchitectureBlueprint stack and start a fresh delivery." } });
+    }
     // Capture the brownfield identity before the delivery row exists so its
     // immutable base SHA is part of that row from creation.  This is still a
     // controller-only preflight; Bootstrap remains strictly after admission.

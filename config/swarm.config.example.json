@@ -5,10 +5,15 @@
     "generatedDir": "docs/orchestration-generated",
     "projectMode": { "schemaVersion": 1, "kind": "ProjectMode", "mode": "greenfield" },
     "repositoryBaselineDeclaration": null,
-    "productRoots": [
-      { "id": "frontend", "path": "frontend", "adapter": "next-node" },
-      { "id": "backend", "path": "backend", "adapter": "dotnet" }
-    ]
+    "architectureBlueprint": {
+      "schemaVersion": 1,
+      "kind": "ArchitectureBlueprint",
+      "projectMode": { "schemaVersion": 1, "kind": "ProjectMode", "mode": "greenfield" },
+      "components": [
+        { "id": "frontend", "path": "frontend", "adapter": { "id": "next-node", "version": 1 } },
+        { "id": "backend", "path": "backend", "adapter": { "id": "dotnet", "version": 1 } }
+      ]
+    }
   },
   "repository": "D:/path/to/your/git/repository",
   "baseRef": "main",
