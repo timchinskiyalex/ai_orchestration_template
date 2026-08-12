@@ -73,6 +73,39 @@ test("controller-owned barrier turns writer fan-in into a verified checkpoint ba
     const b = router.list().find((task) => task.title === "Write B"); const barrier = router.store.integrationBarrier(b.integrationBarrierId); const checkpoint = router.store.integrationCheckpoint(barrier.checkpointId); assert.equal(barrier.status, "passed"); assert.equal(checkpoint.status, "passed"); assert.equal(client.writerBases.get("writer-b"), checkpoint.outputSha); assert.equal(b.artifactBaseSha, checkpoint.outputSha);
   } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
 });
+test("mixed logical and execution writer predecessors create one checkpoint barrier before the consumer runs", async () => {
+  const plan = { blueprintId: "pb-test", tasks: [writer("writer-a", "Write A"), { ...writer("writer-c", "Write C"), allowedPaths: ["src"] }, { ...writer("writer-b", "Write B", ["writer-c"]), allowedPaths: ["src"] }] };
+  const client = new LineageClient(plan, { contextualFanIn: true }); const root = setup(client); let router;
+  try {
+    router = new SwarmRouter(config(root, client)); await router.ensureProjectOverlay(); router.startProject(); await router.runUntilIdle();
+    const a = router.list().find((task) => task.title === "Write A"), c = router.list().find((task) => task.title === "Write C"), b = router.list().find((task) => task.title === "Write B");
+    const barrier = router.store.integrationBarrier(b.integrationBarrierId), checkpoint = router.store.integrationCheckpoint(b.localCheckpointId);
+    assert.deepEqual(b.dependencies.filter((id) => id !== b.parentTaskId), [c.id]); assert.deepEqual(b.executionDependencies, [a.id]);
+    assert.equal(router.store.db.prepare("SELECT COUNT(*) AS count FROM integration_barriers").get().count, 1);
+    assert.deepEqual(barrier.inputArtifacts.map((item) => item.artifactId), [c.id, a.id]); assert.equal(barrier.status, "passed"); assert.equal(client.writerBases.get("writer-b"), checkpoint.outputSha); assert.equal(b.artifactBaseSha, checkpoint.outputSha); assert.deepEqual(b.artifactDependencies, []);
+    assert.equal((await router.runToIntegration({ alreadyIdle: true })).integration.manifest.status, "candidate_ready");
+  } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
+});
+test("mixed-predecessor consumer resumes at its persisted barrier checkpoint boundary", async () => {
+  const plan = { blueprintId: "pb-test", tasks: [writer("writer-a", "Write A"), { ...writer("writer-c", "Write C"), allowedPaths: ["src"] }, { ...writer("writer-b", "Write B", ["writer-c"]), allowedPaths: ["src"] }] };
+  const paused = new LineageClient(plan, { contextualFanIn: true }); const root = setup(paused); let router;
+  try {
+    router = new SwarmRouter(config(root, paused)); await router.ensureProjectOverlay(); router.startProject();
+    const claimNext = router.store.claimNext.bind(router.store); router.store.claimNext = () => router.store.listTasks().some((task) => task.title === "Write B" && task.status === "queued" && task.localCheckpointId) ? null : claimNext();
+    await router.runUntilIdle();
+    const b = router.list().find((task) => task.title === "Write B"), checkpoint = router.store.integrationCheckpoint(b.localCheckpointId); assert.equal(b.status, "queued"); assert.equal(b.artifactBaseSha, checkpoint.outputSha); router.close();
+    const resumed = new LineageClient(plan, { contextualFanIn: true }); router = new SwarmRouter(config(root, resumed)); await router.runUntilIdle({ deliveryRunId: null });
+    const resumedB = router.list().find((task) => task.title === "Write B"); assert.equal(resumed.writerBases.get("writer-b"), checkpoint.outputSha); assert.equal(resumedB.status, "done");
+  } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
+});
+test("unreachable queued writer dependency returns a persisted bounded integrity-blocked deadlock", async () => {
+  const client = new LineageClient({ blueprintId: "pb-test", tasks: [] }); const root = setup(client); let router;
+  try {
+    router = new SwarmRouter(config(root, client)); await router.ensureProjectOverlay(); const predecessor = router.enqueue({ role: "backend", title: "Historical writer", prompt: "Historical writer", allowedPaths: ["src"] }); const task = router.enqueue({ role: "backend", title: "Blocked writer", prompt: "Blocked writer", allowedPaths: ["src"], dependencies: [predecessor.id] }); router.store.db.prepare("UPDATE tasks SET status = 'cancelled' WHERE id = ?").run(predecessor.id); router.store.db.prepare("UPDATE tasks SET dependencies_json = ? WHERE id = ?").run(JSON.stringify(["missing-writer"]), task.id);
+    const result = await router.runUntilIdle(); assert.equal(result.integrityBlocked, true); assert.equal(result.dependencyDeadlock.outcome, "dependency_deadlock"); assert.equal(result.dependencyDeadlock.classification, "integrity-blocked"); assert.deepEqual(result.dependencyDeadlock.taskIds, [task.id]); assert.deepEqual(result.dependencyDeadlock.reasons, [{ taskId: task.id, code: "missing_predecessor", predecessorId: "missing-writer" }]);
+    const persisted = router.store.dependencyDeadlock(result.dependencyDeadlock.recordId); assert.deepEqual(persisted.outcome, { outcome: "dependency_deadlock", classification: "integrity-blocked", taskIds: [task.id], reasons: result.dependencyDeadlock.reasons });
+  } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
+});
 test("local fan-in consumer reaches candidate_ready from its checkpoint lineage", async () => {
   const plan = { blueprintId: "pb-test", tasks: [writer("writer-a", "Write A"), writer("writer-c", "Write C"), writer("writer-b", "Write B", ["writer-a", "writer-c"])] }; const client = new LineageClient(plan); const root = setup(client); let router;
   try {

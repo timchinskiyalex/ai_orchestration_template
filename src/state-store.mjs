@@ -159,6 +159,12 @@ export class StateStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS dependency_deadlocks (
+        id TEXT PRIMARY KEY,
+        delivery_run_id TEXT REFERENCES delivery_runs(id),
+        outcome_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS external_actions (
         idempotency_key TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -809,6 +815,18 @@ export class StateStore {
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.deliveryRun(id);
+  }
+
+  recordDependencyDeadlock({ id, deliveryRunId = null, outcome }) {
+    if (!id || !outcome || outcome.outcome !== "dependency_deadlock") throw new Error("Dependency deadlock requires an immutable structured outcome");
+    if (this.db.prepare("SELECT id FROM dependency_deadlocks WHERE id = ?").get(id)) return this.dependencyDeadlock(id);
+    this.db.prepare("INSERT INTO dependency_deadlocks (id, delivery_run_id, outcome_json, created_at) VALUES (?, ?, ?, ?)").run(id, deliveryRunId, JSON.stringify(outcome), now());
+    return this.dependencyDeadlock(id);
+  }
+
+  dependencyDeadlock(id) {
+    const row = this.db.prepare("SELECT * FROM dependency_deadlocks WHERE id = ?").get(id);
+    return row ? { id: row.id, deliveryRunId: row.delivery_run_id, outcome: JSON.parse(row.outcome_json), createdAt: row.created_at } : null;
   }
 
   blockDeliveryForSpecification(id, { reason, recovery } = {}) {

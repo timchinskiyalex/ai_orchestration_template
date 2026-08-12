@@ -561,13 +561,13 @@ export class SwarmRouter extends EventEmitter {
       const snapshot = this.account.normalize({ account: account.account, usage: account.usage, rateLimits: account.rateLimits, previous: this.store.latestAccountSnapshot() });
       this.store.recordAccountSnapshot(snapshot);
       this.#lifecycle(snapshot.diagnostics?.length ? "account read failed" : "account read completed", { diagnostics: snapshot.diagnostics?.length ?? 0 });
-      const scheduler = { active: 0, blockedQuota: false, blockedBudget: false, failed: false };
+      const scheduler = { active: 0, blockedQuota: false, blockedBudget: false, failed: false, dependencyDeadlock: null };
       const workers = Array.from({ length: this.config.router.maxConcurrentTasks }, () => this.#worker(client, scheduler));
       await Promise.all(workers);
       // Notification handlers are intentionally non-blocking, but a terminal
       // scheduler result must not race a just-started budget interrupt.
       await Promise.allSettled([...this.pendingBudgetWatchdogs]);
-      return { blockedQuota: scheduler.blockedQuota, blockedBudget: scheduler.blockedBudget || this.budgetInterruptedTasks.size > 0, failed: scheduler.failed, interrupted: this.stopRequested, quota: this.quotaThrottleStatus() };
+      return { blockedQuota: scheduler.blockedQuota, blockedBudget: scheduler.blockedBudget || this.budgetInterruptedTasks.size > 0, failed: scheduler.failed, interrupted: this.stopRequested, integrityBlocked: Boolean(scheduler.dependencyDeadlock), dependencyDeadlock: scheduler.dependencyDeadlock, quota: this.quotaThrottleStatus() };
     } finally {
       if (heartbeat) clearInterval(heartbeat);
       process.removeListener("SIGINT", onSigint);
@@ -589,7 +589,11 @@ export class SwarmRouter extends EventEmitter {
       const task = this.store.claimNext();
       if (!task) {
         if (barriersRan) continue;
-        if (!scheduler.active) return;
+        if (!scheduler.active) {
+          const diagnosis = this.#diagnoseDependencyDeadlock();
+          if (diagnosis) scheduler.dependencyDeadlock ??= this.#persistDependencyDeadlock(diagnosis);
+          return;
+        }
         await new Promise((resolve) => setTimeout(resolve, 100));
         continue;
       }
@@ -1125,7 +1129,7 @@ export class SwarmRouter extends EventEmitter {
       changed = false;
       for (const task of tasks) {
         if (this.config.roles[task.role]?.sandbox !== "workspace-write" || descendants.has(task.id)) continue;
-        if ((task.artifactDependencies ?? []).some((dependency) => descendants.has(dependency))) { descendants.add(task.id); changed = true; }
+        if (this.#effectiveWriterPredecessorIds(task).some((dependency) => descendants.has(dependency))) { descendants.add(task.id); changed = true; }
       }
     }
     return [...descendants].some((candidate) => {
@@ -1142,8 +1146,8 @@ export class SwarmRouter extends EventEmitter {
     const blockedExecution = (task.executionDependencies ?? []).find((id) => this.store.getTask(id)?.executionReleaseState !== "released");
     if (blockedExecution) return `awaiting safe controller release of execution predecessor ${blockedExecution}`;
     if (task.executionIsWriter) {
-      const blockedLogical = task.dependencies.find((id) => this.store.getTask(id)?.executionIsWriter && this.store.getTask(id)?.executionReleaseState !== "released");
-      if (blockedLogical) return `awaiting safe controller release of logical writer predecessor ${blockedLogical}`;
+      const blockedWriter = this.#effectiveWriterPredecessorIds(task).find((id) => this.store.getTask(id)?.executionReleaseState !== "released");
+      if (blockedWriter) return `awaiting safe controller release of effective writer predecessor ${blockedWriter}`;
       if (task.executionReleaseState !== "pending") return `writer execution release is ${task.executionReleaseState}`;
     }
     return null;
@@ -1255,7 +1259,7 @@ export class SwarmRouter extends EventEmitter {
     const predecessor = this.store.workerArtifactRecord(writer.id);
     if (!predecessor?.artifact) throw new Error(`Security remediation requires finalized artifact for ${writer.id}`);
     const allowedPaths = remediationScope(report, writer);
-    const remediation = this.enqueue({ role: writer.role, parentTaskId: task.id, title: `Remediate ${writer.title} (security round ${nextRound})`, prompt: `Apply only these validated SecurityGate findings. Do not expand scope or risk: ${JSON.stringify(report.findings.map((finding) => ({ id: finding.id, path: finding.path, requiredFix: finding.requiredFix, verification: finding.verification })))}.`, allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [task.id], estimatedTokens: Math.min(this.config.roles[writer.role].tokenBudget, writer.estimatedTokens), riskFlags: writer.riskFlags, supportingDomains: ["security", "qa"], artifactBaseSha: predecessor.artifact.headSha, artifactDependencies: [writer.id], remediationRound: nextRound, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, baselineBehaviorIds: writer.baselineBehaviorIds, deliveryRunId: writer.deliveryRunId });
+    const remediation = this.enqueue({ role: writer.role, parentTaskId: task.id, title: `Remediate ${writer.title} (security round ${nextRound})`, prompt: `Apply only these validated SecurityGate findings. Do not expand scope or risk: ${JSON.stringify(report.findings.map((finding) => ({ id: finding.id, path: finding.path, requiredFix: finding.requiredFix, verification: finding.verification })))}.`, allowedPaths, acceptanceChecks: report.findings.map((finding) => finding.verification), dependencies: [task.id, writer.id], estimatedTokens: Math.min(this.config.roles[writer.role].tokenBudget, writer.estimatedTokens), riskFlags: writer.riskFlags, supportingDomains: ["security", "qa"], artifactBaseSha: predecessor.artifact.headSha, artifactDependencies: [writer.id], remediationRound: nextRound, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, baselineBehaviorIds: writer.baselineBehaviorIds, deliveryRunId: writer.deliveryRunId });
     const security = this.enqueue({ role: "security", parentTaskId: remediation.id, title: `Security review: ${remediation.title}`, prompt: `Review the finalized security remediation artifact for '${writer.title}'. Return the required SecurityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [remediation.id], estimatedTokens: Math.min(this.config.roles.security.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.35))), riskFlags: writer.riskFlags, supportingDomains: ["security"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, baselineBehaviorIds: writer.baselineBehaviorIds, deliveryRunId: writer.deliveryRunId });
     this.enqueue({ role: "qa", parentTaskId: security.id, title: `QA: ${remediation.title}`, prompt: `Verify the finalized security remediation artifact for '${writer.title}'. Return the required QualityGateReport only.`, allowedPaths, acceptanceChecks: remediation.acceptanceChecks, dependencies: [security.id], estimatedTokens: Math.min(this.config.roles.qa.tokenBudget, Math.max(1, Math.ceil(remediation.estimatedTokens * 0.4))), riskFlags: writer.riskFlags, supportingDomains: ["qa"], sourceWriterTaskId: remediation.id, blueprintId: writer.blueprintId, requirementIds: writer.requirementIds, baselineBehaviorIds: writer.baselineBehaviorIds, deliveryRunId: writer.deliveryRunId });
     this.store.transition(task.id, "done");
@@ -1477,9 +1481,7 @@ export class SwarmRouter extends EventEmitter {
       const dependencies = [plannerTask.id, ...dependencyPlanIds.map((dependency) => primaryIds.get(dependency))];
       if (scaffoldTaskId && item.id !== "scaffold-product" && primary.sandbox === "workspace-write" && !dependencies.includes(scaffoldTaskId)) dependencies.push(scaffoldTaskId);
       const executionDependencies = executionTopology.get(item.id)?.executionDependencies.map((dependency) => primaryIds.get(dependency)) ?? [];
-      const writerPredecessors = [...new Set([...dependencies
-        .filter((dependency) => dependency !== plannerTask.id)
-        .filter((dependency) => this.config.roles[primaryRoleByTaskId.get(dependency)]?.sandbox === "workspace-write"), ...executionDependencies])];
+      const writerPredecessors = this.#effectiveWriterPredecessorIds({ dependencies: dependencies.filter((dependency) => dependency !== plannerTask.id), executionDependencies }, { taskForId: (id) => ({ role: primaryRoleByTaskId.get(id) }) });
       const fanIn = writerPredecessors.length > 1;
       const prompt = item.id === "scaffold-product"
         ? "[[product-scaffold]]\nController-owned scaffold contract: create every declared product root now. frontend/ must be a runnable Next.js application with package.json, npm lockfile, build and test scripts. backend/ must be an ASP.NET Core Web API solution with an xUnit test project. Do not create placeholders, plans, or a partial root. Run the declared checks after files are written."
@@ -1513,6 +1515,70 @@ export class SwarmRouter extends EventEmitter {
 
   #isScaffoldTask(task) { return task.prompt.startsWith("[[product-scaffold]]"); }
 
+  // This is the controller's sole writer-lineage derivation. Keep logical
+  // order first, then topology order: both are immutable controller inputs
+  // and this preserves the existing effective integration traversal order.
+  #effectiveWriterPredecessorIds(task, { taskForId = (id) => this.store.getTask(id) } = {}) {
+    const seen = new Set();
+    const ids = [];
+    for (const id of [...(task.dependencies ?? []), ...(task.executionDependencies ?? [])]) {
+      if (typeof id !== "string" || !id || seen.has(id)) continue;
+      seen.add(id);
+      const predecessor = taskForId(id);
+      if (predecessor && this.config.roles[predecessor.role]?.sandbox === "workspace-write") ids.push(id);
+    }
+    return ids;
+  }
+
+  #diagnoseDependencyDeadlock() {
+    const tasks = this.store.listTasks();
+    const byId = new Map(tasks.map((task) => [task.id, task]));
+    const problems = [];
+    const add = (task, code, predecessorId = null) => {
+      if (problems.some((item) => item.taskId === task.id && item.code === code && item.predecessorId === predecessorId)) return;
+      problems.push({ taskId: task.id, code, ...(predecessorId ? { predecessorId } : {}) });
+    };
+    const hasCycle = (startId, id, visiting = new Set(), seen = new Set()) => {
+      if (id === startId && visiting.size) return true;
+      if (visiting.has(id) || seen.has(id)) return false;
+      visiting.add(id);
+      const node = byId.get(id);
+      const cycle = Boolean(node && this.#effectiveWriterPredecessorIds(node, { taskForId: (candidate) => byId.get(candidate) }).some((parent) => hasCycle(startId, parent, visiting, seen)));
+      visiting.delete(id); seen.add(id);
+      return cycle;
+    };
+    for (const task of tasks) {
+      if (task.status !== "queued" || !ENGINEERING_DOMAINS.has(task.role)) continue;
+      const rawIds = [...(task.dependencies ?? []), ...(task.executionDependencies ?? [])];
+      for (const id of rawIds) if (!byId.has(id)) add(task, "missing_predecessor", id);
+      if (task.planBatchId && (task.executionTopologyVersion !== 1 || !Array.isArray(task.executionDependencies))) add(task, "legacy_execution_topology");
+      const parents = this.#effectiveWriterPredecessorIds(task, { taskForId: (id) => byId.get(id) });
+      if (!parents.length) continue;
+      if (hasCycle(task.id, task.id)) add(task, "cyclic_writer_predecessor");
+      for (const id of parents) {
+        const predecessor = byId.get(id);
+        if (!predecessor || ["failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted"].includes(predecessor.status)) add(task, "unreachable_writer_predecessor", id);
+        else if (predecessor.status !== "done" || predecessor.executionReleaseState !== "released") add(task, "unsatisfied_writer_predecessor", id);
+        else if (!this.store.workerArtifact(id)) add(task, "missing_writer_artifact", id);
+      }
+      if (parents.length > 1) {
+        const barrier = String(task.integrationBarrierId ?? "").startsWith("pending:") ? null : this.store.integrationBarrier(task.integrationBarrierId);
+        if (!task.integrationBarrierId || (!barrier && !String(task.integrationBarrierId).startsWith("pending:"))) add(task, "missing_integration_barrier");
+        else if (barrier && barrier.status === "failed") add(task, "unreachable_integration_barrier");
+      }
+    }
+    if (!problems.length) return null;
+    const bounded = problems.slice(0, 25);
+    return { outcome: "dependency_deadlock", classification: "integrity-blocked", taskIds: [...new Set(bounded.map((item) => item.taskId))], reasons: bounded };
+  }
+
+  #persistDependencyDeadlock(outcome) {
+    const stored = this.store.recordDependencyDeadlock({ id: randomUUID(), deliveryRunId: this.activeDeliveryRunId, outcome });
+    if (this.activeDeliveryRunId) this.store.updateDeliveryRun(this.activeDeliveryRunId, { state: "failed", publish: { reason: "dependency_deadlock", classification: "integrity-blocked", taskIds: outcome.taskIds, reasons: outcome.reasons } });
+    this.#lifecycle("dependency deadlock", { taskIds: outcome.taskIds, reasons: outcome.reasons });
+    return { ...outcome, recordId: stored.id };
+  }
+
   async #failFastAfterTaskFailure(client, scheduler, failedTaskId, error) {
     if (scheduler.failed) return;
     scheduler.failed = true;
@@ -1523,22 +1589,29 @@ export class SwarmRouter extends EventEmitter {
 
   #connectArtifactDependents(predecessor, artifact) {
     for (const task of this.store.listTasks()) {
-      if (task.id === predecessor.id || (![...task.dependencies, ...(task.executionDependencies ?? [])].includes(predecessor.id)) || this.config.roles[task.role]?.sandbox !== "workspace-write") continue;
-      const writerPredecessors = [...new Set([...task.dependencies, ...(task.executionDependencies ?? [])].filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write"))];
+      if (task.id === predecessor.id || !this.#effectiveWriterPredecessorIds(task).includes(predecessor.id) || this.config.roles[task.role]?.sandbox !== "workspace-write") continue;
+      const writerPredecessors = this.#effectiveWriterPredecessorIds(task);
       if (writerPredecessors.length === 1 && !task.integrationBarrierId) this.store.setArtifactLineage(task.id, { artifactBaseSha: artifact.headSha, artifactDependencies: writerPredecessors });
     }
   }
   _assertWriterArtifactLineage(task) {
-    const writerPredecessors = [...new Set([...task.dependencies, ...(task.executionDependencies ?? [])].filter((dependency) => this.config.roles[this.store.getTask(dependency)?.role]?.sandbox === "workspace-write"))];
+    const writerPredecessors = this.#effectiveWriterPredecessorIds(task);
     if (writerPredecessors.length > 1) {
       const barrier = this.store.integrationBarrier(task.integrationBarrierId);
       const checkpoint = task.localCheckpointId ? this.store.integrationCheckpoint(task.localCheckpointId) : null;
-      if (!barrier || barrier.status !== "passed" || !checkpoint) throw new Error(`Writer task ${task.id} cannot start before its IntegrationBarrier checkpoint`);
+      if (!barrier || barrier.status !== "passed" || !checkpoint) throw new Error(`Writer task ${task.id} has a missing, legacy, invalid IntegrationBarrier checkpoint`);
+      const expectedInputs = writerPredecessors.map((id) => {
+        const artifact = this.store.workerArtifact(id);
+        return artifact ? { artifactId: id, headSha: artifact.headSha } : null;
+      });
       validateLocalIntegrationCheckpoint(checkpoint);
-      if (checkpoint.barrierId !== barrier.id || !checkpoint.consumerTaskIds.includes(task.id) || task.artifactBaseSha !== checkpoint.outputSha || (task.artifactDependencies ?? []).length) throw new Error(`Writer task ${task.id} must start exactly from LocalIntegrationCheckpoint output SHA`);
+      if (expectedInputs.some((input) => !input) || JSON.stringify(barrier.inputArtifacts) !== JSON.stringify(expectedInputs) || JSON.stringify(checkpoint.inputArtifacts) !== JSON.stringify(expectedInputs) || checkpoint.barrierId !== barrier.id || !checkpoint.consumerTaskIds.includes(task.id) || task.artifactBaseSha !== checkpoint.outputSha || (task.artifactDependencies ?? []).length) throw new Error(`Writer task ${task.id} has incomplete local checkpoint lineage`);
       return;
     }
-    if (!writerPredecessors.length) return;
+    if (!writerPredecessors.length) {
+      if ((task.artifactDependencies ?? []).length) throw new Error(`Writer task ${task.id} has unexpected artifact lineage without an effective writer predecessor`);
+      return;
+    }
     const predecessorId = writerPredecessors[0];
     const predecessor = this.store.workerArtifact(predecessorId);
     if (!predecessor) throw new Error(`Writer task ${task.id} cannot start before predecessor ${predecessorId} has a WorkerArtifact`);
@@ -1552,7 +1625,7 @@ export class SwarmRouter extends EventEmitter {
     const tasks = this.store.listTasks();
     for (const task of tasks) {
       if (this.config.roles[task.role]?.sandbox !== "workspace-write" || !String(task.integrationBarrierId ?? "").startsWith("pending:") || task.status !== "queued") continue;
-      const parentIds = task.dependencies.filter((id) => this.config.roles[this.store.getTask(id)?.role]?.sandbox === "workspace-write");
+      const parentIds = this.#effectiveWriterPredecessorIds(task);
       if (parentIds.length < 2) continue;
       const artifacts = parentIds.map((id) => this.store.workerArtifact(id));
       if (artifacts.some((artifact) => !artifact)) continue;
@@ -1565,8 +1638,21 @@ export class SwarmRouter extends EventEmitter {
       const barrier = this.store.claimIntegrationBarrier(pending.id);
       if (!barrier) continue;
       progressed = true;
-      const artifacts = barrier.inputArtifacts.map((item) => this.store.workerArtifact(item.artifactId));
-      const resolved = this.#resolveEffectiveLineage(barrier.inputArtifacts.map((item) => item.artifactId), { baseSha: barrier.baseSha });
+      const consumers = this.store.listTasks().filter((item) => item.integrationBarrierId === barrier.id && item.status === "queued");
+      const consumer = consumers[0];
+      // A persisted barrier can be independently valid at a crash boundary
+      // before it is linked to a fan-in consumer. Its immutable inputs remain
+      // the authoritative lineage in that case; do not bypass the integrator
+      // (or its managed-worktree ownership record) merely because no consumer
+      // is present yet.
+      const parentIds = consumer ? this.#effectiveWriterPredecessorIds(consumer) : barrier.inputArtifacts.map((input) => input.artifactId);
+      const artifacts = parentIds.map((id) => this.store.workerArtifact(id));
+      const expectedInputs = artifacts.map((artifact) => ({ artifactId: artifact?.taskId, headSha: artifact?.headSha }));
+      if ((consumer && parentIds.length < 2) || artifacts.some((artifact) => !artifact) || JSON.stringify(barrier.inputArtifacts) !== JSON.stringify(expectedInputs)) {
+        this.store.failIntegrationBarrier(barrier.id, "integration_barrier_input_integrity");
+        continue;
+      }
+      const resolved = this.#resolveEffectiveLineage(parentIds, { baseSha: barrier.baseSha });
       const result = await new Integrator({ ...this.config, processRunner: this.processRunner, worktrees: this.worktrees, deliveryRunId: barrier.deliveryRunId }).integrateBarrier({ barrier, artifacts, effectiveArtifacts: resolved.artifacts, effectiveLineage: resolved.lineage, allowedBaseShas: resolved.allowedBaseShas, overlay: this.#workerOverlayContext().overlay });
       if (result.status !== "passed") {
         this.store.failIntegrationBarrier(barrier.id, result.error);
@@ -1574,8 +1660,7 @@ export class SwarmRouter extends EventEmitter {
         if (consumer) this.#recordScopedFailure(consumer, result.error, "barrier_failure", { barrierId: barrier.id, inputArtifacts: barrier.inputArtifacts });
         continue;
       }
-      const consumers = this.store.listTasks().filter((item) => item.integrationBarrierId === barrier.id && item.status === "queued");
-      const checkpoint = { schemaVersion: 2, kind: "LocalIntegrationCheckpoint", id: randomUUID(), deliveryRunId: barrier.deliveryRunId, blueprintId: barrier.blueprintId, wave: barrier.wave, baseSha: barrier.baseSha, inputArtifacts: barrier.inputArtifacts, outputSha: result.outputSha, verificationResults: result.verificationResults, status: "passed", barrierId: barrier.id, effectiveLineage: resolved.lineage, consumerTaskIds: consumers.map((task) => task.id), createdAt: new Date().toISOString() };
+      const checkpoint = { schemaVersion: 2, kind: "LocalIntegrationCheckpoint", id: randomUUID(), deliveryRunId: barrier.deliveryRunId, blueprintId: barrier.blueprintId, wave: barrier.wave, baseSha: barrier.baseSha, inputArtifacts: expectedInputs, outputSha: result.outputSha, verificationResults: result.verificationResults, status: "passed", barrierId: barrier.id, effectiveLineage: resolved.lineage, consumerTaskIds: consumers.map((task) => task.id), createdAt: new Date().toISOString() };
       this.store.recordLocalIntegrationCheckpoint(checkpoint);
       this.#lifecycle("integration barrier checkpointed", { barrierId: barrier.id, checkpointId: checkpoint.id, outputSha: checkpoint.outputSha });
     }
@@ -1611,12 +1696,13 @@ export class SwarmRouter extends EventEmitter {
       const task = tasks.get(taskId), artifact = this.store.workerArtifact(taskId);
       if (!task || !artifact || task.status !== "done") throw new Error(`Effective lineage input ${taskId} is missing or unfinished`);
       visitingTasks.add(taskId);
+      if (this.config.roles[task.role]?.sandbox === "workspace-write") this._assertWriterArtifactLineage(task);
       if (task.localCheckpointId) {
         const checkpoint = this.store.integrationCheckpoint(task.localCheckpointId);
         if (!checkpoint || !checkpoint.consumerTaskIds.includes(task.id) || task.artifactBaseSha !== checkpoint.outputSha) throw new Error(`Task ${task.id} has incomplete local checkpoint lineage`);
         addCheckpoint(task.localCheckpointId);
       }
-      for (const dependency of task.artifactDependencies ?? []) visit(dependency);
+      for (const dependency of this.#effectiveWriterPredecessorIds(task)) visit(dependency);
       if (!resolvedBase) resolvedBase = task.planBatchId ? this.store.planBatch(task.planBatchId)?.basedOnCheckpointSha : artifact.baseSha;
       seenArtifacts.add(taskId); artifacts.push(artifact); lineage.push({ kind: "artifact", id: artifact.taskId, sha: artifact.headSha }); visitingTasks.delete(taskId);
     };
