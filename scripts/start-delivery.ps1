@@ -6,7 +6,6 @@ param(
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $source = Join-Path $projectRoot 'docs\project-specifications'
-$watchScript = Join-Path $PSScriptRoot 'watch-delivery.ps1'
 $env:NODE_NO_WARNINGS = '1'
 
 if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw "Project documentation directory is missing: $source" }
@@ -41,8 +40,9 @@ if ($LASTEXITCODE -ne 0) { throw "Could not recover stale delivery state" }
 if ($recovery) { Write-Host ($recovery -join "`n") }
 
 $status = Get-DeliveryStatus
+$watchCommand = "& '.\scripts\watch-delivery.ps1' -IntervalMs $IntervalMs"
 $monitor = Start-Process -FilePath 'powershell.exe' -WorkingDirectory $projectRoot -PassThru -ArgumentList @(
-  '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScript, '-IntervalMs', $IntervalMs
+  '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $watchCommand
 )
 if (-not $monitor) { throw 'Could not start the live delivery monitor.' }
 Start-Sleep -Milliseconds 750
