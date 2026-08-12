@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -143,14 +143,49 @@ test("legacy Blueprint and scoped replan without a manifest cannot start Planner
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
 
-test("green exact-candidate CI without available product E2E evidence is blocked_acceptance and never merges", async () => {
-  const fixture = setup(true); const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+test("production manifest-backed product evidence is wired automatically and gates publication", async () => {
+  const fixture = setup(true); const executed = []; fixture.config.processRunner = async (command) => { executed.push(command); return { pid: 91, stdout: "bounded output SECRET_SHOULD_NOT_PERSIST", stderr: "" }; }; const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
   try {
     const adapters = fakeRemote(calls); delete adapters.productEvidenceAdapter;
     const final = await coordinator.begin({ source: fixture.source, ...adapters });
-    assert.equal(final.state, "blocked_acceptance"); assert.equal(calls.merge, 0);
+    assert.equal(final.state, "completed_merged"); assert.deepEqual(calls, { push: 1, pr: 1, ci: 1, merge: 1 }); assert.ok(executed.length >= 3);
     const report = router.store.productAcceptanceForRun(final.id);
-    assert.equal(report.passing, false); assert.equal(report.report.evidence.productE2e.status, "not_verified");
+    assert.equal(report.passing, true); assert.equal(report.report.evidence.productE2e.status, "pass");
+    const persisted = router.store.db.prepare("SELECT execution_json FROM product_evidence_executions").get();
+    assert.ok(persisted); assert.doesNotMatch(persisted.execution_json, /SECRET_SHOULD_NOT_PERSIST/); assert.match(persisted.execution_json, /outputDigest/);
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("missing product VerificationManifest blocks before any remote publication", async () => {
+  const fixture = setup(true); const executed = []; let removed = false; fixture.config.processRunner = async (command) => { executed.push(command); if (!removed && String(command.cwd).replace(/\\/g, "/").includes("/integrations/")) { const path = join(fixture.root, "docs", "orchestration-generated", "project-overlay.v1.json"); const overlay = JSON.parse(readFileSync(path, "utf8")); overlay.verificationCommands = []; writeFileSync(path, JSON.stringify(overlay)); removed = true; } return { pid: 1, stdout: "", stderr: "" }; }; const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+  try {
+    const adapters = fakeRemote(calls); delete adapters.productEvidenceAdapter;
+    const final = await coordinator.begin({ source: fixture.source, ...adapters });
+    assert.equal(final.state, "blocked_acceptance"); assert.deepEqual(calls, { push: 0, pr: 0, ci: 0, merge: 0 }); assert.equal(executed.filter((command) => String(command.cwd).replace(/\\/g, "/").includes("/integrations/")).length, 1, "only integration verification ran; product command did not");
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("failed production verification blocks before publication", async () => {
+  const fixture = setup(true); let count = 0; let candidateCommands = 0; fixture.config.processRunner = async (command) => { count += 1; if (String(command.cwd).replace(/\\/g, "/").includes("/integrations/")) { candidateCommands += 1; if (candidateCommands >= 2) throw Object.assign(new Error("failed product command"), { code: 1, stdout: "secret", stderr: "failure" }); } return { pid: 1, stdout: "ok", stderr: "" }; }; const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+  try {
+    const adapters = fakeRemote(calls); delete adapters.productEvidenceAdapter;
+    const final = await coordinator.begin({ source: fixture.source, ...adapters });
+    assert.equal(final.state, "blocked_acceptance"); assert.deepEqual(calls, { push: 0, pr: 0, ci: 0, merge: 0 }); assert.ok(count >= 2); assert.equal(candidateCommands, 2);
+    const record = router.store.db.prepare("SELECT execution_json FROM product_evidence_executions").get(); assert.match(record.execution_json, /\"result\":\"failed\"/); assert.doesNotMatch(record.execution_json, /secret/);
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test("production evidence reuse is restart-safe only for the exact immutable candidate identity", async () => {
+  const fixture = setup(true); let executions = 0; fixture.config.processRunner = async () => { executions += 1; return { pid: 1, stdout: "ok", stderr: "" }; }; const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router); const calls = { push: 0, pr: 0, ci: 0, merge: 0 };
+  try {
+    const adapters = fakeRemote(calls); delete adapters.productEvidenceAdapter;
+    const final = await coordinator.begin({ source: fixture.source, ...adapters }); assert.equal(final.state, "completed_merged");
+    const integration = router.store.integrationManifest(final.integrationPath); const candidate = { branch: integration.branch, sha: integration.candidateSha };
+    const beforeReuse = executions;
+    const reused = await coordinator.productEvidenceExecutor.verify({ candidate, manifest: integration, deliveryRunId: final.id });
+    assert.equal(reused.results[0].status, "pass"); assert.equal(executions, beforeReuse, "exact persisted proof is reused without another command");
+    const stale = await coordinator.productEvidenceExecutor.verify({ candidate: { ...candidate, sha: "c".repeat(40) }, manifest: integration, deliveryRunId: final.id });
+    assert.deepEqual(stale.results, []); assert.equal(executions, beforeReuse, "a stale candidate cannot reuse proof or run a command");
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
 
@@ -177,7 +212,7 @@ test("missing, wrong-SHA, malformed, or failed criterion evidence blocks publica
     try {
       const final = await coordinator.begin({ source: fixture.source, ...fakeRemote(calls, product) });
       const acceptance = router.store.productAcceptanceForRun(final.id);
-      assert.equal(final.state, "blocked_acceptance", label); assert.equal(calls.merge, 0, label); assert.equal(acceptance.passing, false, label);
+      assert.equal(final.state, "blocked_acceptance", label); assert.deepEqual(calls, { push: 0, pr: 0, ci: 0, merge: 0 }, label); assert.equal(acceptance.passing, false, label);
     } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
   }
 });

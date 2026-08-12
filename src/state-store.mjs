@@ -233,6 +233,13 @@ export class StateStore {
         candidate_sha TEXT NOT NULL, report_json TEXT NOT NULL, passing INTEGER NOT NULL, created_at TEXT NOT NULL
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_acceptance_identity ON product_acceptance_reports(delivery_run_id, manifest_id, candidate_sha);
+      CREATE TABLE IF NOT EXISTS product_evidence_executions (
+        id TEXT PRIMARY KEY, delivery_run_id TEXT NOT NULL REFERENCES delivery_runs(id), integration_manifest_id TEXT NOT NULL,
+        candidate_sha TEXT NOT NULL, blueprint_id TEXT NOT NULL, blueprint_digest TEXT NOT NULL,
+        verification_manifest_id TEXT NOT NULL, verification_manifest_digest TEXT NOT NULL, worktree TEXT NOT NULL,
+        execution_json TEXT NOT NULL, success INTEGER NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_product_evidence_identity ON product_evidence_executions(delivery_run_id, integration_manifest_id, candidate_sha, verification_manifest_id);
       CREATE TABLE IF NOT EXISTS plan_batches (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, kind TEXT NOT NULL,
         delivery_run_id TEXT NOT NULL, blueprint_id TEXT NOT NULL, wave INTEGER NOT NULL,
@@ -1284,6 +1291,33 @@ export class StateStore {
   productAcceptanceForRun(deliveryRunId, { candidateSha = null, manifestId = null } = {}) {
     const rows = this.db.prepare("SELECT id FROM product_acceptance_reports WHERE delivery_run_id = ? ORDER BY created_at DESC").all(deliveryRunId);
     return rows.map((row) => this.productAcceptanceReport(row.id)).find((item) => (!candidateSha || item.report.candidateSha.toLowerCase() === candidateSha.toLowerCase()) && (!manifestId || item.report.integrationManifestId === manifestId)) ?? null;
+  }
+
+  recordProductEvidenceExecution(execution) {
+    const required = ["id", "deliveryRunId", "integrationManifestId", "candidateSha", "blueprintId", "blueprintDigest", "verificationManifestId", "verificationManifestDigest", "worktree"];
+    if (!execution || required.some((key) => typeof execution[key] !== "string" || !execution[key]) || !Array.isArray(execution.commands) || !execution.evidence || typeof execution.success !== "boolean") throw new Error("Product evidence execution record is incomplete");
+    const existing = this.db.prepare("SELECT id FROM product_evidence_executions WHERE id = ?").get(execution.id);
+    if (existing) return this.productEvidenceExecution(existing.id);
+    this.#mutate(null, "product-evidence/executed", { deliveryRunId: execution.deliveryRunId, integrationManifestId: execution.integrationManifestId, candidateSha: execution.candidateSha, verificationManifestId: execution.verificationManifestId, success: execution.success, commandCount: execution.commands.length }, () => {
+      this.db.prepare("INSERT INTO product_evidence_executions(id,delivery_run_id,integration_manifest_id,candidate_sha,blueprint_id,blueprint_digest,verification_manifest_id,verification_manifest_digest,worktree,execution_json,success,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+        .run(execution.id, execution.deliveryRunId, execution.integrationManifestId, execution.candidateSha, execution.blueprintId, execution.blueprintDigest, execution.verificationManifestId, execution.verificationManifestDigest, execution.worktree, JSON.stringify(execution), execution.success ? 1 : 0, now());
+    });
+    return this.productEvidenceExecution(execution.id);
+  }
+
+  productEvidenceExecution(id) {
+    const row = this.db.prepare("SELECT * FROM product_evidence_executions WHERE id = ?").get(id);
+    return row ? { id: row.id, record: parse(row.execution_json, null), success: Boolean(row.success), createdAt: row.created_at } : null;
+  }
+
+  productEvidenceExecutionForIdentity(identity) {
+    if (!identity || ["deliveryRunId", "integrationManifestId", "candidateSha", "blueprintId", "blueprintDigest", "verificationManifestId", "verificationManifestDigest", "worktree"].some((key) => typeof identity[key] !== "string" || !identity[key])) return null;
+    const row = this.db.prepare("SELECT id FROM product_evidence_executions WHERE delivery_run_id = ? AND integration_manifest_id = ? AND candidate_sha = ? AND verification_manifest_id = ? ORDER BY created_at DESC LIMIT 1")
+      .get(identity.deliveryRunId, identity.integrationManifestId, identity.candidateSha, identity.verificationManifestId);
+    const stored = row ? this.productEvidenceExecution(row.id) : null;
+    if (!stored?.success) return null;
+    const record = stored.record;
+    return record?.deliveryRunId === identity.deliveryRunId && record.integrationManifestId === identity.integrationManifestId && record.candidateSha?.toLowerCase() === identity.candidateSha.toLowerCase() && record.blueprintId === identity.blueprintId && record.blueprintDigest === identity.blueprintDigest && record.verificationManifestId === identity.verificationManifestId && record.verificationManifestDigest === identity.verificationManifestDigest && record.worktree === identity.worktree ? stored : null;
   }
 
   completeDeliveryWithAcceptance({ deliveryRunId, reportId, merge, publish = {} }) {

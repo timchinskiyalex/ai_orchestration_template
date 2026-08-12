@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { ingestDocumentation } from "./project-intake.mjs";
 import { ENGINEERING_DOMAINS } from "./domain.mjs";
 import { specificationBlockers } from "./product-blueprint.mjs";
+import { ProductEvidenceExecutor } from "./product-evidence-executor.mjs";
 
 function manualGateFor(tasks) {
   const task = tasks.find((item) => ["awaiting_human", "awaiting_approval"].includes(item.status));
@@ -17,7 +18,7 @@ function terminalForTask(task) {
 }
 
 export class DeliveryCoordinator {
-  constructor(router) { this.router = router; }
+  constructor(router) { this.router = router; this.productEvidenceExecutor = new ProductEvidenceExecutor(router); }
 
   async begin({ source, ...adapters }) {
     await this.router.recoverStaleDeliveries();
@@ -155,25 +156,51 @@ export class DeliveryCoordinator {
   }
 
   async #publishWithAcceptance(run, integration, adapters) {
-    const preliminary = await this.router.publishCandidate(integration, adapters);
-    if (preliminary.terminalState !== "awaiting_final_acceptance") return this.router.store.updateDeliveryRun(run.id, { state: preliminary.terminalState, integrationPath: integration.path, publish: preliminary, confirmRemotePush: this.router.isAutonomous() });
     const existing = this.router.store.productAcceptanceForRun(run.id, { candidateSha: integration.manifest.candidateSha, manifestId: integration.manifest.id });
     let acceptance = existing;
     if (!acceptance) {
-      let productEvidence = null;
+      // Product verification is a pre-publication controller gate.  In normal
+      // CLI delivery this is the manifest-backed executor; injected adapters
+      // remain a narrowly scoped test seam only.
       const adapter = adapters.productEvidenceAdapter;
       const candidate = { branch: integration.manifest.branch, sha: integration.manifest.candidateSha };
-      if (adapter) productEvidence = typeof adapter.verify === "function" ? await adapter.verify({ candidate, manifest: integration.manifest, deliveryRunId: run.id }) : await adapter({ candidate, manifest: integration.manifest, deliveryRunId: run.id });
+      const productEvidence = adapter
+        ? (typeof adapter.verify === "function" ? await adapter.verify({ candidate, manifest: integration.manifest, deliveryRunId: run.id }) : await adapter({ candidate, manifest: integration.manifest, deliveryRunId: run.id }))
+        : await this.productEvidenceExecutor.verify({ candidate, manifest: integration.manifest, deliveryRunId: run.id });
+      const productReady = this.#productEvidenceReady(run, candidate, productEvidence);
+      if (!productReady) {
+        acceptance = this.router.store.recordProductAcceptanceReport(await this.router.buildProductAcceptanceReport({ integration, remoteCi: null, productEvidence }));
+        return this.#blockedAcceptance(run, integration, acceptance, { reason: "Final product evidence did not pass before publication; candidate and evidence are retained." });
+      }
+      const preliminary = await this.router.publishCandidate(integration, adapters);
+      if (preliminary.terminalState !== "awaiting_final_acceptance") return this.router.store.updateDeliveryRun(run.id, { state: preliminary.terminalState, integrationPath: integration.path, publish: preliminary, confirmRemotePush: this.router.isAutonomous() });
       acceptance = this.router.store.recordProductAcceptanceReport(await this.router.buildProductAcceptanceReport({ integration, remoteCi: preliminary.remoteCi, productEvidence }));
     }
     if (!acceptance.passing) {
-      const report = acceptance.report;
-      const specification = specificationBlockers(this.router.store.productBlueprint(report.blueprintId)?.blueprint ?? []).length > 0;
-      return this.router.store.updateDeliveryRun(run.id, { state: specification ? "blocked_specification" : "blocked_acceptance", integrationPath: integration.path, publish: { ...preliminary, acceptanceReportId: acceptance.id, reason: specification ? "Final acceptance is blocked by a source/specification condition." : "Final acceptance did not pass; candidate and evidence are retained." }, confirmRemotePush: this.router.isAutonomous() });
+      return this.#blockedAcceptance(run, integration, acceptance, { reason: "Final acceptance did not pass; candidate and evidence are retained." });
     }
     const merged = await this.router.publishCandidate(integration, { ...adapters, acceptanceReportId: acceptance.id });
     if (merged.terminalState !== "merge_verified") return this.router.store.updateDeliveryRun(run.id, { state: merged.terminalState, integrationPath: integration.path, publish: merged, confirmRemotePush: this.router.isAutonomous() });
     return this.router.store.completeDeliveryWithAcceptance({ deliveryRunId: run.id, reportId: acceptance.id, merge: merged.merge, publish: merged });
+  }
+
+  #blockedAcceptance(run, integration, acceptance, { reason }) {
+    const report = acceptance.report;
+    const specification = specificationBlockers(this.router.store.productBlueprint(report.blueprintId)?.blueprint ?? []).length > 0;
+    return this.router.store.updateDeliveryRun(run.id, { state: specification ? "blocked_specification" : "blocked_acceptance", integrationPath: integration.path, publish: { acceptanceReportId: acceptance.id, reason: specification ? "Final acceptance is blocked by a source/specification condition." : reason }, confirmRemotePush: this.router.isAutonomous() });
+  }
+
+  #productEvidenceReady(run, candidate, evidence) {
+    const current = this.router.store.deliveryRun(run.id);
+    const blueprint = this.router.store.productBlueprint(current?.blueprintId)?.blueprint;
+    const criteria = blueprint?.requirements?.flatMap((requirement) => requirement.acceptanceCriteria.map((criterion) => `${requirement.requirementId}:${criterion.criterionId}`)) ?? [];
+    if (!criteria.length || evidence?.candidateSha?.toLowerCase() !== candidate.sha.toLowerCase() || !Array.isArray(evidence?.results) || evidence.results.length !== criteria.length) return false;
+    const expected = new Set(criteria); const seen = new Set();
+    return evidence.results.every((item) => {
+      const key = `${item?.requirementId}:${item?.criterionId}`;
+      if (!expected.has(key) || seen.has(key) || item?.status !== "pass" || typeof item?.testId !== "string" || !item.testId.trim() || typeof item?.reference !== "string" || !item.reference.trim() || item?.candidateSha?.toLowerCase() !== candidate.sha.toLowerCase()) return false;
+      seen.add(key); return true;
+    }) && seen.size === expected.size;
   }
 
   #awaiting(run, gate) {
