@@ -23,11 +23,11 @@ $stderrPath = "$LogPath.stderr"
 Write-Host "[remediation] Codex stage $StageId started. Output is also saved to $LogPath"
 
 try {
-  $prompt | & $codex.Source exec `
-    --dangerously-bypass-approvals-and-sandbox `
-    --cd $projectRoot `
-    --output-last-message "$LogPath.final.txt" `
-    --color always 2>$stderrPath | Tee-Object -LiteralPath $LogPath
+  # Invoke the npm .cmd shim through cmd.exe. Calling it directly through a
+  # PowerShell pipeline can report a false non-zero status after Codex has
+  # successfully written its final message.
+  $codexCommand = "`"$($codex.Source)`" exec --dangerously-bypass-approvals-and-sandbox --cd `"$projectRoot`" --output-last-message `"$LogPath.final.txt`" --color always"
+  $prompt | & cmd.exe /d /s /c "`"$codexCommand`"" 2>$stderrPath | Tee-Object -LiteralPath $LogPath
   $exitCode = $LASTEXITCODE
 }
 finally {
