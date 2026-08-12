@@ -10,6 +10,8 @@ const classifications = new Set(["mandatory", "non_mandatory", "ambiguous"]);
 const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
   ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
 export const SOURCE_CLAIM_MANIFEST_SCHEMA_VERSION = 1;
+export const SOURCE_CLAIM_EXTRACTION_SCHEMA_VERSION = 1;
+const claimTypes = new Set(["functional", "non_functional", "constraint", "decision", "risk", "assumption", "scope"]);
 
 export function normalizeSourceText(text) {
   return String(text).replace(/\r\n?/g, "\n");
@@ -90,7 +92,47 @@ export function createImportedSourceResolver(context) {
   }
 
   function lineCount(documentId) { const lines = sourceLines(readDocument(documentId)); return lines.at(-1) === "" ? lines.length - 1 : lines.length; }
-  return Object.freeze({ sourceDocuments: Object.freeze(sourceDocuments), verify, lineCount });
+  function controlledDocuments() {
+    return Object.freeze(sourceDocuments.map((document) => Object.freeze({
+      ...document,
+      lineCount: lineCount(document.documentId),
+      text: readDocument(document.documentId)
+    })));
+  }
+  return Object.freeze({ sourceDocuments: Object.freeze(sourceDocuments), verify, lineCount, controlledDocuments });
+}
+
+export function sourceClaimCandidateId({ documentId, startLine, endLine, claimType, normalizedStatement }) {
+  const identity = `${documentId}:${startLine}:${endLine}:${claimType}:${normalizedStatement}`;
+  return `claim-${sha256(identity).slice(0, 24)}`;
+}
+
+// This deliberately validates evidence only. It does not admit claims as
+// facts, require document coverage, or create the authoritative manifest.
+export function validateSourceClaimExtraction(value, { sourceResolver }) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.schemaVersion !== SOURCE_CLAIM_EXTRACTION_SCHEMA_VERSION || value.kind !== "SourceClaimExtraction") claimContractError("source_claim_extraction_schema_invalid");
+  const sourceDocuments = sourceResolver.sourceDocuments;
+  const documentSetDigest = sha256(canonical([...sourceDocuments].sort((a, b) => a.path.localeCompare(b.path))));
+  if (value.documentSetDigest !== documentSetDigest || !Array.isArray(value.claims) || !value.claims.length) claimContractError("source_claim_extraction_document_set_or_claims_invalid");
+  const documents = new Map(sourceDocuments.map((item) => [item.documentId, item]));
+  const seen = new Set();
+  const claims = value.claims.map((claim) => {
+    if (!claim || typeof claim !== "object" || Array.isArray(claim) || !claimIdPattern.test(claim.claimId ?? "") || seen.has(claim.claimId) || !documents.has(claim.documentId) || !Number.isInteger(claim.startLine) || !Number.isInteger(claim.endLine) || claim.startLine < 1 || claim.endLine < claim.startLine || !digestPattern.test(claim.sourceDigest ?? "") || !claimTypes.has(claim.claimType) || typeof claim.normalizedStatement !== "string" || !claim.normalizedStatement.trim() || claim.normalizedStatement.length > 2000 || typeof claim.confidence !== "number" || !Number.isFinite(claim.confidence) || claim.confidence < 0 || claim.confidence > 1) claimContractError("source_claim_extraction_claim_invalid");
+    const expected = documents.get(claim.documentId);
+    if (claim.sourceDigest !== expected.sha256) claimContractError(`source_claim_extraction_source_digest_mismatch:${claim.claimId}`);
+    let ref;
+    try { ref = sourceResolver.verify({ documentId: claim.documentId, startLine: claim.startLine, endLine: claim.endLine, excerptDigest: claim.sourceQuote?.excerptDigest }, `extracted claim '${claim.claimId}'`); }
+    catch (error) { claimContractError(error.message.replace(/^source_provenance: /, "")); }
+    if (!claim.sourceQuote || claim.sourceQuote.documentId !== claim.documentId || claim.sourceQuote.startLine !== claim.startLine || claim.sourceQuote.endLine !== claim.endLine) claimContractError(`source_claim_extraction_quote_reference_invalid:${claim.claimId}`);
+    const normalizedStatement = claim.normalizedStatement.trim().replace(/\s+/g, " ");
+    const stableId = sourceClaimCandidateId({ ...claim, normalizedStatement });
+    if (claim.claimId !== stableId) claimContractError(`source_claim_extraction_claim_id_unstable:${claim.claimId}`);
+    seen.add(claim.claimId);
+    return Object.freeze({ claimId: claim.claimId, documentId: claim.documentId, startLine: claim.startLine, endLine: claim.endLine, sourceDigest: claim.sourceDigest, claimType: claim.claimType, normalizedStatement, confidence: claim.confidence, sourceQuote: ref });
+  });
+  const unsigned = { schemaVersion: SOURCE_CLAIM_EXTRACTION_SCHEMA_VERSION, kind: "SourceClaimExtraction", documentSetDigest, sourceDocuments, claims: [...claims].sort((a, b) => a.claimId.localeCompare(b.claimId)) };
+  const digest = sha256(canonical(unsigned));
+  return Object.freeze({ ...unsigned, extractionId: `sce-${digest.slice(0, 24)}`, digest });
 }
 
 // This is deliberately a declaration compiler, not an extraction heuristic.

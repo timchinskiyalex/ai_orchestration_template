@@ -21,6 +21,7 @@ export class StateStore {
     this.hasTokenUsageSource = this.#hasColumn("tasks", "token_usage_source");
     this.hasResolutionAuthorityEvidence = this.#hasTable("specification_resolution_evidence");
     this.hasSourceClaimManifests = this.#hasTable("source_claim_manifests");
+    this.hasSourceClaimExtractions = this.#hasTable("source_claim_extractions");
     this.hasRepositoryBaselines = this.#hasTable("repository_baselines") && this.#hasColumn("delivery_runs", "repository_mode");
     this.hasManagedWorktrees = this.#hasTable("managed_worktrees");
     if (readOnly) return;
@@ -207,6 +208,11 @@ export class StateStore {
         manifest_id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, digest TEXT NOT NULL,
         document_set_digest TEXT NOT NULL, manifest_json TEXT NOT NULL, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS source_claim_extractions (
+        extraction_id TEXT PRIMARY KEY, delivery_run_id TEXT NOT NULL REFERENCES delivery_runs(id),
+        schema_version INTEGER NOT NULL, digest TEXT NOT NULL, document_set_digest TEXT NOT NULL,
+        artifact_path TEXT NOT NULL, extraction_json TEXT NOT NULL, created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS repository_baseline_drafts (
         delivery_run_id TEXT PRIMARY KEY REFERENCES delivery_runs(id),
         schema_version INTEGER NOT NULL, draft_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -312,6 +318,7 @@ export class StateStore {
     `);
     this.hasResolutionAuthorityEvidence = true;
     this.hasSourceClaimManifests = true;
+    this.hasSourceClaimExtractions = true;
     this.hasRepositoryBaselines = true;
     this.hasManagedWorktrees = true;
     this.#addColumnIfMissing("tasks", "dependencies_json", "TEXT NOT NULL DEFAULT '[]'");
@@ -380,6 +387,8 @@ export class StateStore {
     this.#addColumnIfMissing("delivery_runs", "blueprint_id", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "completion_contract_version", "INTEGER NOT NULL DEFAULT 0");
     this.#addColumnIfMissing("delivery_runs", "source_claim_manifest_id", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "source_claim_extraction_id", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "source_claim_input_mode", "TEXT NOT NULL DEFAULT 'supplied'");
     this.#addColumnIfMissing("delivery_runs", "repository_mode", "TEXT NOT NULL DEFAULT 'legacy'");
     this.#addColumnIfMissing("delivery_runs", "repository_base_sha", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "repository_baseline_id", "TEXT");
@@ -745,14 +754,14 @@ export class StateStore {
     return row ? { writerTaskId: row.writer_task_id, path: row.report_path, report: JSON.parse(row.report_json) } : null;
   }
 
-  createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false, ownerPid, ownerSessionId, sourceClaimManifestId = null, repositoryMode = "legacy", repositoryBaseSha = null }) {
+  createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false, ownerPid, ownerSessionId, sourceClaimManifestId = null, sourceClaimInputMode = "supplied", repositoryMode = "legacy", repositoryBaseSha = null }) {
     if (!Number.isInteger(ownerPid) || ownerPid < 1 || typeof ownerSessionId !== "string" || !ownerSessionId) throw new Error("Delivery run requires an initial owner lease");
     const timestamp = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const active = this.db.prepare("SELECT id FROM delivery_runs WHERE state IN ('running','awaiting_human','awaiting_human_remote_handoff') LIMIT 1").get();
       if (active) throw new Error(`Delivery already owned by active run: ${active.id}`);
-      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, owner_pid, owner_session_id, heartbeat_at, completion_contract_version, source_claim_manifest_id, repository_mode, repository_base_sha, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, ownerPid, ownerSessionId, timestamp, sourceClaimManifestId, repositoryMode, repositoryBaseSha, timestamp, timestamp);
+      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, owner_pid, owner_session_id, heartbeat_at, completion_contract_version, source_claim_manifest_id, source_claim_input_mode, repository_mode, repository_base_sha, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, ownerPid, ownerSessionId, timestamp, sourceClaimManifestId, sourceClaimInputMode, repositoryMode, repositoryBaseSha, timestamp, timestamp);
       this.#insertEvent(bootstrapTaskId, "delivery/created", { deliveryRunId: id, confirmRemotePush: Boolean(confirmRemotePush), ownerPid, ownerSessionId, heartbeatAt: timestamp });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -1043,6 +1052,27 @@ export class StateStore {
     return row ? { manifest: JSON.parse(row.manifest_json), digest: row.digest, documentSetDigest: row.document_set_digest, createdAt: row.created_at } : null;
   }
 
+  recordSourceClaimExtraction({ deliveryRunId, extraction, artifactPath }) {
+    if (!this.hasSourceClaimExtractions || !this.deliveryRun(deliveryRunId) || !extraction?.extractionId || !extraction?.digest || !extraction?.documentSetDigest || typeof artifactPath !== "string" || !artifactPath) throw new Error("SourceClaimExtraction identity is invalid");
+    const recordId = `${extraction.extractionId}@${deliveryRunId}`;
+    const existing = this.db.prepare("SELECT digest, delivery_run_id FROM source_claim_extractions WHERE extraction_id = ?").get(recordId);
+    if (existing && (existing.digest !== extraction.digest || existing.delivery_run_id !== deliveryRunId)) throw new Error(`SourceClaimExtraction '${extraction.extractionId}' is immutable and mismatched`);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (!existing) this.db.prepare("INSERT INTO source_claim_extractions(extraction_id,delivery_run_id,schema_version,digest,document_set_digest,artifact_path,extraction_json,created_at) VALUES (?,?,?,?,?,?,?,?)").run(recordId, deliveryRunId, extraction.schemaVersion, extraction.digest, extraction.documentSetDigest, artifactPath, JSON.stringify(extraction), now());
+      this.db.prepare("UPDATE delivery_runs SET source_claim_extraction_id = ?, updated_at = ? WHERE id = ? AND source_claim_extraction_id IS NULL").run(recordId, now(), deliveryRunId);
+      this.#insertEvent(null, "source-claim-extraction/persisted", { deliveryRunId, extractionId: extraction.extractionId, digest: extraction.digest, claimCount: extraction.claims.length });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.sourceClaimExtraction(recordId);
+  }
+
+  sourceClaimExtraction(extractionId) {
+    if (!this.hasSourceClaimExtractions) return null;
+    const row = this.db.prepare("SELECT * FROM source_claim_extractions WHERE extraction_id = ?").get(extractionId);
+    return row ? { id: row.extraction_id, extraction: JSON.parse(row.extraction_json), artifactPath: row.artifact_path, digest: row.digest, documentSetDigest: row.document_set_digest, deliveryRunId: row.delivery_run_id, createdAt: row.created_at } : null;
+  }
+
   recordProductBlueprint({ blueprint, artifactPath, digest, bootstrapTaskId = null, deliveryRunId = null, sourceClaimManifestId = null }) {
     const existing = this.db.prepare("SELECT artifact_path FROM product_blueprints WHERE blueprint_id = ?").get(blueprint.blueprintId);
     if (existing) throw new Error(`ProductBlueprint '${blueprint.blueprintId}' is immutable and already persisted at ${existing.artifact_path}`);
@@ -1104,6 +1134,16 @@ export class StateStore {
       this.#insertEvent(current.bootstrapTaskId, "delivery/resumed", { deliveryRunId: id, previousState: current.state, ownerPid, ownerSessionId, publicationCheckpoint: current.publicationCheckpoint });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(id);
+  }
+
+  resumeSourceClaimExtractionRun(id, { ownerPid, ownerSessionId }) {
+    if (!Number.isInteger(ownerPid) || ownerPid < 1 || typeof ownerSessionId !== "string" || !ownerSessionId) throw new Error("Source claim extraction resume requires owner pid and session");
+    const run = this.deliveryRun(id);
+    if (!run || run.sourceClaimInputMode !== "raw" || run.sourceClaimExtractionId || run.state !== "blocked_specification" || !String(run.publish?.reason ?? "").startsWith("source_claim_extraction:")) throw new Error("Delivery run is not a resumable raw source claim extraction");
+    const timestamp = now();
+    this.db.prepare("UPDATE delivery_runs SET state = 'running', owner_pid = ?, owner_session_id = ?, heartbeat_at = ?, updated_at = ? WHERE id = ? AND state = 'blocked_specification'").run(ownerPid, ownerSessionId, timestamp, timestamp, id);
+    this.#insertEvent(null, "source-claim-extraction/resumed", { deliveryRunId: id });
     return this.deliveryRun(id);
   }
 
@@ -1249,7 +1289,7 @@ export class StateStore {
   }
 
   #mapDeliveryRun(row) {
-    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, sourceClaimManifestId: row.source_claim_manifest_id ?? null, repositoryMode: row.repository_mode ?? "legacy", repositoryBaseSha: row.repository_base_sha ?? null, repositoryBaselineId: row.repository_baseline_id ?? null, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
+    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, sourceClaimManifestId: row.source_claim_manifest_id ?? null, sourceClaimExtractionId: row.source_claim_extraction_id ?? null, sourceClaimInputMode: row.source_claim_input_mode ?? "supplied", repositoryMode: row.repository_mode ?? "legacy", repositoryBaseSha: row.repository_base_sha ?? null, repositoryBaselineId: row.repository_baseline_id ?? null, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   #mapScopedReplan(row) {

@@ -33,6 +33,16 @@ export class DeliveryCoordinator {
     });
     if (cancelled.length) this.router.store.recordEvent(null, "delivery/fresh-start-cleanup", { previousDeliveryRunId: current?.id ?? null, cancelledTaskIds: cancelled.map((task) => task.id) });
     const intake = ingestDocumentation({ source, repository: this.router.config.repository, destinationRelative: this.router.config.project.documentationDir });
+    // Raw documents deliberately stop at the candidate handoff. Stage 04 owns
+    // independent audit/admission and is the only stage allowed to create the
+    // authoritative SourceClaimManifest used by Bootstrap.
+    if (intake.sourceClaimInput === "raw") {
+      const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: null, confirmRemotePush: false, sourceClaimInputMode: "raw", repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: null });
+      try {
+        const candidate = await this.router.extractSourceClaimsForRun(run);
+        return this.router.store.updateDeliveryRun(run.id, { state: "awaiting_source_claim_audit", publish: { reason: "source_claim_extraction:candidate_persisted", extractionId: candidate.extraction.extractionId, digest: candidate.digest, recovery: { action: "Stage 04 audit/admission must independently validate and admit this candidate before Bootstrap." } } });
+      } catch (error) { return this.router.blockRunForSourceExtraction(run, error); }
+    }
     const overlay = await this.router.ensureProjectOverlay();
     // Brownfield identity is captured before Bootstrap creates the ProductBlueprint.
     // The immutable draft is finalized only after that persisted blueprint exists.
@@ -43,7 +53,7 @@ export class DeliveryCoordinator {
       // redacted delivery stop.  Queueing Bootstrap is harmless here: the run
       // is blocked before the scheduler can ever create an App Server turn.
       const bootstrap = this.router.startProject();
-      const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous(), sourceClaimManifestId: this.router.sourceClaimManifestIdentity(), repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: null });
+      const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous(), sourceClaimManifestId: this.router.sourceClaimManifestIdentity(), sourceClaimInputMode: "supplied", repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: null });
       this.router.store.linkTaskToDelivery(bootstrap.id, run.id);
       return this.router.blockRunForRepositoryBaseline(run, error);
     }
@@ -51,7 +61,7 @@ export class DeliveryCoordinator {
     // required at this phase because Bootstrap is the operation that creates it.
     const sourceClaimManifestId = this.router.sourceClaimManifestIdentity();
     const bootstrap = this.router.startProject();
-    const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous(), sourceClaimManifestId, repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: baselineDraft?.baseSha ?? null });
+    const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous(), sourceClaimManifestId, sourceClaimInputMode: "supplied", repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: baselineDraft?.baseSha ?? null });
     if (baselineDraft) this.router.store.recordRepositoryBaselineDraft(run.id, baselineDraft);
     this.router.store.linkTaskToDelivery(bootstrap.id, run.id);
     return this.#advance(run, { intake, overlayPath: overlay.path, ...adapters });
@@ -61,6 +71,21 @@ export class DeliveryCoordinator {
     await this.router.recoverStaleDeliveries();
     const run = this.router.store.currentDeliveryRun();
     if (!run) throw new Error("No delivery run exists; start with npm run deliver -- --source <docs-dir>");
+    if (run.sourceClaimInputMode === "raw") {
+      if (run.sourceClaimExtractionId) {
+        try { await this.router.extractSourceClaimsForRun(run); }
+        catch (error) { return this.router.blockRunForSourceExtraction(run, error); }
+        return this.router.store.updateDeliveryRun(run.id, { state: "awaiting_source_claim_audit", publish: { ...(run.publish ?? {}), reason: "source_claim_extraction:candidate_persisted", recovery: { action: "Stage 04 audit/admission must independently validate and admit this candidate before Bootstrap." } } });
+      }
+      if (["interrupted", "blocked_credentials", "blocked_specification"].includes(run.state)) {
+        const resumed = run.state === "blocked_specification" ? this.router.resumeSourceClaimExtractionRun(run.id) : this.router.resumeDeliveryRun(run.id);
+        try {
+          const candidate = await this.router.extractSourceClaimsForRun(resumed);
+          return this.router.store.updateDeliveryRun(resumed.id, { state: "awaiting_source_claim_audit", publish: { reason: "source_claim_extraction:candidate_persisted", extractionId: candidate.extraction.extractionId, digest: candidate.digest, recovery: { action: "Stage 04 audit/admission must independently validate and admit this candidate before Bootstrap." } } });
+        } catch (error) { return this.router.blockRunForSourceExtraction(resumed, error); }
+      }
+      return run;
+    }
     if (typeof this.router.assertRepositoryBaseline === "function") {
       try { this.router.assertRepositoryBaseline(run); }
       catch (error) { return this.router.blockRunForRepositoryBaseline(run, error); }

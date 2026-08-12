@@ -35,10 +35,11 @@ export function ingestDocumentation({ source, repository, destinationRelative })
   if (!isInside(repositoryRoot, destination)) throw new Error("documentationDir must stay inside the project repository");
   const files = markdownFiles(sourceRoot);
   if (!files.length) throw new Error("No Markdown files found in documentation source");
-  // The declaration is a single, explicit root companion.  Do not discover
-  // arbitrary JSON alongside docs: that would turn intake into a policy search.
+  // The declaration is a single, explicit root companion.  When absent the
+  // controller owns extraction; do not discover arbitrary JSON alongside docs.
   const declaration = join(sourceRoot, "source-claims.json");
-  if (!existsSync(declaration) || lstatSync(declaration).isSymbolicLink()) throw new Error("source_claim_contract: missing_required_source_claims_declaration");
+  const suppliedDeclaration = existsSync(declaration);
+  if (suppliedDeclaration && lstatSync(declaration).isSymbolicLink()) throw new Error("source_claim_contract: supplied_source_claims_declaration_symlink");
   for (const sourceFile of files) {
     const destinationFile = resolve(destination, relative(sourceRoot, sourceFile));
     if (!isInside(destination, destinationFile)) throw new Error(`Unsafe documentation path: ${sourceFile}`);
@@ -56,7 +57,8 @@ export function ingestDocumentation({ source, repository, destinationRelative })
   inventory.documentSetDigest = documentSetDigest(inventory.files);
   const inventoryPath = join(destination, "inventory.json");
   writeFileSync(inventoryPath, `${JSON.stringify(inventory, null, 2)}\n`, "utf8");
+  if (!suppliedDeclaration) return { files: files.length, destination, inventoryPath, sourceClaimInput: "raw" };
   copyFileSync(declaration, join(destination, "source-claims.json"));
   const manifest = compileImportedSourceClaimManifest({ repository, documentationDir: destinationRelative });
-  return { files: files.length, destination, inventoryPath, sourceClaimManifest: { manifestId: manifest.manifestId, digest: manifest.digest } };
+  return { files: files.length, destination, inventoryPath, sourceClaimInput: "supplied", sourceClaimManifest: { manifestId: manifest.manifestId, digest: manifest.digest } };
 }

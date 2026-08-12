@@ -21,7 +21,8 @@ import { GitHubCiAdapter, GitHubMergeAdapter, GitHubPullRequestAdapter, RemoteAd
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { provisionDeterministicScaffold } from "./deterministic-scaffold.mjs";
 import { sourceClaimBlockers, specificationBlockers, validateControllerAuthorizedBlueprint } from "./product-blueprint.mjs";
-import { compileImportedSourceClaimManifest, createImportedSourceResolver } from "./source-evidence.mjs";
+import { compileImportedSourceClaimManifest, createImportedSourceResolver, validateSourceClaimExtraction } from "./source-evidence.mjs";
+import { SourceClaimExtractionExecutor } from "./source-claim-extraction.mjs";
 import { PRODUCT_ACCEPTANCE_KIND, PRODUCT_ACCEPTANCE_SCHEMA_VERSION, productAcceptancePasses } from "./final-acceptance.mjs";
 import { compileWriteSurfaceTopology } from "./write-surface.mjs";
 import { assertRepositoryBaselineCurrent, captureRepositoryBaselineDraft, finalizeRepositoryBaseline, repositoryBaselineStatus, validateTaskBaselineBehaviorIds } from "./repository-baseline.mjs";
@@ -203,12 +204,42 @@ export class SwarmRouter extends EventEmitter {
     return run;
   }
 
+  resumeSourceClaimExtractionRun(id) {
+    const sessionId = randomUUID();
+    const run = this.store.resumeSourceClaimExtractionRun(id, { ownerPid: process.pid, ownerSessionId: sessionId });
+    this.activateDeliveryRun(run.id, sessionId);
+    return run;
+  }
+
   lifecycleEvents() { return [...this.lifecycleTrace]; }
 
   sourceClaimManifestIdentity() {
     const manifest = this.#currentSourceClaimManifest();
     this.store.recordSourceClaimManifest(manifest);
     return manifest.manifestId;
+  }
+
+  async extractSourceClaimsForRun(run) {
+    if (!run || run.sourceClaimInputMode !== "raw") throw new Error("source_claim_extraction:raw_intake_required");
+    const existing = run.sourceClaimExtractionId ? this.store.sourceClaimExtraction(run.sourceClaimExtractionId) : null;
+    if (existing) {
+      validateSourceClaimExtraction(existing.extraction, { sourceResolver: this.#sourceEvidenceResolver() });
+      return existing;
+    }
+    const extraction = await new SourceClaimExtractionExecutor(this.config).extract();
+    const directory = join(this.config.repository, this.config.project.generatedDir, "source-claim-extractions");
+    mkdirSync(directory, { recursive: true });
+    const path = join(directory, `${extraction.extractionId}.json`);
+    const serialized = `${JSON.stringify(extraction, null, 2)}\n`;
+    if (existsSync(path) && readFileSync(path, "utf8") !== serialized) throw new Error("source_claim_extraction:existing_candidate_artifact_mismatch");
+    if (!existsSync(path)) writeFileSync(path, serialized, "utf8");
+    await this.config.faultHooks?.source_claim_candidate_file_before_db_persistence?.({ deliveryRunId: run.id, extractionId: extraction.extractionId, path });
+    return this.store.recordSourceClaimExtraction({ deliveryRunId: run.id, extraction, artifactPath: relative(this.config.repository, path).split("\\").join("/") });
+  }
+
+  blockRunForSourceExtraction(run, error) {
+    const code = /malformed_json/i.test(String(error?.message ?? error)) ? "source_claim_extraction:malformed_json" : /provider_unavailable|transport|unsupported_capability/i.test(String(error?.message ?? error)) ? "source_claim_extraction:provider_unavailable" : /source_provenance|source_claim_contract/i.test(String(error?.message ?? error)) ? "source_claim_extraction:source_integrity_invalid" : "source_claim_extraction:failed";
+    return this.store.blockDeliveryForSpecification(run.id, { reason: code, recovery: { action: "Correct the imported documentation or extraction provider, then resume this intake or start a fresh delivery." } });
   }
 
   assertRunSourceCompleteness(run) { return this.#assertRunSourceCompleteness(run); }
