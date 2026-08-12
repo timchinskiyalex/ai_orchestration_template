@@ -23,7 +23,7 @@ export class DeliveryCoordinator {
     await this.router.recoverStaleDeliveries();
     const current = this.router.store.currentDeliveryRun();
     if (current && (["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state) || (this.router.store.activeScopedReplans?.(current.id).length ?? 0))) throw new Error(`A delivery run is already active or recovering: ${current.id}. Use npm run deliver -- --resume.`);
-    if (current && ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "failed"].includes(current.state)) throw new Error(`A persisted delivery run is resumable: ${current.id}. Use npm run deliver -- --resume instead of creating a new Bootstrap/DAG.`);
+    if (current && ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(current.state)) throw new Error(`A persisted delivery run is resumable: ${current.id}. Use npm run deliver -- --resume instead of creating a new Bootstrap/DAG.`);
     // A terminal controller run can still have never-claimed DAG rows. They are
     // historical work, not a live delivery: retain their evidence but never let
     // them block a deliberately fresh delivery.
@@ -65,7 +65,9 @@ export class DeliveryCoordinator {
       catch (error) { return this.router.blockRunForRepositoryBaseline(run, error); }
     }
     if (["completed_merged", "completed_candidate_ready", "blocked_budget", "blocked_quota", "blocked_specification", "blocked_acceptance", "conflict_blocked"].includes(run.state)) return run;
-    const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "failed"].includes(run.state)
+    const resumableFailure = run.state === "failed" && (this.router.store.activeScopedReplans?.(run.id).length ?? 0) > 0;
+    if (run.state === "failed" && !resumableFailure) throw new Error(`Delivery run is terminally failed: ${run.id}. Start a fresh delivery with --source after correcting its input or runtime condition.`);
+    const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(run.state) || resumableFailure
       ? this.router.resumeDeliveryRun(run.id)
       : (this.router.activateDeliveryRun(run.id), run);
     const sourceControlledDelivery = Boolean(resumed.source || resumed.sourceClaimManifestId || resumed.blueprintId);

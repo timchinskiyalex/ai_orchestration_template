@@ -245,6 +245,18 @@ test("a fresh delivery cancels stranded historical tasks but preserves their rec
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
 
+test("a terminal failed delivery starts a fresh Bootstrap/DAG instead of requiring an invalid resume", async () => {
+  const fixture = setup(false); const client = new DeliveryClient(); fixture.config.executionProviderFactory = () => provider(client);
+  const router = new SwarmRouter(fixture.config); const coordinator = new DeliveryCoordinator(router);
+  try {
+    const first = await coordinator.begin({ source: fixture.source });
+    router.store.updateDeliveryRun(first.id, { state: "failed", publish: { reason: "input corrected" } });
+    const second = await coordinator.begin({ source: fixture.source });
+    assert.notEqual(second.id, first.id);
+    assert.equal(router.list().filter((task) => task.role === "bootstrap").length, 2);
+  } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
 test("tracking-only delivery keeps worker goals uncapped while bounding planning goals", async () => {
   const fixture = setup(false); fixture.config.budget.enforceLocalLimits = false;
   const client = new DeliveryClient(); fixture.config.executionProviderFactory = () => provider(client);
