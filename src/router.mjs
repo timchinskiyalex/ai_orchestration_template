@@ -597,7 +597,9 @@ export class SwarmRouter extends EventEmitter {
     const gates = this.store.listTasks().filter((task) => (!deliveryRunId || task.deliveryRunId === deliveryRunId) && ["awaiting_human", "awaiting_approval"].includes(task.status));
     if (gates.length) throw new Error(`Run-to-integration refuses to bypass human gates: ${gates.map((task) => task.id).join(", ")}`);
     if (!alreadyIdle) await this.runUntilIdle();
-    const tasks = this.store.listTasks().filter((task) => (!deliveryRunId || task.deliveryRunId === deliveryRunId) && !this.store.isReplannedHistoricalTask(task.id));
+    const allTasks = this.store.listTasks().filter((task) => (!deliveryRunId || task.deliveryRunId === deliveryRunId) && !this.store.isReplannedHistoricalTask(task.id));
+    const activeWave = deliveryRunId ? Math.max(...this.store.planBatches(deliveryRunId).map((batch) => batch.wave), 0) : null;
+    const tasks = activeWave ? allTasks.filter((task) => !task.planBatchId || task.wave === activeWave) : allTasks;
     const unfinished = tasks.filter((task) => ENGINEERING_DOMAINS.has(task.role) && task.status !== "done");
     if (unfinished.length) throw new Error(`Run-to-integration stopped before completion: ${unfinished.map((task) => `${task.id}:${task.status}`).join(", ")}`);
     const writers = tasks.filter((task) => this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done");
@@ -1156,7 +1158,7 @@ export class SwarmRouter extends EventEmitter {
   }
 
   #enqueuePlanner(bootstrapTask) {
-    const existing = this.store.listTasks().find((task) => task.role === "planner" && task.parentTaskId === bootstrapTask.id);
+    const existing = this.store.listTasks().find((task) => task.role === "planner" && task.parentTaskId === bootstrapTask.id && !["done", "failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted"].includes(task.status));
     if (existing) return existing;
     const stored = this.store.productBlueprintForBootstrap(bootstrapTask.id);
     if (!stored) throw new Error(`Bootstrap task ${bootstrapTask.id} has no persisted ProductBlueprint`);
@@ -1172,10 +1174,20 @@ export class SwarmRouter extends EventEmitter {
       role: "planner",
       parentTaskId: bootstrapTask.id,
       title: `Plan ${this.config.project.name}`,
-      prompt: `Use the immutable ProductBlueprint '${stored.blueprint.blueprintId}' at ${stored.artifactPath}. The immutable ProjectMode is ${JSON.stringify(this.projectMode)}. Produce PlanBatch id '${randomUUID()}', deliveryRunId '${bootstrapTask.deliveryRunId}', wave ${wave}, basedOnCheckpointSha '${baseSha}', and non-empty requirementIds on every implementation task.${greenfieldInstruction}${baselineInstruction}`,
+      prompt: `Use the immutable ProductBlueprint '${stored.blueprint.blueprintId}' at ${stored.artifactPath}. The immutable ProjectMode is ${JSON.stringify(this.projectMode)}. Produce one bounded PlanBatch wave only: id '${randomUUID()}', deliveryRunId '${bootstrapTask.deliveryRunId}', wave ${wave}, basedOnCheckpointSha '${baseSha}', and non-empty requirementIds on every implementation task. Cover only unresolved mandatory requirements; do not repeat ownership that a prior verified wave closed.${greenfieldInstruction}${baselineInstruction}`,
       dependencies: [bootstrapTask.id], estimatedTokens: this.config.roles.planner.tokenBudget,
       blueprintId: stored.blueprint.blueprintId,
     });
+  }
+
+  enqueueNextPlannerWave(deliveryRunId) {
+    const run = this.store.deliveryRun(deliveryRunId);
+    const bootstrap = run?.bootstrapTaskId ? this.store.getTask(run.bootstrapTaskId) : null;
+    if (!run || !bootstrap || bootstrap.status !== "done") throw new Error("Next Planner wave requires the original completed Bootstrap task");
+    const checkpoint = this.store.currentCheckpoint(deliveryRunId);
+    if (!checkpoint) throw new Error("Next Planner wave requires a reconciled GlobalWaveCheckpoint");
+    if (checkpoint.wave >= (this.config.delivery?.maxWaves ?? 8)) throw new Error(`max_waves_exhausted:${checkpoint.wave}`);
+    return this.#enqueuePlanner(bootstrap);
   }
 
   isAutonomous() { return this.config.autonomy?.mode !== "manual"; }
@@ -1432,7 +1444,7 @@ export class SwarmRouter extends EventEmitter {
         : " No trusted controller policy proposals are available.";
       return `Return only one fenced JSON ProductBlueprint v1 claim set. Include the exact controller-provided ProjectMode from the task prompt as projectMode; it is lifecycle identity, not source evidence. Required exact top-level fields: {"schemaVersion":1,"kind":"ProductBlueprint","blueprintId":"stable-kebab-id","createdAt":"ISO-8601","documentSetDigest":"sha256","sourceDocuments":[{"documentId":"doc-id","path":"path","sha256":"sha256"}],"requirements":[{"requirementId":"stable-kebab-id","type":"functional|nfr|data|integration|constraint","priority":"must|should|could","mandatory":true,"description":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"acceptanceCriteria":[{"criterionId":"stable-kebab-id","description":"string","verificationHint":"optional"}],"constraints":[]}],"nfrs":[],"modules":[],"integrations":[],"dataModel":{},"constraints":[],"assumptions":[],"decisions":[{"adrId":"stable-kebab-id","decision":"string","rationale":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}]}],"unresolvedQuestions":[{"questionId":"stable-kebab-id","description":"string","requiredForRequirementIds":["requirement-id"],"proposedPolicyId":"optional-controller-policy-id","proposedPolicyVersion":"optional-version","proposedPolicyDigest":"optional-sha256","proposedResolution":"optional-proposed-value","sourceRefs":[]}],"contradictions":[{"contradictionId":"stable-kebab-id","requirementIds":["requirement-id"],"sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"description":"string"}]}. Bootstrap claims are never authorization: do not emit final resolution statuses, policy defaults, or authoritative resolutions. The controller alone validates configured trusted policy evidence and creates any ADR. sourceDocuments must exactly match inventory.json. A SourceRef is controller-verified evidence only: read imported UTF-8 source, normalize CRLF/CR to LF, use inclusive 1-based lines, join the selected lines with LF, and hash that exact fragment with SHA-256. Do not use locator fields; do not invent ranges or digests. Do not invent resolutions: a missing mandatory fact or unresolved contradiction stays unresolved.${policyInstruction}`;
     }
-    if (role === "planner") return `Return only one fenced JSON PlanBatch v1 with exact fields {"schemaVersion":1,"kind":"PlanBatch","id":"new-immutable-id","deliveryRunId":"controller-provided-run-id","blueprintId":"persisted-blueprint-id","wave":1,"basedOnCheckpointSha":"controller-provided-verified-git-sha","tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa","security"],"riskFlags":["public_api_change"],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"],"requirementIds":["ProductBlueprint requirement id"],"baselineBehaviorIds":[]}],"createdAt":"ISO-8601"}. The controller-provided id/run/wave/base are authoritative. Every implementation task must have non-empty requirementIds from the immutable ProductBlueprint; every mandatory requirement must be covered. Include baselineBehaviorIds only when controller brownfield context requires them; it is a preservation obligation and never changes allowedPaths. A writer with two writer predecessors is valid: the controller creates the fan-in barrier. Do not create implementation tasks for ambiguity; return {"outcome":"specification_gap","reason":"..."} instead.`;
+    if (role === "planner") return `Return only one fenced JSON PlanBatch v1 with exact fields {"schemaVersion":1,"kind":"PlanBatch","id":"new-immutable-id","deliveryRunId":"controller-provided-run-id","blueprintId":"persisted-blueprint-id","wave":1,"basedOnCheckpointSha":"controller-provided-verified-git-sha","tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa","security"],"riskFlags":["public_api_change"],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"],"requirementIds":["ProductBlueprint requirement id"],"baselineBehaviorIds":[]}],"createdAt":"ISO-8601"}. The controller-provided id/run/wave/base are authoritative. Every implementation task must have non-empty requirementIds from the immutable ProductBlueprint. This is one bounded wave: cover only unresolved mandatory requirements and never duplicate prior ownership. Include baselineBehaviorIds only when controller brownfield context requires them; it is a preservation obligation and never changes allowedPaths. A writer with two writer predecessors is valid: the controller creates the fan-in barrier. Do not create implementation tasks for ambiguity; return {"outcome":"specification_gap","reason":"..."} instead.`;
     if (role === "qa") return `Return only one fenced JSON QualityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     if (role === "security") return `Return only one fenced JSON SecurityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
     return "Return a concise Markdown report with evidence; do not return orchestration JSON.";
@@ -1638,7 +1650,7 @@ export class SwarmRouter extends EventEmitter {
     const batchInput = { ...(parsedPlan ?? {}), schemaVersion: 1, kind: "PlanBatch", id: scopedReplan?.replacementPlanBatchId ?? scopedReplan?.id ?? randomUUID(), deliveryRunId: planRunId, blueprintId: stored.blueprint.blueprintId, projectMode: runProjectMode, wave: controllerWave, basedOnCheckpointSha: controllerBase, createdAt: new Date().toISOString() };
     const repositoryBaseline = plannerTask.deliveryRunId ? this.store.repositoryBaselineForRun(plannerTask.deliveryRunId) : null;
     const productRoots = runProjectMode?.mode === "greenfield" && !scopedReplan ? this.config.project.productRoots : [];
-    const plan = validatePlan(normalizePlannerPlanForProject(batchInput, productRoots, runProjectMode), { maxTasks: this.config.router.maxPlanTasks, productRoots, blueprint: stored.blueprint, requirePlanBatch: true, allowPartialRequirementCoverage: Boolean(scopedReplan), recovery: Boolean(scopedReplan), repositoryBaseline, projectMode: runProjectMode });
+    const plan = validatePlan(normalizePlannerPlanForProject(batchInput, productRoots, runProjectMode), { maxTasks: this.config.router.maxPlanTasks, productRoots, blueprint: stored.blueprint, requirePlanBatch: true, allowPartialRequirementCoverage: true, recovery: Boolean(scopedReplan), repositoryBaseline, projectMode: runProjectMode });
     const executionTopology = compileWriteSurfaceTopology(plan.tasks, { isWorkspaceWriter: (item) => this.config.roles[item.primaryDomain]?.sandbox === "workspace-write" });
     if (plan.deliveryRunId !== planRunId) throw new Error("PlanBatch deliveryRunId must match Planner delivery run");
     if (scopedReplan) {
@@ -1647,6 +1659,7 @@ export class SwarmRouter extends EventEmitter {
     } else if (existingBatches.length) {
       const checkpoint = this.store.currentCheckpoint(plan.deliveryRunId);
       if (!checkpoint || plan.wave !== checkpoint.wave + 1 || plan.basedOnCheckpointSha !== checkpoint.outputSha) throw new Error("Next PlanBatch requires successful reconciliation of the current verified checkpoint");
+      if (plan.wave > (this.config.delivery?.maxWaves ?? 8)) throw new Error("max_waves_exhausted");
     } else if (plan.wave !== 1 || plan.basedOnCheckpointSha !== gitSha(this.config.repository, this.config.baseRef)) {
       throw new Error("PlanBatch wave 1 must use the controller verified repository baseline");
     }
@@ -1919,10 +1932,9 @@ export class SwarmRouter extends EventEmitter {
 
   #persistGlobalWaveCheckpoint(deliveryRunId, result) {
     if (!deliveryRunId) return;
-    const writers = this.store.listTasks().filter((task) => task.deliveryRunId === deliveryRunId && this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done");
-    const waves = [...new Set(writers.map((task) => task.wave))];
-    if (waves.length !== 1) return; // A later PlanBatch is only legal after its predecessor global checkpoint.
-    const wave = waves[0]; if (this.store.currentCheckpoint(deliveryRunId)?.wave === wave) return;
+    const wave = Math.max(...this.store.planBatches(deliveryRunId).map((batch) => batch.wave), 0);
+    const writers = this.store.listTasks().filter((task) => task.deliveryRunId === deliveryRunId && task.wave === wave && this.config.roles[task.role]?.sandbox === "workspace-write" && task.status === "done");
+    if (!wave || !writers.length || this.store.globalWaveCheckpoint(deliveryRunId, wave)) return;
     const batch = this.store.planBatch(writers[0]?.planBatchId);
     const checkpoint = { schemaVersion: 2, kind: "GlobalWaveCheckpoint", id: randomUUID(), deliveryRunId, blueprintId: writers[0]?.blueprintId, wave, baseSha: batch?.basedOnCheckpointSha ?? result.manifest.baseSha, inputArtifacts: result.manifest.effectiveLineage.filter((item) => item.kind === "artifact").map((item) => ({ artifactId: item.id, headSha: item.sha })), outputSha: result.manifest.candidateSha, verificationResults: result.manifest.verificationResults, status: "passed", effectiveLineage: result.manifest.effectiveLineage, createdAt: new Date().toISOString() };
     this.store.recordGlobalWaveCheckpoint(checkpoint);

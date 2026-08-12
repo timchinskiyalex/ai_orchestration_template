@@ -55,6 +55,9 @@ export function loadConfig(configPath) {
   catch (error) { throw new Error(error.message); }
   config.delivery ??= {};
   config.delivery.maxRemediationRounds ??= config.autonomy.maxRemediationRounds;
+  config.delivery.maxWaves ??= 8;
+  config.delivery.maxNoProgressReconciliations ??= 2;
+  config.delivery.maxReconciliationDiagnostics ??= 25;
   config.delivery.leaseHeartbeatMs ??= 5000;
   config.delivery.staleLeaseMs ??= 30000;
   config.delivery.shutdownGraceMs ??= 3000;
@@ -123,6 +126,9 @@ export function loadConfig(configPath) {
   if (!Number.isInteger(config.quota.throttleAtUsedPercent) || config.quota.throttleAtUsedPercent < 1 || config.quota.throttleAtUsedPercent > 100) throw new Error("quota.throttleAtUsedPercent must be an integer from 1 to 100");
   if (typeof config.quota.throttleWhenUnavailable !== "boolean") throw new Error("quota.throttleWhenUnavailable must be boolean");
   if (!Number.isInteger(config.delivery.maxRemediationRounds) || config.delivery.maxRemediationRounds < 0 || config.delivery.maxRemediationRounds > 10) throw new Error("delivery.maxRemediationRounds must be an integer from 0 to 10");
+  if (!Number.isInteger(config.delivery.maxWaves) || config.delivery.maxWaves < 1 || config.delivery.maxWaves > 100) throw new Error("delivery.maxWaves must be an integer from 1 to 100");
+  if (!Number.isInteger(config.delivery.maxNoProgressReconciliations) || config.delivery.maxNoProgressReconciliations < 0 || config.delivery.maxNoProgressReconciliations > 100) throw new Error("delivery.maxNoProgressReconciliations must be an integer from 0 to 100");
+  if (!Number.isInteger(config.delivery.maxReconciliationDiagnostics) || config.delivery.maxReconciliationDiagnostics < 1 || config.delivery.maxReconciliationDiagnostics > 100) throw new Error("delivery.maxReconciliationDiagnostics must be an integer from 1 to 100");
   for (const key of ["leaseHeartbeatMs", "staleLeaseMs", "shutdownGraceMs"]) if (!Number.isInteger(config.delivery[key]) || config.delivery[key] < 250) throw new Error(`delivery.${key} must be an integer of at least 250`);
   if (config.autonomy.mode === "autonomous" && config.delivery.maxRemediationRounds !== config.autonomy.maxRemediationRounds) throw new Error("delivery.maxRemediationRounds must match autonomy.maxRemediationRounds in autonomous mode");
   if (typeof config.remote.enabled !== "boolean" || typeof config.remote.requireCi !== "boolean") throw new Error("remote.enabled and remote.requireCi must be boolean");

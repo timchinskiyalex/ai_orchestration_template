@@ -45,6 +45,9 @@
   },
   "delivery": {
     "maxRemediationRounds": 3,
+    "maxWaves": 8,
+    "maxNoProgressReconciliations": 2,
+    "maxReconciliationDiagnostics": 25,
     "leaseHeartbeatMs": 5000,
     "staleLeaseMs": 30000,
     "shutdownGraceMs": 3000

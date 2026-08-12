@@ -273,8 +273,25 @@ export class StateStore {
       );
       CREATE TABLE IF NOT EXISTS wave_reconciliations (
         delivery_run_id TEXT NOT NULL, wave INTEGER NOT NULL, checkpoint_id TEXT NOT NULL,
-        checkpoint_sha TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
+        checkpoint_sha TEXT NOT NULL, status TEXT NOT NULL, progress INTEGER, diagnostics_json TEXT, created_at TEXT NOT NULL,
         PRIMARY KEY(delivery_run_id, wave)
+      );
+      CREATE TABLE IF NOT EXISTS requirement_ledger (
+        delivery_run_id TEXT NOT NULL REFERENCES delivery_runs(id),
+        blueprint_id TEXT NOT NULL REFERENCES product_blueprints(blueprint_id),
+        requirement_id TEXT NOT NULL,
+        criterion_id TEXT NOT NULL DEFAULT '',
+        source_blueprint_identity TEXT NOT NULL,
+        coverage_state TEXT NOT NULL,
+        owner_task_id TEXT,
+        artifact_task_id TEXT,
+        checkpoint_id TEXT,
+        candidate_sha TEXT,
+        evidence_state TEXT NOT NULL,
+        evidence_json TEXT NOT NULL DEFAULT '[]',
+        unresolved_reason TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(delivery_run_id, requirement_id, criterion_id)
       );
       CREATE TABLE IF NOT EXISTS scoped_replans (
         id TEXT PRIMARY KEY, delivery_run_id TEXT, blueprint_id TEXT, failed_task_id TEXT NOT NULL,
@@ -361,6 +378,8 @@ export class StateStore {
     this.#addColumnIfMissing("integration_checkpoints", "barrier_id", "TEXT");
     this.#addColumnIfMissing("integration_checkpoints", "effective_lineage_json", "TEXT");
     this.#addColumnIfMissing("integration_checkpoints", "consumer_task_ids_json", "TEXT");
+    this.#addColumnIfMissing("wave_reconciliations", "progress", "INTEGER");
+    this.#addColumnIfMissing("wave_reconciliations", "diagnostics_json", "TEXT");
     // Version-one checkpoints did not distinguish local fan-in from the global
     // baseline.  Keep them as audit evidence but never promote them on restart.
     this.db.prepare("UPDATE wave_reconciliations SET status = 'legacy_ambiguous' WHERE status = 'reconciled' AND checkpoint_id IN (SELECT id FROM integration_checkpoints WHERE COALESCE(checkpoint_type, '') NOT IN ('GlobalWaveCheckpoint'))").run();
@@ -916,6 +935,7 @@ export class StateStore {
     if (!Array.isArray(tasks) || tasks.length < batch.tasks.length) throw new Error("PlanBatch task materialization must include every planned writer");
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      this.#claimRequirementLedgerOwnership(batch, tasks, { replanId });
       this.db.prepare("INSERT INTO plan_batches(id, schema_version, kind, delivery_run_id, blueprint_id, wave, based_on_checkpoint_sha, tasks_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .run(batch.id, batch.schemaVersion, batch.kind, batch.deliveryRunId, batch.blueprintId, batch.wave, batch.basedOnCheckpointSha, JSON.stringify({ projectMode: batch.projectMode ?? null, tasks: batch.tasks }), batch.createdAt);
       // Inline version of createTasks keeps the batch row and task DAG one decision.
@@ -952,6 +972,76 @@ export class StateStore {
     return { schemaVersion: row.schema_version, kind: row.kind, id: row.id, deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, projectMode: Array.isArray(stored) ? null : stored.projectMode ?? null, wave: row.wave, basedOnCheckpointSha: row.based_on_checkpoint_sha, tasks, createdAt: row.created_at };
   }
   planBatches(deliveryRunId) { return this.db.prepare("SELECT id FROM plan_batches WHERE delivery_run_id = ? ORDER BY wave, created_at").all(deliveryRunId).map((row) => this.planBatch(row.id)); }
+
+  requirementLedger(deliveryRunId) {
+    return this.db.prepare("SELECT * FROM requirement_ledger WHERE delivery_run_id = ? ORDER BY requirement_id, criterion_id").all(deliveryRunId).map((row) => ({
+      deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, requirementId: row.requirement_id, criterionId: row.criterion_id || null,
+      sourceBlueprintIdentity: row.source_blueprint_identity, coverageState: row.coverage_state, ownerTaskId: row.owner_task_id,
+      artifactTaskId: row.artifact_task_id, checkpointId: row.checkpoint_id, candidateSha: row.candidate_sha,
+      evidenceState: row.evidence_state, evidence: parse(row.evidence_json, []), unresolvedReason: row.unresolved_reason, updatedAt: row.updated_at
+    }));
+  }
+
+  reconcileRequirementLedger({ deliveryRunId, checkpointId, diagnosticsLimit = 25 }) {
+    const checkpoint = this.integrationCheckpoint(checkpointId);
+    if (!checkpoint || checkpoint.kind !== "GlobalWaveCheckpoint" || checkpoint.deliveryRunId !== deliveryRunId) throw new Error("RequirementLedger reconciliation requires a verified GlobalWaveCheckpoint");
+    const before = this.requirementLedger(deliveryRunId);
+    const diagnostics = [];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const entry of before) {
+        if (!entry.ownerTaskId || entry.coverageState === "covered") continue;
+        const owner = this.getTask(entry.ownerTaskId);
+        const artifact = owner && this.workerArtifact(owner.id);
+        const qa = owner && this.listTasks().find((task) => task.sourceWriterTaskId === owner.id && task.role === "qa");
+        const security = owner && this.listTasks().find((task) => task.sourceWriterTaskId === owner.id && task.role === "security");
+        const verified = owner?.wave === checkpoint.wave && owner.status === "done" && artifact?.headSha && this.qualityReport(qa?.id)?.report?.verdict === "pass" && this.securityReport(security?.id)?.report?.verdict === "pass";
+        if (verified) {
+          this.db.prepare("UPDATE requirement_ledger SET coverage_state = 'covered', artifact_task_id = ?, checkpoint_id = ?, evidence_state = CASE WHEN evidence_state = 'passing' THEN evidence_state ELSE 'awaiting_candidate' END, unresolved_reason = NULL, updated_at = ? WHERE delivery_run_id = ? AND requirement_id = ? AND criterion_id = ?")
+            .run(owner.id, checkpoint.id, now(), deliveryRunId, entry.requirementId, entry.criterionId ?? "");
+        } else if (diagnostics.length < diagnosticsLimit) diagnostics.push({ requirementId: entry.requirementId, criterionId: entry.criterionId, ownerTaskId: entry.ownerTaskId, reason: owner ? `owner_${owner.status}` : "owner_missing" });
+      }
+      this.reconcileWave({ deliveryRunId, wave: checkpoint.wave, checkpointId });
+      const progressed = this.db.prepare("SELECT COUNT(*) AS count FROM requirement_ledger WHERE delivery_run_id = ? AND coverage_state = 'covered'").get(deliveryRunId).count > before.filter((item) => item.coverageState === "covered").length;
+      this.db.prepare("UPDATE wave_reconciliations SET progress = ?, diagnostics_json = ? WHERE delivery_run_id = ? AND wave = ?").run(progressed ? 1 : 0, json(diagnostics), deliveryRunId, checkpoint.wave);
+      this.#insertEvent(null, "requirement-ledger/reconciled", { deliveryRunId, wave: checkpoint.wave, checkpointId, diagnostics });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    const entries = this.requirementLedger(deliveryRunId);
+    const required = entries.filter((item) => item.criterionId === null);
+    const remainingRequirementIds = required.filter((item) => item.coverageState !== "covered").map((item) => item.requirementId);
+    const unverified = entries.filter((item) => item.coverageState === "covered" && item.evidenceState !== "passing").map((item) => ({ requirementId: item.requirementId, criterionId: item.criterionId }));
+    const invalidated = entries.filter((item) => item.coverageState === "invalidated").map((item) => ({ requirementId: item.requirementId, criterionId: item.criterionId, reason: item.unresolvedReason }));
+    const progressed = entries.filter((item) => item.coverageState === "covered").length > before.filter((item) => item.coverageState === "covered").length;
+    return { checkpoint, entries, remainingRequirementIds, unverified, invalidated, progressed, diagnostics, wave: checkpoint.wave };
+  }
+
+  reconcileRequirementLedgerCandidate({ deliveryRunId, reportId }) {
+    const stored = this.productAcceptanceReport(reportId); if (!stored) throw new Error("RequirementLedger candidate reconciliation requires a persisted acceptance report");
+    const report = stored.report;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const entry of this.requirementLedger(deliveryRunId)) {
+        const result = report.results.find((item) => item.requirementId === entry.requirementId && (item.criterionId ?? null) === entry.criterionId);
+        const passing = result?.status === "pass";
+        this.db.prepare("UPDATE requirement_ledger SET candidate_sha = ?, evidence_state = ?, evidence_json = ?, unresolved_reason = ?, updated_at = ? WHERE delivery_run_id = ? AND requirement_id = ? AND criterion_id = ?")
+          .run(report.candidateSha, passing ? "passing" : "not_verified", json(result?.evidence ?? []), passing ? null : `candidate_evidence_${result?.status ?? "missing"}`, now(), deliveryRunId, entry.requirementId, entry.criterionId ?? "");
+      }
+      this.#insertEvent(null, "requirement-ledger/candidate-reconciled", { deliveryRunId, reportId, candidateSha: report.candidateSha });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.requirementLedger(deliveryRunId);
+  }
+
+  assertRequirementLedgerCompletion(deliveryRunId) {
+    const entries = this.requirementLedger(deliveryRunId);
+    if (!entries.length) return true; // legacy runs retain their former acceptance contract.
+    const incomplete = entries.filter((item) => item.coverageState !== "covered" || item.evidenceState !== "passing" || !item.candidateSha);
+    if (incomplete.length) throw new Error(`Completion requires candidate-bound passing evidence for every ledger entry: ${incomplete.slice(0, 10).map((item) => `${item.requirementId}:${item.criterionId ?? "@requirement"}`).join(", ")}`);
+    const open = this.listTasks().filter((task) => task.deliveryRunId === deliveryRunId && task.planBatchId && !this.isReplannedHistoricalTask(task.id) && task.status !== "done");
+    if (open.length) throw new Error("Completion requires every planned dependency to be closed");
+    return true;
+  }
 
   createIntegrationBarrier(barrier) {
     validateIntegrationBarrier(barrier);
@@ -1005,17 +1095,35 @@ export class StateStore {
   }
   recordGlobalWaveCheckpoint(checkpoint) {
     validateGlobalWaveCheckpoint(checkpoint);
+    const batch = this.planBatches(checkpoint.deliveryRunId).find((item) => item.wave === checkpoint.wave);
+    if (!batch || batch.blueprintId !== checkpoint.blueprintId || batch.basedOnCheckpointSha !== checkpoint.baseSha) throw new Error("GlobalWaveCheckpoint must bind its immutable PlanBatch baseline");
+    if (checkpoint.wave > 1) {
+      const prior = this.currentCheckpoint(checkpoint.deliveryRunId);
+      if (!prior || prior.wave !== checkpoint.wave - 1 || prior.outputSha !== checkpoint.baseSha) throw new Error("GlobalWaveCheckpoint ancestry must extend the prior reconciled checkpoint");
+    }
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      if (this.db.prepare("SELECT 1 FROM wave_reconciliations WHERE delivery_run_id = ? AND wave = ? AND status = 'reconciled'").get(checkpoint.deliveryRunId, checkpoint.wave)) throw new Error("GlobalWaveCheckpoint is immutable and already reconciled");
+      if (this.db.prepare("SELECT 1 FROM integration_checkpoints WHERE delivery_run_id = ? AND wave = ? AND checkpoint_type = 'GlobalWaveCheckpoint'").get(checkpoint.deliveryRunId, checkpoint.wave)) throw new Error("GlobalWaveCheckpoint is immutable and already persisted");
       this.db.prepare("INSERT INTO integration_checkpoints(id,schema_version,kind,delivery_run_id,blueprint_id,wave,base_sha,input_artifacts_json,output_sha,verification_results_json,status,created_at,checkpoint_type,effective_lineage_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(checkpoint.id, checkpoint.schemaVersion, checkpoint.kind, checkpoint.deliveryRunId, checkpoint.blueprintId, checkpoint.wave, checkpoint.baseSha, json(checkpoint.inputArtifacts), checkpoint.outputSha, json(checkpoint.verificationResults), checkpoint.status, checkpoint.createdAt, checkpoint.kind, json(checkpoint.effectiveLineage));
-      this.db.prepare("INSERT INTO wave_reconciliations(delivery_run_id,wave,checkpoint_id,checkpoint_sha,status,created_at) VALUES (?,?,?,?,?,?)").run(checkpoint.deliveryRunId, checkpoint.wave, checkpoint.id, checkpoint.outputSha, "reconciled", now());
+      this.#insertEvent(null, "global-wave-checkpoint/verified", { deliveryRunId: checkpoint.deliveryRunId, wave: checkpoint.wave, checkpointId: checkpoint.id, checkpointSha: checkpoint.outputSha });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.currentCheckpoint(checkpoint.deliveryRunId);
   }
-  reconcileWave({ deliveryRunId, wave, checkpointId }) { const checkpoint = this.integrationCheckpoint(checkpointId); if (!checkpoint || checkpoint.kind !== "GlobalWaveCheckpoint" || checkpoint.deliveryRunId !== deliveryRunId || checkpoint.wave !== wave) throw new Error("Wave reconciliation requires a verified GlobalWaveCheckpoint"); return this.recordGlobalWaveCheckpoint(checkpoint); }
+  globalWaveCheckpoint(deliveryRunId, wave) { const row = this.db.prepare("SELECT id FROM integration_checkpoints WHERE delivery_run_id = ? AND wave = ? AND checkpoint_type = 'GlobalWaveCheckpoint'").get(deliveryRunId, wave); return row ? this.integrationCheckpoint(row.id) : null; }
+  unreconciledGlobalWaveCheckpoint(deliveryRunId) {
+    const row = this.db.prepare("SELECT id FROM integration_checkpoints WHERE delivery_run_id = ? AND checkpoint_type = 'GlobalWaveCheckpoint' AND id NOT IN (SELECT checkpoint_id FROM wave_reconciliations WHERE status = 'reconciled') ORDER BY wave LIMIT 1").get(deliveryRunId);
+    return row ? this.integrationCheckpoint(row.id) : null;
+  }
+  reconcileWave({ deliveryRunId, wave, checkpointId }) {
+    const checkpoint = this.integrationCheckpoint(checkpointId);
+    if (!checkpoint || checkpoint.kind !== "GlobalWaveCheckpoint" || checkpoint.deliveryRunId !== deliveryRunId || checkpoint.wave !== wave) throw new Error("Wave reconciliation requires a verified GlobalWaveCheckpoint");
+    if (this.db.prepare("SELECT 1 FROM wave_reconciliations WHERE delivery_run_id = ? AND wave = ? AND status = 'reconciled'").get(deliveryRunId, wave)) return this.currentCheckpoint(deliveryRunId);
+    this.db.prepare("INSERT INTO wave_reconciliations(delivery_run_id,wave,checkpoint_id,checkpoint_sha,status,created_at) VALUES (?,?,?,?,?,?)").run(deliveryRunId, wave, checkpointId, checkpoint.outputSha, "reconciled", now());
+    return this.currentCheckpoint(deliveryRunId);
+  }
   currentCheckpoint(deliveryRunId) { const row = this.db.prepare("SELECT checkpoint_id, checkpoint_sha, wave FROM wave_reconciliations WHERE delivery_run_id = ? AND status = 'reconciled' ORDER BY wave DESC LIMIT 1").get(deliveryRunId); const checkpoint = row ? this.integrationCheckpoint(row.checkpoint_id) : null; return checkpoint?.kind === "GlobalWaveCheckpoint" && checkpoint.outputSha === row.checkpoint_sha ? { checkpointId: row.checkpoint_id, outputSha: row.checkpoint_sha, wave: row.wave } : null; }
+  reconciliationHistory(deliveryRunId) { return this.db.prepare("SELECT * FROM wave_reconciliations WHERE delivery_run_id = ? ORDER BY wave").all(deliveryRunId).map((row) => ({ wave: row.wave, checkpointId: row.checkpoint_id, checkpointSha: row.checkpoint_sha, status: row.status, progressed: row.progress === null ? null : Boolean(row.progress), diagnostics: parse(row.diagnostics_json, []), createdAt: row.created_at })); }
   recordScopedReplan(value) {
     const timestamp = value.createdAt ?? now();
     if (!value.idempotencyKey || !value.failureKind || !value.deliveryRunId || !value.blueprintId) throw new Error("Scoped replan v2 requires delivery, blueprint, failure taxonomy, and idempotency key");
@@ -1120,6 +1228,7 @@ export class StateStore {
     try {
       this.db.prepare(`INSERT INTO product_blueprints(blueprint_id, schema_version, artifact_path, digest, document_set_digest, bootstrap_task_id, delivery_run_id, source_claim_manifest_id, blueprint_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(blueprint.blueprintId, blueprint.schemaVersion, artifactPath, digest, blueprint.documentSetDigest, bootstrapTaskId, deliveryRunId, sourceClaimManifestId, JSON.stringify(blueprint), now());
+      if (deliveryRunId) this.#initializeRequirementLedger(deliveryRunId, blueprint, digest);
       if (blueprint.resolutionAuthority) this.db.prepare("INSERT INTO specification_resolution_evidence(blueprint_id, schema_version, evidence_json, created_at) VALUES (?, ?, ?, ?)").run(blueprint.blueprintId, blueprint.resolutionAuthority.schemaVersion, JSON.stringify(blueprint.resolutionAuthority), now());
       this.#insertEvent(bootstrapTaskId, "blueprint/persisted", { blueprintId: blueprint.blueprintId, artifactPath, digest, deliveryRunId });
       this.db.exec("COMMIT");
@@ -1162,7 +1271,7 @@ export class StateStore {
 
   resumeDeliveryRun(id, { ownerPid, ownerSessionId }) {
     if (!Number.isInteger(ownerPid) || ownerPid < 1 || typeof ownerSessionId !== "string" || !ownerSessionId) throw new Error("Delivery resume requires owner pid and session");
-    const resumable = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"];
+    const resumable = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "blocked_reconciliation"];
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const current = this.deliveryRun(id); if (!current) throw new Error(`Delivery run not found: ${id}`);
@@ -1282,6 +1391,11 @@ export class StateStore {
   integrationManifest(manifestPath) {
     const row = this.db.prepare("SELECT manifest_json FROM integration_manifests WHERE manifest_path = ?").get(manifestPath);
     return row ? JSON.parse(row.manifest_json) : null;
+  }
+  integrationManifestForCandidate(candidateSha) {
+    const rows = this.db.prepare("SELECT manifest_path, manifest_json FROM integration_manifests ORDER BY created_at DESC").all();
+    const row = rows.find((item) => parse(item.manifest_json, null)?.candidateSha?.toLowerCase() === candidateSha?.toLowerCase());
+    return row ? { path: row.manifest_path, manifest: parse(row.manifest_json, null) } : null;
   }
 
   recordBudgetOverride({ taskId, reason, forecast }) {
@@ -1405,6 +1519,7 @@ export class StateStore {
     if (!run || !stored?.passing) throw new Error("Completion requires a persisted passing ProductAcceptanceReport");
     const report = stored.report; const blueprint = this.productBlueprint(report.blueprintId); const manifest = this.integrationManifest(report.integrationManifestPath);
     if (!blueprint || !manifest || run.blueprintId !== report.blueprintId || run.candidate?.sha?.toLowerCase() !== report.candidateSha.toLowerCase() || manifest.id !== report.integrationManifestId || manifest.candidateSha?.toLowerCase() !== report.candidateSha.toLowerCase()) throw new Error("Completion acceptance identity mismatch");
+    this.assertRequirementLedgerCompletion(deliveryRunId);
     if (merge?.status !== "merged" || !merge.mainSha || merge.targetVerified !== true) throw new Error("Completion requires a verified merge result");
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -1418,6 +1533,42 @@ export class StateStore {
   #addColumnIfMissing(table, column, definition) {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
     if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+
+  #initializeRequirementLedger(deliveryRunId, blueprint, digest) {
+    const sourceBlueprintIdentity = `${blueprint.blueprintId}:${digest}`;
+    for (const requirement of blueprint.requirements.filter((item) => item.mandatory)) {
+      const rows = [{ criterionId: "" }, ...requirement.acceptanceCriteria.map((criterion) => ({ criterionId: criterion.criterionId }))];
+      for (const row of rows) this.db.prepare("INSERT INTO requirement_ledger(delivery_run_id,blueprint_id,requirement_id,criterion_id,source_blueprint_identity,coverage_state,evidence_state,updated_at) VALUES (?,?,?,?,?,'pending','pending',?)")
+        .run(deliveryRunId, blueprint.blueprintId, requirement.requirementId, row.criterionId, sourceBlueprintIdentity, now());
+    }
+  }
+
+  #claimRequirementLedgerOwnership(batch, tasks, { replanId = null } = {}) {
+    const entries = this.requirementLedger(batch.deliveryRunId);
+    if (!entries.length) return;
+    const known = new Map(entries.filter((item) => item.criterionId === null).map((item) => [item.requirementId, item]));
+    const writers = tasks.filter((task) => task.executionIsWriter);
+    const claimed = new Set();
+    const legacyGreenfieldComposite = batch.projectMode?.mode === "greenfield" && batch.wave === 1;
+    for (const task of writers) for (const requirementId of task.requirementIds ?? []) {
+      const entry = known.get(requirementId);
+      if (!entry) throw new Error(`PlanBatch references unknown or non-mandatory RequirementLedger requirement '${requirementId}'`);
+      if (claimed.has(requirementId)) {
+        // Stage-05 greenfield scaffold plans historically attach the single
+        // product requirement to bootstrap infrastructure and both root
+        // writers. Keep that immutable compatibility shape confined to wave 1;
+        // all iterative waves remain one-owner-per-requirement.
+        if (legacyGreenfieldComposite) continue;
+        throw new Error(`PlanBatch duplicates RequirementLedger ownership for '${requirementId}'`);
+      }
+      claimed.add(requirementId);
+      if (!replanId && entry.coverageState !== "pending") throw new Error(`PlanBatch repeats RequirementLedger coverage for '${requirementId}'`);
+      if (replanId && !["planned", "invalidated", "pending"].includes(entry.coverageState)) throw new Error(`Scoped PlanBatch cannot replace already covered RequirementLedger requirement '${requirementId}'`);
+      this.db.prepare("UPDATE requirement_ledger SET coverage_state = 'planned', owner_task_id = ?, artifact_task_id = NULL, checkpoint_id = NULL, evidence_state = 'pending', candidate_sha = NULL, evidence_json = '[]', unresolved_reason = NULL, updated_at = ? WHERE delivery_run_id = ? AND requirement_id = ?")
+        .run(task.id, now(), batch.deliveryRunId, requirementId);
+    }
+    if (!claimed.size) throw new Error("PlanBatch creates no RequirementLedger coverage progress");
   }
 
   #claimable(candidate) {

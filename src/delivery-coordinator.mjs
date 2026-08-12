@@ -24,7 +24,7 @@ export class DeliveryCoordinator {
     await this.router.recoverStaleDeliveries();
     const current = this.router.store.currentDeliveryRun();
     if (current && (["running", "awaiting_human", "awaiting_human_remote_handoff"].includes(current.state) || (this.router.store.activeScopedReplans?.(current.id).length ?? 0))) throw new Error(`A delivery run is already active or recovering: ${current.id}. Use npm run deliver -- --resume.`);
-    if (current && ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(current.state)) throw new Error(`A persisted delivery run is resumable: ${current.id}. Use npm run deliver -- --resume instead of creating a new Bootstrap/DAG.`);
+    if (current && ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "blocked_reconciliation"].includes(current.state)) throw new Error(`A persisted delivery run is resumable: ${current.id}. Use npm run deliver -- --resume instead of creating a new Bootstrap/DAG.`);
     // A terminal controller run can still have never-claimed DAG rows. They are
     // historical work, not a live delivery: retain their evidence but never let
     // them block a deliberately fresh delivery.
@@ -75,7 +75,7 @@ export class DeliveryCoordinator {
     if (["completed_merged", "completed_candidate_ready", "blocked_budget", "blocked_quota", "blocked_specification", "blocked_acceptance", "conflict_blocked"].includes(run.state)) return run;
     const resumableFailure = run.state === "failed" && (this.router.store.activeScopedReplans?.(run.id).length ?? 0) > 0;
     if (run.state === "failed" && !resumableFailure) throw new Error(`Delivery run is terminally failed: ${run.id}. Start a fresh delivery with --source after correcting its input or runtime condition.`);
-    const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"].includes(run.state) || resumableFailure
+    const resumed = ["interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection", "blocked_reconciliation"].includes(run.state) || resumableFailure
       ? this.router.resumeDeliveryRun(run.id)
       : (this.router.activateDeliveryRun(run.id), run);
     const sourceControlledDelivery = Boolean(resumed.source || resumed.sourceClaimManifestId || resumed.blueprintId);
@@ -119,6 +119,13 @@ export class DeliveryCoordinator {
         else this.router.assertBootstrapSourceIntake(run);
       } catch (error) { return this.router.blockRunForSourceCompleteness(run, error); }
     }
+    const recoveredReconciliation = this.#reconcileVerifiedWave(run);
+    if (recoveredReconciliation?.blocked) return recoveredReconciliation.run;
+    if (recoveredReconciliation?.nextPlanner) return this.#advance(this.router.store.deliveryRun(run.id), context);
+    if (recoveredReconciliation?.finalIntegration) {
+      const resumed = this.router.store.updateDeliveryRun(run.id, { state: "running", integrationPath: recoveredReconciliation.finalIntegration.path, candidate: { branch: recoveredReconciliation.finalIntegration.manifest.branch, sha: recoveredReconciliation.finalIntegration.manifest.candidateSha }, publicationCheckpoint: { stage: "publication-ready", candidate: { branch: recoveredReconciliation.finalIntegration.manifest.branch, sha: recoveredReconciliation.finalIntegration.manifest.candidateSha }, resumed: true, updatedAt: new Date().toISOString() } });
+      return this.#publishWithAcceptance(resumed, recoveredReconciliation.finalIntegration, context);
+    }
     if (!this.router.isAutonomous()) {
       const existingGate = manualGateFor(this.router.list());
       if (existingGate) return this.#awaiting(run, existingGate);
@@ -155,6 +162,9 @@ export class DeliveryCoordinator {
     try { integration = await this.router.runToIntegration({ alreadyIdle: true, deliveryRunId: run.id }); }
     catch (error) { return this.router.store.updateDeliveryRun(run.id, { state: "conflict_blocked", publish: { reason: String(error.message).slice(0, 500), recovery: { action: "Inspect the retained candidate/worktree and verification results." } } }); }
     if (integration.integration.manifest.status !== "candidate_ready") return this.router.store.updateDeliveryRun(run.id, { state: "conflict_blocked", integrationPath: integration.integration.path, publish: { reason: integration.integration.manifest.blockedReason, recovery: integration.integration.manifest.recovery } });
+    const reconciliation = this.#reconcileVerifiedWave(run);
+    if (reconciliation?.blocked) return reconciliation.run;
+    if (reconciliation?.nextPlanner) return this.#advance(this.router.store.deliveryRun(run.id), context);
     // This transaction is intentionally before the first remote action.  A
     // crash after a remote side effect can therefore only resume this exact
     // candidate and its idempotency keys, never create a fresh DAG.
@@ -177,12 +187,14 @@ export class DeliveryCoordinator {
       const productReady = this.#productEvidenceReady(run, candidate, productEvidence);
       if (!productReady) {
         acceptance = this.router.store.recordProductAcceptanceReport(await this.router.buildProductAcceptanceReport({ integration, remoteCi: null, productEvidence }));
+        this.router.store.reconcileRequirementLedgerCandidate({ deliveryRunId: run.id, reportId: acceptance.id });
         return this.#blockedAcceptance(run, integration, acceptance, { reason: "Final product evidence did not pass before publication; candidate and evidence are retained." });
       }
       const preliminary = await this.router.publishCandidate(integration, adapters);
       if (preliminary.terminalState !== "awaiting_final_acceptance") return this.router.store.updateDeliveryRun(run.id, { state: preliminary.terminalState, integrationPath: integration.path, publish: preliminary, confirmRemotePush: this.router.isAutonomous() });
       acceptance = this.router.store.recordProductAcceptanceReport(await this.router.buildProductAcceptanceReport({ integration, remoteCi: preliminary.remoteCi, productEvidence }));
     }
+    this.router.store.reconcileRequirementLedgerCandidate({ deliveryRunId: run.id, reportId: acceptance.id });
     if (!acceptance.passing) {
       return this.#blockedAcceptance(run, integration, acceptance, { reason: "Final acceptance did not pass; candidate and evidence are retained." });
     }
@@ -208,6 +220,29 @@ export class DeliveryCoordinator {
       if (!expected.has(key) || seen.has(key) || item?.status !== "pass" || typeof item?.testId !== "string" || !item.testId.trim() || typeof item?.reference !== "string" || !item.reference.trim() || item?.candidateSha?.toLowerCase() !== candidate.sha.toLowerCase()) return false;
       seen.add(key); return true;
     }) && seen.size === expected.size;
+  }
+
+  #reconcileVerifiedWave(run) {
+    const checkpoint = this.router.store.unreconciledGlobalWaveCheckpoint?.(run.id);
+    if (!checkpoint) return null;
+    const result = this.router.store.reconcileRequirementLedger({ deliveryRunId: run.id, checkpointId: checkpoint.id, diagnosticsLimit: this.router.config.delivery?.maxReconciliationDiagnostics ?? 25 });
+    const history = this.router.store.reconciliationHistory(run.id);
+    const noProgress = history.filter((item) => item.progressed === false).length;
+    const limits = this.router.config.delivery ?? {};
+    if (!result.progressed && noProgress > (limits.maxNoProgressReconciliations ?? 2)) {
+      const blocked = this.router.store.updateDeliveryRun(run.id, { state: "blocked_reconciliation", publish: { reason: "no_progress_reconciliation_limit_exhausted", checkpointId: checkpoint.id, checkpointSha: checkpoint.outputSha, wave: checkpoint.wave, diagnostics: result.diagnostics, recovery: { action: "Correct the unresolved requirement ownership/evidence and resume this exact delivery; prior checkpoints and artifacts are retained." } } });
+      return { blocked: true, run: blocked };
+    }
+    if (result.remainingRequirementIds.length) {
+      if (checkpoint.wave >= (limits.maxWaves ?? 8)) {
+        const blocked = this.router.store.updateDeliveryRun(run.id, { state: "blocked_reconciliation", publish: { reason: "max_waves_exhausted", checkpointId: checkpoint.id, checkpointSha: checkpoint.outputSha, wave: checkpoint.wave, remainingRequirementIds: result.remainingRequirementIds, diagnostics: result.diagnostics, recovery: { action: "Resume this exact delivery after increasing delivery.maxWaves or resolving the remaining requirements; prior waves are retained." } } });
+        return { blocked: true, run: blocked };
+      }
+      this.router.enqueueNextPlannerWave(run.id);
+      return { nextPlanner: true, result };
+    }
+    const integration = this.router.store.integrationManifestForCandidate?.(checkpoint.outputSha);
+    return { result, finalIntegration: integration };
   }
 
   #awaiting(run, gate) {
