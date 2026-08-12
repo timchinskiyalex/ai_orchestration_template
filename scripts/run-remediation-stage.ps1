@@ -23,11 +23,11 @@ $stderrPath = "$LogPath.stderr"
 Write-Host "[remediation] Codex stage $StageId started. Output is also saved to $LogPath"
 
 try {
-  # Invoke the npm .cmd shim through cmd.exe. Calling it directly through a
-  # PowerShell pipeline can report a false non-zero status after Codex has
-  # successfully written its final message.
-  $codexCommand = "`"$($codex.Source)`" exec --dangerously-bypass-approvals-and-sandbox --cd `"$projectRoot`" --output-last-message `"$LogPath.final.txt`" --color always"
-  $prompt | & cmd.exe /d /s /c "`"$codexCommand`"" 2>$stderrPath | Tee-Object -LiteralPath $LogPath
+  $prompt | & $codex.Source exec `
+    --dangerously-bypass-approvals-and-sandbox `
+    --cd $projectRoot `
+    --output-last-message "$LogPath.final.txt" `
+    --color always 2>$stderrPath | Tee-Object -LiteralPath $LogPath
   $exitCode = $LASTEXITCODE
 }
 finally {
@@ -41,5 +41,13 @@ finally {
   }
 }
 
-if ($exitCode -ne 0) { throw "Codex stage '$StageId' exited with code $exitCode. See $LogPath" }
+if (-not (Test-Path -LiteralPath "$LogPath.final.txt" -PathType Leaf)) {
+  throw "Codex stage '$StageId' produced no final message (exit code $exitCode). See $LogPath"
+}
+if ($exitCode -ne 0) {
+  # The npm PowerShell shim can return a false non-zero code after a completed
+  # Codex run. The final response plus the pipeline's full deterministic test
+  # suite is the trustworthy success condition.
+  Write-Warning "Codex stage '$StageId' returned $exitCode after writing its final message; continuing to verification."
+}
 Write-Host "[remediation] Codex stage $StageId completed."
