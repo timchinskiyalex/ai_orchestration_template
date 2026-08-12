@@ -3,6 +3,7 @@ import { enforceRoutingInvariants } from "./routing-evaluator.mjs";
 import { assertMandatoryRequirementCoverage, authorizeBootstrapClaims, validateRequirementIds } from "./product-blueprint.mjs";
 import { isWriteSurfaceAncestorOrSame, normalizeAllowedPaths } from "./write-surface.mjs";
 import { validateTaskBaselineBehaviorIds } from "./repository-baseline.mjs";
+import { validateProjectMode } from "./project-mode.mjs";
 const domains = new Set(["backend", "frontend", "database", "qa", "security", "devops"]);
 const riskFlags = new Set(["public_api_change", "auth_or_authorization", "secret_handling", "sensitive_data", "destructive_data_change", "schema_change", "production_write", "network_exposure", "permission_change", "dependency_supply_chain", "irreversible_operation", "high_blast_radius"]);
 const sha = (value) => typeof value === "string" && /^[a-f0-9]{40,64}$/i.test(value);
@@ -20,8 +21,10 @@ export function validateBootstrap(value, { sourceDocuments = null, sourceResolve
   catch (error) { fail(error.message.replace(/^Invalid ProductBlueprint: /, "")); }
 }
 
-export function validatePlan(value, { maxTasks, productRoots = [], blueprint = null, requirePlanBatch = false, allowPartialRequirementCoverage = false, recovery = false, repositoryBaseline = null } = {}) {
+export function validatePlan(value, { maxTasks, productRoots = [], blueprint = null, requirePlanBatch = false, allowPartialRequirementCoverage = false, recovery = false, repositoryBaseline = null, projectMode = null } = {}) {
+  const mode = projectMode ? validateProjectMode(projectMode) : null;
   if (!value || typeof value !== "object" || !Array.isArray(value.tasks)) fail("PlanBatch must contain a tasks array");
+  if (mode && (!value.projectMode || validateProjectMode(value.projectMode).mode !== mode.mode)) fail("PlanBatch ProjectMode must match the persisted delivery mode");
   const hasBatchFields = ["schemaVersion", "kind", "id", "deliveryRunId", "wave", "basedOnCheckpointSha", "createdAt"].some((key) => key in value);
   if (requirePlanBatch || hasBatchFields) {
     for (const key of ["schemaVersion", "kind", "id", "deliveryRunId", "blueprintId", "wave", "basedOnCheckpointSha", "tasks", "createdAt"]) if (!(key in value)) fail(`PlanBatch is missing '${key}'`);
@@ -64,7 +67,7 @@ export function validatePlan(value, { maxTasks, productRoots = [], blueprint = n
       if (!ids.has(dependency) || dependency === task.id) fail(`task '${task.id}' has an invalid dependency '${dependency}'`);
     }
   }
-  if (productRoots.length && !recovery) {
+  if ((mode?.mode === "greenfield" || (!mode && productRoots.length)) && productRoots.length && !recovery) {
     const scaffold = value.tasks.find((task) => task.id === "scaffold-product");
     if (!scaffold) fail("greenfield multi-stack plan requires a scaffold-product task");
     if (scaffold.primaryDomain !== "devops") fail("scaffold-product must be a devops writer task");
@@ -76,6 +79,7 @@ export function validatePlan(value, { maxTasks, productRoots = [], blueprint = n
       if (writesProduct && !task.dependsOn.includes(scaffold.id)) fail(`product task '${task.id}' must directly depend on scaffold-product`);
     }
   }
+  if (mode?.mode === "brownfield" && value.tasks.some((task) => task?.id === "scaffold-product")) fail("brownfield ProjectMode forbids generic scaffold-product");
   const visiting = new Set();
   const visited = new Set();
   const byId = new Map(value.tasks.map((task) => [task.id, task]));

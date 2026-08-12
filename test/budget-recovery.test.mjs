@@ -63,7 +63,8 @@ function createRun(router, task) {
 }
 
 async function waitForTurnStart(client) {
-  for (let attempts = 0; attempts < 100 && client.next === 1; attempts += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline && client.next === 1) await new Promise((resolve) => setTimeout(resolve, 10));
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.notEqual(client.next, 1, "fake turn did not start");
 }

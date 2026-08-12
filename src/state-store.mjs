@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { assertRole, assertTransition } from "./domain.mjs";
 import { validateGlobalWaveCheckpoint, validateIntegrationBarrier, validateIntegrationCheckpoint, validateLocalIntegrationCheckpoint, validatePlan, validateWorkerArtifactContract } from "./workflow-contract.mjs";
 import { productAcceptancePasses, validateProductAcceptanceReport } from "./final-acceptance.mjs";
+import { validateProjectMode } from "./project-mode.mjs";
 
 const now = () => new Date().toISOString();
 const json = (value) => JSON.stringify(value ?? []);
@@ -401,10 +402,12 @@ export class StateStore {
     this.#addColumnIfMissing("delivery_runs", "repository_mode", "TEXT NOT NULL DEFAULT 'legacy'");
     this.#addColumnIfMissing("delivery_runs", "repository_base_sha", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "repository_baseline_id", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "project_mode_json", "TEXT");
     this.#addColumnIfMissing("product_blueprints", "source_claim_manifest_id", "TEXT");
     // Older resumable runs have no immutable intake contract. Preserve every
     // row, but prevent them from silently continuing under the new semantics.
     this.#blockLegacyRunsWithoutBlueprint();
+    this.#blockLegacyRunsWithoutProjectMode();
     // A PlanBatch persisted before execution topology existed cannot safely be
     // resumed: it may contain overlapping writers with no controller lane.
     this.#blockLegacyPlanTasksWithoutExecutionTopology();
@@ -763,14 +766,16 @@ export class StateStore {
     return row ? { writerTaskId: row.writer_task_id, path: row.report_path, report: JSON.parse(row.report_json) } : null;
   }
 
-  createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false, ownerPid, ownerSessionId, sourceClaimManifestId = null, sourceClaimInputMode = "supplied", repositoryMode = "legacy", repositoryBaseSha = null }) {
+  createDeliveryRun({ id, source = null, bootstrapTaskId = null, confirmRemotePush = false, ownerPid, ownerSessionId, sourceClaimManifestId = null, sourceClaimInputMode = "supplied", repositoryMode = "legacy", repositoryBaseSha = null, projectMode = null }) {
     if (!Number.isInteger(ownerPid) || ownerPid < 1 || typeof ownerSessionId !== "string" || !ownerSessionId) throw new Error("Delivery run requires an initial owner lease");
     const timestamp = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const active = this.db.prepare("SELECT id FROM delivery_runs WHERE state IN ('running','awaiting_human','awaiting_human_remote_handoff') LIMIT 1").get();
       if (active) throw new Error(`Delivery already owned by active run: ${active.id}`);
-      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, owner_pid, owner_session_id, heartbeat_at, completion_contract_version, source_claim_manifest_id, source_claim_input_mode, repository_mode, repository_base_sha, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, ownerPid, ownerSessionId, timestamp, sourceClaimManifestId, sourceClaimInputMode, repositoryMode, repositoryBaseSha, timestamp, timestamp);
+      const validatedProjectMode = projectMode ? validateProjectMode(projectMode) : null;
+      if (validatedProjectMode && repositoryMode !== validatedProjectMode.mode) throw new Error("ProjectMode and repositoryMode must match");
+      this.db.prepare("INSERT INTO delivery_runs(id, schema_version, state, source, bootstrap_task_id, confirm_remote_push, owner_pid, owner_session_id, heartbeat_at, completion_contract_version, source_claim_manifest_id, source_claim_input_mode, repository_mode, repository_base_sha, project_mode_json, created_at, updated_at) VALUES (?, 1, 'running', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)").run(id, source, bootstrapTaskId, confirmRemotePush ? 1 : 0, ownerPid, ownerSessionId, timestamp, sourceClaimManifestId, sourceClaimInputMode, repositoryMode, repositoryBaseSha, validatedProjectMode ? JSON.stringify(validatedProjectMode) : null, timestamp, timestamp);
       this.#insertEvent(bootstrapTaskId, "delivery/created", { deliveryRunId: id, confirmRemotePush: Boolean(confirmRemotePush), ownerPid, ownerSessionId, heartbeatAt: timestamp });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -912,7 +917,7 @@ export class StateStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db.prepare("INSERT INTO plan_batches(id, schema_version, kind, delivery_run_id, blueprint_id, wave, based_on_checkpoint_sha, tasks_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .run(batch.id, batch.schemaVersion, batch.kind, batch.deliveryRunId, batch.blueprintId, batch.wave, batch.basedOnCheckpointSha, JSON.stringify(batch.tasks), batch.createdAt);
+        .run(batch.id, batch.schemaVersion, batch.kind, batch.deliveryRunId, batch.blueprintId, batch.wave, batch.basedOnCheckpointSha, JSON.stringify({ projectMode: batch.projectMode ?? null, tasks: batch.tasks }), batch.createdAt);
       // Inline version of createTasks keeps the batch row and task DAG one decision.
       for (const task of tasks) {
         assertRole(task.role); this.#validateTaskBlueprint(task);
@@ -940,7 +945,12 @@ export class StateStore {
     return this.planBatch(batch.id);
   }
 
-  planBatch(id) { const row = this.db.prepare("SELECT * FROM plan_batches WHERE id = ?").get(id); return row ? { schemaVersion: row.schema_version, kind: row.kind, id: row.id, deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, wave: row.wave, basedOnCheckpointSha: row.based_on_checkpoint_sha, tasks: parse(row.tasks_json, []), createdAt: row.created_at } : null; }
+  planBatch(id) {
+    const row = this.db.prepare("SELECT * FROM plan_batches WHERE id = ?").get(id);
+    if (!row) return null;
+    const stored = parse(row.tasks_json, []); const tasks = Array.isArray(stored) ? stored : stored.tasks ?? [];
+    return { schemaVersion: row.schema_version, kind: row.kind, id: row.id, deliveryRunId: row.delivery_run_id, blueprintId: row.blueprint_id, projectMode: Array.isArray(stored) ? null : stored.projectMode ?? null, wave: row.wave, basedOnCheckpointSha: row.based_on_checkpoint_sha, tasks, createdAt: row.created_at };
+  }
   planBatches(deliveryRunId) { return this.db.prepare("SELECT id FROM plan_batches WHERE delivery_run_id = ? ORDER BY wave, created_at").all(deliveryRunId).map((row) => this.planBatch(row.id)); }
 
   createIntegrationBarrier(barrier) {
@@ -1319,7 +1329,7 @@ export class StateStore {
   }
 
   #mapDeliveryRun(row) {
-    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, sourceClaimManifestId: row.source_claim_manifest_id ?? null, sourceClaimExtractionId: row.source_claim_extraction_id ?? null, sourceClaimAuditId: row.source_claim_audit_id ?? null, sourceClaimInputMode: row.source_claim_input_mode ?? "supplied", repositoryMode: row.repository_mode ?? "legacy", repositoryBaseSha: row.repository_base_sha ?? null, repositoryBaselineId: row.repository_baseline_id ?? null, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
+    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, sourceClaimManifestId: row.source_claim_manifest_id ?? null, sourceClaimExtractionId: row.source_claim_extraction_id ?? null, sourceClaimAuditId: row.source_claim_audit_id ?? null, sourceClaimInputMode: row.source_claim_input_mode ?? "supplied", repositoryMode: row.repository_mode ?? "legacy", projectMode: parse(row.project_mode_json, null), repositoryBaseSha: row.repository_base_sha ?? null, repositoryBaselineId: row.repository_baseline_id ?? null, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   #mapScopedReplan(row) {
@@ -1467,6 +1477,23 @@ export class StateStore {
       for (const row of rows) {
         const reason = "source_claim_contract:persisted_run_manifest_missing";
         this.db.prepare("UPDATE delivery_runs SET state = 'blocked_specification', publish_json = ?, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(JSON.stringify({ reason, recovery: { action: "Start a fresh delivery from source documentation; historical artifacts and tasks remain retained." } }), timestamp, row.id);
+        this.db.prepare("UPDATE tasks SET status = 'blocked_specification', error = ?, updated_at = ? WHERE delivery_run_id = ? AND status IN ('queued','preparing','running','awaiting_approval','awaiting_human','interrupted')").run(reason, timestamp, row.id);
+        this.#insertEvent(row.bootstrap_task_id, "delivery/blocked_specification", { deliveryRunId: row.id, reason });
+      }
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  #blockLegacyRunsWithoutProjectMode() {
+    const states = ["running", "awaiting_human", "awaiting_human_remote_handoff", "interrupted", "blocked_credentials", "blocked_ci", "blocked_branch_protection"];
+    const rows = this.db.prepare(`SELECT id, bootstrap_task_id FROM delivery_runs WHERE project_mode_json IS NULL AND state IN (${states.map(() => "?").join(",")})`).all(...states);
+    if (!rows.length) return;
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        const reason = "project_mode:persisted_record_missing";
+        this.db.prepare("UPDATE delivery_runs SET state = 'blocked_specification', publish_json = ?, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(JSON.stringify({ reason, recovery: { action: "Start a fresh delivery with a versioned ProjectMode; historical records remain readable." } }), timestamp, row.id);
         this.db.prepare("UPDATE tasks SET status = 'blocked_specification', error = ?, updated_at = ? WHERE delivery_run_id = ? AND status IN ('queued','preparing','running','awaiting_approval','awaiting_human','interrupted')").run(reason, timestamp, row.id);
         this.#insertEvent(row.bootstrap_task_id, "delivery/blocked_specification", { deliveryRunId: row.id, reason });
       }

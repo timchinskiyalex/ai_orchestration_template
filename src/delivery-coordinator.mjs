@@ -40,14 +40,14 @@ export class DeliveryCoordinator {
     let baselineDraft;
     try { baselineDraft = this.router.captureRepositoryBaselineDraft(overlay); }
     catch (error) {
-      const blocked = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: null, confirmRemotePush: false, sourceClaimInputMode: intake.sourceClaimInput, repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: null });
+      const blocked = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: null, confirmRemotePush: false, sourceClaimInputMode: intake.sourceClaimInput, repositoryMode: this.router.projectMode?.mode, projectMode: this.router.projectMode, repositoryBaseSha: null });
       // Preserve the historical Bootstrap task used by baseline diagnostics,
       // but block the run before the scheduler can claim it.
       const bootstrap = this.router.startProject();
       this.router.store.linkTaskToDelivery(bootstrap.id, blocked.id);
       return this.router.blockRunForRepositoryBaseline(blocked, error);
     }
-    let run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: null, confirmRemotePush: false, sourceClaimInputMode: intake.sourceClaimInput, repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: baselineDraft?.baseSha ?? null });
+    let run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: null, confirmRemotePush: false, sourceClaimInputMode: intake.sourceClaimInput, repositoryMode: this.router.projectMode?.mode, projectMode: this.router.projectMode, repositoryBaseSha: baselineDraft?.baseSha ?? null });
     try {
       if (intake.sourceClaimInput === "raw") await this.router.extractSourceClaimsForRun(run);
       await this.router.auditAndAdmitSourceClaimsForRun(this.router.store.deliveryRun(run.id));
@@ -109,7 +109,7 @@ export class DeliveryCoordinator {
   async #advance(run, context = {}) {
     this.router.activateDeliveryRun(run.id);
     if (typeof this.router.assertRepositoryBaseline === "function") {
-      try { this.router.assertRepositoryBaseline(run, { requireFinal: run.repositoryMode === "brownfield" && Boolean(run.blueprintId) }); }
+      try { this.router.assertRepositoryBaseline(run, { requireFinal: run.projectMode?.mode === "brownfield" && Boolean(run.blueprintId) }); }
       catch (error) { return this.router.blockRunForRepositoryBaseline(run, error); }
     }
     const sourceControlledDelivery = Boolean(run.source || run.sourceClaimManifestId || run.blueprintId);

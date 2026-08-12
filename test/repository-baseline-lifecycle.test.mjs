@@ -107,10 +107,25 @@ test("brownfield controller lifecycle captures, finalizes, materializes, verifie
     const run = router.store.deliveryRun(final.id); const draft = router.store.repositoryBaselineDraft(final.id); const baseline = router.store.repositoryBaselineForRun(final.id); const manifest = router.store.integrationManifest(final.integrationPath); const acceptance = router.store.productAcceptanceForRun(final.id).report;
     assert.equal(final.state, "completed_merged"); assert.equal(draft.baseSha, git(fx.root, ["rev-parse", "main"])); assert.equal(baseline.baseSha, draft.baseSha); assert.equal(baseline.productBlueprintDigest, router.store.productBlueprint(run.blueprintId).digest);
     assert.deepEqual(client.events, ["draft-before-bootstrap", "final-before-planner"]);
+    assert.equal(run.projectMode.mode, "brownfield"); assert.equal(router.list().some((item) => item.prompt.startsWith("[[product-scaffold]]")), false);
     assert.deepEqual(router.list().filter((item) => item.title === "Writer Protected").map((item) => item.baselineBehaviorIds), [["value-preserved"]]);
     assert.ok(fx.processCalls.some((command) => command.cwd === manifest.worktree && command.args.join(" ").includes("test")), "candidate worktree runs the declared Overlay command");
     assert.equal(acceptance.candidateSha, manifest.candidateSha); assert.equal(acceptance.repositoryBaselineDigest, baseline.digest); assert.deepEqual(acceptance.behaviorEvidence.map((item) => ({ behaviorId: item.behaviorId, commandId: item.commandId, candidateSha: item.candidateSha, baselineDigest: item.baselineDigest, classification: item.classification })), [{ behaviorId: "value-preserved", commandId: "package-script:test", candidateSha: manifest.candidateSha, baselineDigest: baseline.digest, classification: "pass" }]);
   } finally { router?.close(); rmSync(fx.root, { recursive: true, force: true }); }
+});
+
+test("legacy persisted records without ProjectMode are fail-closed before a worker can start", async () => {
+  const fx = fixture(); const client = new LifecycleClient(); const { router, run } = await persistedBaseline(fx, client);
+  try {
+    router.store.db.prepare("UPDATE delivery_runs SET project_mode_json = NULL WHERE id = ?").run(run.id);
+    router.close();
+    const resumed = new SwarmRouter(fx.config);
+    try {
+      const persisted = resumed.store.deliveryRun(run.id);
+      assert.equal(persisted.state, "blocked_specification");
+      assert.equal(persisted.publish.reason, "project_mode:persisted_record_missing");
+    } finally { resumed.close(); }
+  } finally { rmSync(fx.root, { recursive: true, force: true }); }
 });
 
 test("missing or invalid declaration blocks a coordinator delivery before Bootstrap and redacts fixture values", async () => {

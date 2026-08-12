@@ -14,7 +14,9 @@ import { sourceFragmentDigest } from "../src/source-evidence.mjs";
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const waitFor = async (predicate, label) => {
-  const deadline = Date.now() + 15_000;
+  // The full suite runs this durable recovery flow alongside expensive
+  // worktree tests; this is a polling deadline, not a product timeout.
+  const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -76,7 +78,7 @@ function setup(client) {
   writeFileSync(join(root, "src", "base.mjs"), "export const base = true;\n"); writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "npm@10", scripts: {} })); writeFileSync(join(root, "package-lock.json"), "{}");
   git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: role === "backend" }]));
-  const config = { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "scoped", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", productRoots: [] }, router: { maxConcurrentTasks: 1, maxChildrenPerTask: 30, maxDelegationDepth: 6, maxPlanTasks: 8, defaultParentBudget: 10_000, turnTimeoutMs: 1_000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true }, budget: { weeklyTokenLimit: 10_000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxScopedReplanAttempts: 2 }, roles, executionProviderFactory: () => provider(client) };
+  const config = { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { name: "scoped", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", projectMode: { schemaVersion: 1, kind: "ProjectMode", mode: "greenfield" }, productRoots: [] }, router: { maxConcurrentTasks: 1, maxChildrenPerTask: 30, maxDelegationDepth: 6, maxPlanTasks: 8, defaultParentBudget: 10_000, turnTimeoutMs: 1_000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true }, budget: { weeklyTokenLimit: 10_000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxScopedReplanAttempts: 2 }, roles, executionProviderFactory: () => provider(client) };
   return { root, router: new SwarmRouter(config) };
 }
 
@@ -88,7 +90,7 @@ test("scoped implementation recovery preserves upstream evidence, materializes o
     // Stage 04 audit table existed. Compatibility must audit it, not replace
     // its manifest identity and invalidate downstream recovery evidence.
     const legacySessionId = "legacy-scoped-replan-fixture";
-    const run = router.store.createDeliveryRun({ id: "run-scoped", bootstrapTaskId: bootstrap.id, sourceClaimManifestId: suppliedManifestId, ownerPid: process.pid, ownerSessionId: legacySessionId }); router.activateDeliveryRun(run.id, legacySessionId); router.store.linkTaskToDelivery(bootstrap.id, run.id);
+    const run = router.store.createDeliveryRun({ id: "run-scoped", bootstrapTaskId: bootstrap.id, sourceClaimManifestId: suppliedManifestId, repositoryMode: "greenfield", projectMode: { schemaVersion: 1, kind: "ProjectMode", mode: "greenfield" }, ownerPid: process.pid, ownerSessionId: legacySessionId }); router.activateDeliveryRun(run.id, legacySessionId); router.store.linkTaskToDelivery(bootstrap.id, run.id);
     assert.equal(router.store.deliveryRun(run.id).sourceClaimAuditId, null);
     const execution = router.runUntilIdle();
     await waitFor(() => router.store.activeScopedReplans(run.id).length === 1, "active scoped replan planner");

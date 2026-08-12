@@ -27,6 +27,7 @@ import { SourceClaimAuditExecutor, admitAuditedSourceClaims, auditSubjectFromExt
 import { PRODUCT_ACCEPTANCE_KIND, PRODUCT_ACCEPTANCE_SCHEMA_VERSION, productAcceptancePasses } from "./final-acceptance.mjs";
 import { compileWriteSurfaceTopology } from "./write-surface.mjs";
 import { assertRepositoryBaselineCurrent, captureRepositoryBaselineDraft, finalizeRepositoryBaseline, repositoryBaselineStatus, validateTaskBaselineBehaviorIds } from "./repository-baseline.mjs";
+import { configuredProjectMode, sameProjectMode, validateProjectMode } from "./project-mode.mjs";
 
 const gitSha = (repository, ref) => execFileSync("git", ["-C", repository, "rev-parse", "--verify", `${ref}^{commit}`], { encoding: "utf8" }).trim();
 
@@ -38,7 +39,8 @@ export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = nu
     `Worktree: ${worktree ?? "read-only repository"}`,
     `Allowed paths: ${task.allowedPaths.length ? task.allowedPaths.join(", ") : "none specified; do not broaden scope"}`,
     `Acceptance checks: ${task.acceptanceChecks.length ? task.acceptanceChecks.join("; ") : "report which checks are missing"}`,
-    `Generated orchestration artifacts: ${project.generatedDir}`
+    `Generated orchestration artifacts: ${project.generatedDir}`,
+    ...(project.projectMode ? [`Immutable ProjectMode: ${JSON.stringify(project.projectMode)}. ${project.projectMode.mode === "brownfield" ? "Do not create generic product scaffold; preserve repository behavior evidence." : "Declared scaffold adapters may be used only by the controller-owned scaffold task."}`] : [])
   ];
   if (documentationAvailable) lines.splice(6, 0, `Project documentation: ${project.documentationDir}`);
   else lines.push("Project documentation has not been imported. Do not assume docs/orchestration-input exists; perform only the TaskEnvelope and controller-provided sanitized ProjectOverlay snapshot.");
@@ -53,7 +55,8 @@ export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = nu
 // roots. A planner may omit a root or write `frontend/`; both are safe to
 // canonicalize because this only grants the scaffold task paths explicitly
 // declared in project configuration.
-export function normalizePlannerPlanForProject(value, productRoots = []) {
+export function normalizePlannerPlanForProject(value, productRoots = [], projectMode = null) {
+  if (projectMode?.mode === "brownfield") return value;
   if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.tasks) || !productRoots.length) return value;
   const roots = productRoots.map((item) => item?.path).filter((path) => typeof path === "string" && path.trim()).map((path) => path.replace(/[\\/]+$/, ""));
   if (!roots.length) return value;
@@ -77,6 +80,12 @@ export class SwarmRouter extends EventEmitter {
   constructor(config, { readOnly = false } = {}) {
     super();
     this.config = config;
+    try { this.projectMode = configuredProjectMode(config.project, { allowLegacyRepositoryMode: true }); }
+    catch { this.projectMode = null; }
+    if (this.projectMode) {
+      this.config.project.projectMode = this.projectMode;
+      this.config.project.repositoryMode = this.projectMode.mode;
+    }
     this.store = new StateStore(join(config.runtimeDir, "swarm.sqlite"), { readOnly, faultHooks: config.faultHooks });
     this.governor = new BudgetGovernor(config.router);
     this.worktrees = new WorktreeManager({ ...config, store: this.store, readOnly });
@@ -182,7 +191,7 @@ export class SwarmRouter extends EventEmitter {
 
   createDeliveryRun(details) {
     const sessionId = randomUUID();
-    let run = this.store.createDeliveryRun({ ...details, ownerPid: process.pid, ownerSessionId: sessionId });
+    let run = this.store.createDeliveryRun({ ...details, projectMode: details.projectMode ?? this.projectMode, repositoryMode: details.repositoryMode ?? this.projectMode?.mode ?? "legacy", ownerPid: process.pid, ownerSessionId: sessionId });
     this.activateDeliveryRun(run.id, sessionId);
     // Programmatic callers from before source-claim audit/admission supplied a
     // compiled, persisted declaration directly.  It remains usable only after
@@ -196,7 +205,7 @@ export class SwarmRouter extends EventEmitter {
   }
 
   captureRepositoryBaselineDraft(overlay) {
-    if (this.config.project.repositoryMode !== "brownfield") return null;
+    if (this.projectMode?.mode !== "brownfield") return null;
     return captureRepositoryBaselineDraft({ repository: this.config.repository, baseRef: this.config.baseRef, declarationPath: join(this.config.repository, this.config.project.repositoryBaselineDeclaration), overlay: overlay?.overlay ?? overlay });
   }
 
@@ -422,6 +431,7 @@ export class SwarmRouter extends EventEmitter {
       qualityReports: reports.map(({ taskId, path, report }) => ({ taskId, path, verdict: report.verdict, findings: report.findings.length })),
       securityReports: securityReports.map(({ taskId, path, report }) => ({ taskId, path, verdict: report.verdict, findings: report.findings.length })),
       deliveryRun: this.store.currentDeliveryRun(),
+      projectMode: this.store.currentDeliveryRun()?.projectMode ?? this.projectMode,
       repositoryBaseline: repositoryBaselineStatus(this.store.currentDeliveryRun() ? this.store.repositoryBaselineForRun(this.store.currentDeliveryRun().id) : null),
       finalAcceptance: this.store.currentDeliveryRun() ? this.store.productAcceptanceForRun(this.store.currentDeliveryRun().id) : null,
       managedWorktrees: this.store.listManagedWorktrees({ limit: 50 }).map((record) => ({ recordId: record.recordId, kind: record.kind, phase: record.phase, classification: worktreeInventory.current.get(record.recordId)?.classification ?? record.classification, persistedClassification: record.classification, currentVerification: worktreeInventory.current.get(record.recordId) ?? null, taskId: record.taskId, deliveryRunId: record.deliveryRunId, barrierId: record.barrierId, candidateId: record.candidateId, branch: record.branch, lastVerifiedHead: record.lastVerifiedHead, updatedAt: record.updatedAt })),
@@ -900,6 +910,7 @@ export class SwarmRouter extends EventEmitter {
         const manifestRequired = Boolean(task.deliveryRunId);
         const sourceClaimManifest = manifestRequired ? this.#manifestForRun(this.store.deliveryRun(task.deliveryRunId)) : null;
         const blueprint = validateBootstrap(extractOrchestrationJson(resultText), { sourceResolver, policyRegistry: this.#controllerPolicyRegistry(), sourceClaimManifest });
+        if (task.deliveryRunId) blueprint.projectMode = this.#assertProjectMode(this.store.deliveryRun(task.deliveryRunId));
         const persisted = this.#persistBlueprint(task, blueprint);
         this.store.setResultPath(task.id, persisted.artifactPath);
         if (task.deliveryRunId) {
@@ -1155,12 +1166,13 @@ export class SwarmRouter extends EventEmitter {
     const wave = prior ? prior.wave + 1 : 1;
     const baseSha = prior?.outputSha ?? gitSha(this.config.repository, this.config.baseRef);
     const baseline = bootstrapTask.deliveryRunId ? this.store.repositoryBaselineForRun(bootstrapTask.deliveryRunId) : null;
-    const baselineInstruction = baseline ? ` This is brownfield preservation work. Every task must include baselineBehaviorIds exactly equal to the protected behaviors whose declared impact surfaces intersect its allowedPaths; use [] when no surface intersects. The controller rejects missing, unknown, duplicate, or out-of-scope ids. Protected behavior ids: ${baseline.behaviors.map((item) => item.behaviorId).join(", ")}.` : "";
+    const greenfieldInstruction = this.projectMode?.mode === "greenfield" ? " This is greenfield work: include a devops writer task with id scaffold-product that creates every declared product root before any task writing under a declared product root." : "";
+    const baselineInstruction = baseline ? ` This is brownfield preservation work: generic scaffold-product is forbidden even when productRoots are declared. Every task must include baselineBehaviorIds exactly equal to the protected behaviors whose declared impact surfaces intersect its allowedPaths; use [] when no surface intersects. The controller rejects missing, unknown, duplicate, or out-of-scope ids. Protected behavior ids: ${baseline.behaviors.map((item) => item.behaviorId).join(", ")}.` : "";
     return this.enqueue({
       role: "planner",
       parentTaskId: bootstrapTask.id,
       title: `Plan ${this.config.project.name}`,
-      prompt: `Use the immutable ProductBlueprint '${stored.blueprint.blueprintId}' at ${stored.artifactPath}. Produce PlanBatch id '${randomUUID()}', deliveryRunId '${bootstrapTask.deliveryRunId}', wave ${wave}, basedOnCheckpointSha '${baseSha}', and non-empty requirementIds on every implementation task. For this greenfield multi-stack contract, include a devops writer task with id scaffold-product that creates every declared product root before any task writing under frontend/ or backend/.${baselineInstruction}`,
+      prompt: `Use the immutable ProductBlueprint '${stored.blueprint.blueprintId}' at ${stored.artifactPath}. The immutable ProjectMode is ${JSON.stringify(this.projectMode)}. Produce PlanBatch id '${randomUUID()}', deliveryRunId '${bootstrapTask.deliveryRunId}', wave ${wave}, basedOnCheckpointSha '${baseSha}', and non-empty requirementIds on every implementation task.${greenfieldInstruction}${baselineInstruction}`,
       dependencies: [bootstrapTask.id], estimatedTokens: this.config.roles.planner.tokenBudget,
       blueprintId: stored.blueprint.blueprintId,
     });
@@ -1418,7 +1430,7 @@ export class SwarmRouter extends EventEmitter {
       const policyInstruction = policies.length
         ? ` Trusted controller policy proposals available for an exactly matching unresolved question are: ${JSON.stringify(policies)}. You may propose one only when its questionId, affected requirement IDs, and (when present) claim IDs exactly match the question. Copy its policyId, version, digest, and resolvedValue verbatim into proposedPolicyId, proposedPolicyVersion, proposedPolicyDigest, and proposedResolution; do not invent or alter a policy.`
         : " No trusted controller policy proposals are available.";
-      return `Return only one fenced JSON ProductBlueprint v1 claim set. Required exact top-level fields: {"schemaVersion":1,"kind":"ProductBlueprint","blueprintId":"stable-kebab-id","createdAt":"ISO-8601","documentSetDigest":"sha256","sourceDocuments":[{"documentId":"doc-id","path":"path","sha256":"sha256"}],"requirements":[{"requirementId":"stable-kebab-id","type":"functional|nfr|data|integration|constraint","priority":"must|should|could","mandatory":true,"description":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"acceptanceCriteria":[{"criterionId":"stable-kebab-id","description":"string","verificationHint":"optional"}],"constraints":[]}],"nfrs":[],"modules":[],"integrations":[],"dataModel":{},"constraints":[],"assumptions":[],"decisions":[{"adrId":"stable-kebab-id","decision":"string","rationale":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}]}],"unresolvedQuestions":[{"questionId":"stable-kebab-id","description":"string","requiredForRequirementIds":["requirement-id"],"proposedPolicyId":"optional-controller-policy-id","proposedPolicyVersion":"optional-version","proposedPolicyDigest":"optional-sha256","proposedResolution":"optional-proposed-value","sourceRefs":[]}],"contradictions":[{"contradictionId":"stable-kebab-id","requirementIds":["requirement-id"],"sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"description":"string"}]}. Bootstrap claims are never authorization: do not emit final resolution statuses, policy defaults, or authoritative resolutions. The controller alone validates configured trusted policy evidence and creates any ADR. sourceDocuments must exactly match inventory.json. A SourceRef is controller-verified evidence only: read imported UTF-8 source, normalize CRLF/CR to LF, use inclusive 1-based lines, join the selected lines with LF, and hash that exact fragment with SHA-256. Do not use locator fields; do not invent ranges or digests. Do not invent resolutions: a missing mandatory fact or unresolved contradiction stays unresolved.${policyInstruction}`;
+      return `Return only one fenced JSON ProductBlueprint v1 claim set. Include the exact controller-provided ProjectMode from the task prompt as projectMode; it is lifecycle identity, not source evidence. Required exact top-level fields: {"schemaVersion":1,"kind":"ProductBlueprint","blueprintId":"stable-kebab-id","createdAt":"ISO-8601","documentSetDigest":"sha256","sourceDocuments":[{"documentId":"doc-id","path":"path","sha256":"sha256"}],"requirements":[{"requirementId":"stable-kebab-id","type":"functional|nfr|data|integration|constraint","priority":"must|should|could","mandatory":true,"description":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"acceptanceCriteria":[{"criterionId":"stable-kebab-id","description":"string","verificationHint":"optional"}],"constraints":[]}],"nfrs":[],"modules":[],"integrations":[],"dataModel":{},"constraints":[],"assumptions":[],"decisions":[{"adrId":"stable-kebab-id","decision":"string","rationale":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}]}],"unresolvedQuestions":[{"questionId":"stable-kebab-id","description":"string","requiredForRequirementIds":["requirement-id"],"proposedPolicyId":"optional-controller-policy-id","proposedPolicyVersion":"optional-version","proposedPolicyDigest":"optional-sha256","proposedResolution":"optional-proposed-value","sourceRefs":[]}],"contradictions":[{"contradictionId":"stable-kebab-id","requirementIds":["requirement-id"],"sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"description":"string"}]}. Bootstrap claims are never authorization: do not emit final resolution statuses, policy defaults, or authoritative resolutions. The controller alone validates configured trusted policy evidence and creates any ADR. sourceDocuments must exactly match inventory.json. A SourceRef is controller-verified evidence only: read imported UTF-8 source, normalize CRLF/CR to LF, use inclusive 1-based lines, join the selected lines with LF, and hash that exact fragment with SHA-256. Do not use locator fields; do not invent ranges or digests. Do not invent resolutions: a missing mandatory fact or unresolved contradiction stays unresolved.${policyInstruction}`;
     }
     if (role === "planner") return `Return only one fenced JSON PlanBatch v1 with exact fields {"schemaVersion":1,"kind":"PlanBatch","id":"new-immutable-id","deliveryRunId":"controller-provided-run-id","blueprintId":"persisted-blueprint-id","wave":1,"basedOnCheckpointSha":"controller-provided-verified-git-sha","tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa","security"],"riskFlags":["public_api_change"],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"],"requirementIds":["ProductBlueprint requirement id"],"baselineBehaviorIds":[]}],"createdAt":"ISO-8601"}. The controller-provided id/run/wave/base are authoritative. Every implementation task must have non-empty requirementIds from the immutable ProductBlueprint; every mandatory requirement must be covered. Include baselineBehaviorIds only when controller brownfield context requires them; it is a preservation obligation and never changes allowedPaths. A writer with two writer predecessors is valid: the controller creates the fan-in barrier. Do not create implementation tasks for ambiguity; return {"outcome":"specification_gap","reason":"..."} instead.`;
     if (role === "qa") return `Return only one fenced JSON QualityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
@@ -1508,9 +1520,25 @@ export class SwarmRouter extends EventEmitter {
     return `repository_baseline:${code ?? "validation_failed"}`;
   }
 
+  #assertProjectMode(run) {
+    // Programmatic diagnostic fixtures without a configured contract remain
+    // outside autonomous delivery. Config-loaded projects always have one.
+    if (!this.projectMode) return null;
+    let persisted;
+    try { persisted = validateProjectMode(run?.projectMode); }
+    catch { throw new Error("project_mode:persisted_record_missing"); }
+    if (!sameProjectMode(this.projectMode, persisted) || run.repositoryMode !== persisted.mode) throw new Error("project_mode:run_mismatch");
+    if (run?.blueprintId) {
+      const blueprint = this.store.productBlueprint(run.blueprintId)?.blueprint;
+      if (blueprint?.projectMode && !sameProjectMode(blueprint.projectMode, persisted)) throw new Error("project_mode:blueprint_mismatch");
+    }
+    return persisted;
+  }
+
   #assertRepositoryBaseline(run, { requireFinal = true } = {}) {
-    const mode = run?.repositoryMode ?? "legacy";
-    if (this.config.project.repositoryMode === "brownfield" && mode !== "brownfield") throw new Error("repository_baseline:legacy_record_missing");
+    const projectMode = this.#assertProjectMode(run);
+    const mode = projectMode?.mode ?? run?.repositoryMode ?? "legacy";
+    if (this.projectMode?.mode === "brownfield" && mode !== "brownfield") throw new Error("repository_baseline:legacy_record_missing");
     if (mode === "legacy" || mode === "greenfield") return null;
     if (mode !== "brownfield" || !run?.repositoryBaseSha) throw new Error("repository_baseline:run_mode_invalid");
     const { overlay } = loadProjectOverlay(this.config.repository, this.config.project.generatedDir);
@@ -1606,9 +1634,11 @@ export class SwarmRouter extends EventEmitter {
     const existingBatches = this.store.planBatches(planRunId);
     const controllerWave = scopedReplan ? Math.max(0, ...existingBatches.map((batch) => batch.wave)) + 1 : (previous ? previous.wave + 1 : 1);
     const controllerBase = scopedReplan ? (previous?.outputSha ?? scopedReplan.priorCheckpointSha ?? priorBatch?.basedOnCheckpointSha ?? gitSha(this.config.repository, this.config.baseRef)) : (previous?.outputSha ?? gitSha(this.config.repository, this.config.baseRef));
-    const batchInput = { ...(parsedPlan ?? {}), schemaVersion: 1, kind: "PlanBatch", id: scopedReplan?.replacementPlanBatchId ?? scopedReplan?.id ?? randomUUID(), deliveryRunId: planRunId, blueprintId: stored.blueprint.blueprintId, wave: controllerWave, basedOnCheckpointSha: controllerBase, createdAt: new Date().toISOString() };
+    const runProjectMode = plannerTask.deliveryRunId ? this.#assertProjectMode(this.store.deliveryRun(plannerTask.deliveryRunId)) : this.projectMode;
+    const batchInput = { ...(parsedPlan ?? {}), schemaVersion: 1, kind: "PlanBatch", id: scopedReplan?.replacementPlanBatchId ?? scopedReplan?.id ?? randomUUID(), deliveryRunId: planRunId, blueprintId: stored.blueprint.blueprintId, projectMode: runProjectMode, wave: controllerWave, basedOnCheckpointSha: controllerBase, createdAt: new Date().toISOString() };
     const repositoryBaseline = plannerTask.deliveryRunId ? this.store.repositoryBaselineForRun(plannerTask.deliveryRunId) : null;
-    const plan = validatePlan(normalizePlannerPlanForProject(batchInput, scopedReplan ? [] : this.config.project.productRoots), { maxTasks: this.config.router.maxPlanTasks, productRoots: scopedReplan ? [] : this.config.project.productRoots, blueprint: stored.blueprint, requirePlanBatch: true, allowPartialRequirementCoverage: Boolean(scopedReplan), recovery: Boolean(scopedReplan), repositoryBaseline });
+    const productRoots = runProjectMode?.mode === "greenfield" && !scopedReplan ? this.config.project.productRoots : [];
+    const plan = validatePlan(normalizePlannerPlanForProject(batchInput, productRoots, runProjectMode), { maxTasks: this.config.router.maxPlanTasks, productRoots, blueprint: stored.blueprint, requirePlanBatch: true, allowPartialRequirementCoverage: Boolean(scopedReplan), recovery: Boolean(scopedReplan), repositoryBaseline, projectMode: runProjectMode });
     const executionTopology = compileWriteSurfaceTopology(plan.tasks, { isWorkspaceWriter: (item) => this.config.roles[item.primaryDomain]?.sandbox === "workspace-write" });
     if (plan.deliveryRunId !== planRunId) throw new Error("PlanBatch deliveryRunId must match Planner delivery run");
     if (scopedReplan) {
@@ -1659,7 +1689,7 @@ export class SwarmRouter extends EventEmitter {
       const executionDependencies = executionTopology.get(item.id)?.executionDependencies.map((dependency) => primaryIds.get(dependency)) ?? [];
       const writerPredecessors = this.#effectiveWriterPredecessorIds({ dependencies: dependencies.filter((dependency) => dependency !== plannerTask.id), executionDependencies }, { taskForId: (id) => ({ role: primaryRoleByTaskId.get(id) }) });
       const fanIn = writerPredecessors.length > 1;
-      const prompt = item.id === "scaffold-product"
+      const prompt = item.id === "scaffold-product" && runProjectMode?.mode === "greenfield"
         ? "[[product-scaffold]]\nController-owned scaffold contract: create every declared product root now. frontend/ must be a runnable Next.js application with package.json, npm lockfile, build and test scripts. backend/ must be an ASP.NET Core Web API solution with an xUnit test project. Do not create placeholders, plans, or a partial root. Run the declared checks after files are written."
         : item.prompt;
       specs.push({ id: primaryId, role: item.primaryDomain, parentTaskId: plannerTask.id, title: item.title, prompt, allowedPaths: item.allowedPaths, acceptanceChecks: item.acceptanceChecks, baselineBehaviorIds: item.baselineBehaviorIds ?? [], dependencies, executionDependencies, executionTopologyVersion: 1, executionIsWriter: primary.sandbox === "workspace-write", executionReleaseState: primary.sandbox === "workspace-write" ? "pending" : null, estimatedTokens: item.estimatedTokens, tokenBudget: primary.tokenBudget, maxAttempts: 1, humanApprovalRequired: elevatedGate, riskFlags: item.riskFlags, supportingDomains: item.supportingDomains, artifactBaseSha: primary.sandbox === "workspace-write" ? plan.basedOnCheckpointSha : null, artifactDependencies: fanIn ? [] : writerPredecessors, integrationBarrierId: fanIn ? `pending:${primaryId}` : null, blueprintId: stored.blueprint.blueprintId, requirementIds: item.requirementIds, deliveryRunId: planRunId, planBatchId: plan.id, wave: plan.wave });
@@ -1689,7 +1719,7 @@ export class SwarmRouter extends EventEmitter {
     return generateProjectOverlay({ repository: this.config.repository, inspectionRoot: worktree, baseRef: this.config.baseRef, generatedDir: this.config.project.generatedDir, project: this.config.project });
   }
 
-  #isScaffoldTask(task) { return task.prompt.startsWith("[[product-scaffold]]"); }
+  #isScaffoldTask(task) { return task.prompt.startsWith("[[product-scaffold]]") && this.store.deliveryRun(task.deliveryRunId)?.projectMode?.mode === "greenfield"; }
 
   // This is the controller's sole writer-lineage derivation. Keep logical
   // order first, then topology order: both are immutable controller inputs

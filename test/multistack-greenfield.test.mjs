@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { commandsForPaths, generateProjectOverlay } from "../src/project-overlay.mjs";
 import { validatePlan } from "../src/workflow-contract.mjs";
+import { projectModeFor } from "../src/project-mode.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
 const roots = [{ id: "frontend", path: "frontend", adapter: "next-node" }, { id: "backend", path: "backend", adapter: "dotnet" }];
@@ -29,4 +30,12 @@ test("greenfield DAG requires the scaffold writer before product tasks", () => {
   assert.throws(() => validatePlan({ tasks: [task("api", "backend", ["backend/src"]) ] }, { maxTasks: 3, productRoots: roots }), /scaffold-product/);
   const plan = validatePlan({ tasks: [task("scaffold-product", "devops", ["frontend", "backend"]), task("api", "backend", ["backend/src"], ["scaffold-product"]), task("ui", "frontend", ["frontend/app"], ["scaffold-product"])] }, { maxTasks: 4, productRoots: roots });
   assert.equal(plan.tasks.length, 3);
+});
+
+test("brownfield product roots never imply a generic scaffold", () => {
+  const projectMode = projectModeFor("brownfield");
+  const plan = validatePlan({ projectMode, tasks: [task("preserve-api", "backend", ["backend/src"]) ] }, { maxTasks: 3, productRoots: roots, projectMode });
+  assert.equal(plan.tasks[0].id, "preserve-api");
+  assert.throws(() => validatePlan({ projectMode, tasks: [task("scaffold-product", "devops", ["frontend", "backend"])] }, { maxTasks: 3, productRoots: roots, projectMode }), /forbids generic scaffold/);
+  assert.throws(() => validatePlan({ projectMode: projectModeFor("greenfield"), tasks: [task("preserve-api", "backend", ["backend/src"])] }, { maxTasks: 3, productRoots: roots, projectMode }), /ProjectMode must match/);
 });

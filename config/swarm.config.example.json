@@ -3,7 +3,7 @@
     "name": "replace-with-project-name",
     "documentationDir": "docs/orchestration-input",
     "generatedDir": "docs/orchestration-generated",
-    "repositoryMode": "legacy",
+    "projectMode": { "schemaVersion": 1, "kind": "ProjectMode", "mode": "greenfield" },
     "repositoryBaselineDeclaration": null,
     "productRoots": [
       { "id": "frontend", "path": "frontend", "adapter": "next-node" },

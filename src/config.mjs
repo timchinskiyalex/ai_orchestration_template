@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { ROLES } from "./domain.mjs";
 import { validateTrustedPolicyRegistry } from "./product-blueprint.mjs";
+import { configuredProjectMode } from "./project-mode.mjs";
 
 export function loadConfig(configPath) {
   if (!existsSync(configPath)) throw new Error(`Missing config: ${configPath}. Copy config/swarm.config.example.json first.`);
@@ -12,7 +13,7 @@ export function loadConfig(configPath) {
   config.project.documentationDir ??= "docs/orchestration-input";
   config.project.generatedDir ??= "docs/orchestration-generated";
   config.project.productRoots ??= [];
-  config.project.repositoryMode ??= "legacy";
+  config.project.repositoryMode ??= null;
   config.project.repositoryBaselineDeclaration ??= null;
   config.repository = resolve(base, config.repository);
   config.runtimeDir = resolve(base, config.runtimeDir ?? "./runtime");
@@ -76,8 +77,15 @@ export function loadConfig(configPath) {
   };
   config.project.documentationDir = safeProjectPath("project.documentationDir", config.project.documentationDir);
   config.project.generatedDir = safeProjectPath("project.generatedDir", config.project.generatedDir);
-  if (!["legacy", "greenfield", "brownfield"].includes(config.project.repositoryMode)) throw new Error("project.repositoryMode must be legacy, greenfield, or brownfield");
-  if (config.project.repositoryMode === "brownfield") {
+  // A repositoryMode-only file is accepted only as migration input. Runtime
+  // lifecycle decisions use the normalized versioned ProjectMode below.
+  if (config.project.projectMode === undefined && ["greenfield", "brownfield"].includes(config.project.repositoryMode)) {
+    config.project.projectMode = { schemaVersion: 1, kind: "ProjectMode", mode: config.project.repositoryMode };
+  }
+  try { config.project.projectMode = configuredProjectMode(config.project); }
+  catch { throw new Error("project.projectMode must be a versioned ProjectMode with mode greenfield or brownfield"); }
+  config.project.repositoryMode = config.project.projectMode.mode;
+  if (config.project.projectMode.mode === "brownfield") {
     config.project.repositoryBaselineDeclaration = safeProjectPath("project.repositoryBaselineDeclaration", config.project.repositoryBaselineDeclaration);
   } else if (config.project.repositoryBaselineDeclaration !== null && config.project.repositoryBaselineDeclaration !== undefined) {
     throw new Error("project.repositoryBaselineDeclaration is only allowed in brownfield mode");
