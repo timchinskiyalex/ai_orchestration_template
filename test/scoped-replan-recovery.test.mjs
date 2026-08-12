@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SwarmRouter } from "../src/router.mjs";
@@ -83,9 +83,17 @@ function setup(client) {
 test("scoped implementation recovery preserves upstream evidence, materializes one replacement wave, and stays idempotent", async () => {
   const client = new ScopedRecoveryClient(); const { root, router } = setup(client);
   try {
-    await router.ensureProjectOverlay(); const bootstrap = router.startProject(); const run = router.createDeliveryRun({ id: "run-scoped", bootstrapTaskId: bootstrap.id, sourceClaimManifestId: router.sourceClaimManifestIdentity() }); router.store.linkTaskToDelivery(bootstrap.id, run.id);
+    await router.ensureProjectOverlay(); const bootstrap = router.startProject(); const suppliedManifestId = router.sourceClaimManifestIdentity();
+    // This fixture models a persisted supplied declaration created before the
+    // Stage 04 audit table existed. Compatibility must audit it, not replace
+    // its manifest identity and invalidate downstream recovery evidence.
+    const legacySessionId = "legacy-scoped-replan-fixture";
+    const run = router.store.createDeliveryRun({ id: "run-scoped", bootstrapTaskId: bootstrap.id, sourceClaimManifestId: suppliedManifestId, ownerPid: process.pid, ownerSessionId: legacySessionId }); router.activateDeliveryRun(run.id, legacySessionId); router.store.linkTaskToDelivery(bootstrap.id, run.id);
+    assert.equal(router.store.deliveryRun(run.id).sourceClaimAuditId, null);
     const execution = router.runUntilIdle();
     await waitFor(() => router.store.activeScopedReplans(run.id).length === 1, "active scoped replan planner");
+    const admittedRun = router.store.deliveryRun(run.id); const suppliedAudit = router.store.sourceClaimAudit(admittedRun.sourceClaimAuditId);
+    assert.equal(admittedRun.sourceClaimManifestId, suppliedManifestId); assert.ok(suppliedAudit); assert.equal(suppliedAudit.candidateId, suppliedManifestId); assert.ok(router.store.sourceClaimManifest(suppliedManifestId)); assert.ok(existsSync(join(root, "docs", "orchestration-generated", "source-claim-manifests", `${suppliedManifestId}.json`))); assert.equal(client.goals.includes("Independently audit source claims and source coverage."), false);
     const [replan] = router.store.scopedReplans(run.id); const tasks = router.list(); const a = tasks.find((item) => item.title === "Write A"); const b = tasks.find((item) => item.title === "Write B"); const c = tasks.find((item) => item.title === "Write C");
     const aArtifact = router.store.workerArtifact(a.id); const traceability = router.store.traceabilityForRequirement("req-a");
     assert.equal(replan.failureKind, "worker_failure"); assert.deepEqual(replan.preservedArtifacts, [{ taskId: a.id, headSha: aArtifact.headSha, baseSha: aArtifact.baseSha }]); assert.ok(traceability.some((item) => item.taskId === a.id && item.checkpoint === "artifact"));

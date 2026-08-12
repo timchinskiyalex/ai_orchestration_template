@@ -33,37 +33,33 @@ export class DeliveryCoordinator {
     });
     if (cancelled.length) this.router.store.recordEvent(null, "delivery/fresh-start-cleanup", { previousDeliveryRunId: current?.id ?? null, cancelledTaskIds: cancelled.map((task) => task.id) });
     const intake = ingestDocumentation({ source, repository: this.router.config.repository, destinationRelative: this.router.config.project.documentationDir });
-    // Raw documents deliberately stop at the candidate handoff. Stage 04 owns
-    // independent audit/admission and is the only stage allowed to create the
-    // authoritative SourceClaimManifest used by Bootstrap.
-    if (intake.sourceClaimInput === "raw") {
-      const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: null, confirmRemotePush: false, sourceClaimInputMode: "raw", repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: null });
-      try {
-        const candidate = await this.router.extractSourceClaimsForRun(run);
-        return this.router.store.updateDeliveryRun(run.id, { state: "awaiting_source_claim_audit", publish: { reason: "source_claim_extraction:candidate_persisted", extractionId: candidate.extraction.extractionId, digest: candidate.digest, recovery: { action: "Stage 04 audit/admission must independently validate and admit this candidate before Bootstrap." } } });
-      } catch (error) { return this.router.blockRunForSourceExtraction(run, error); }
-    }
     const overlay = await this.router.ensureProjectOverlay();
-    // Brownfield identity is captured before Bootstrap creates the ProductBlueprint.
-    // The immutable draft is finalized only after that persisted blueprint exists.
+    // Capture the brownfield identity before the delivery row exists so its
+    // immutable base SHA is part of that row from creation.  This is still a
+    // controller-only preflight; Bootstrap remains strictly after admission.
     let baselineDraft;
     try { baselineDraft = this.router.captureRepositoryBaselineDraft(overlay); }
     catch (error) {
-      // A malformed or missing brownfield declaration must become a persisted,
-      // redacted delivery stop.  Queueing Bootstrap is harmless here: the run
-      // is blocked before the scheduler can ever create an App Server turn.
+      const blocked = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: null, confirmRemotePush: false, sourceClaimInputMode: intake.sourceClaimInput, repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: null });
+      // Preserve the historical Bootstrap task used by baseline diagnostics,
+      // but block the run before the scheduler can claim it.
       const bootstrap = this.router.startProject();
-      const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous(), sourceClaimManifestId: this.router.sourceClaimManifestIdentity(), sourceClaimInputMode: "supplied", repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: null });
-      this.router.store.linkTaskToDelivery(bootstrap.id, run.id);
-      return this.router.blockRunForRepositoryBaseline(run, error);
+      this.router.store.linkTaskToDelivery(bootstrap.id, blocked.id);
+      return this.router.blockRunForRepositoryBaseline(blocked, error);
     }
-    // Intake is verified before Bootstrap is even queued; no blueprint is
-    // required at this phase because Bootstrap is the operation that creates it.
-    const sourceClaimManifestId = this.router.sourceClaimManifestIdentity();
+    let run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: null, confirmRemotePush: false, sourceClaimInputMode: intake.sourceClaimInput, repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: baselineDraft?.baseSha ?? null });
+    try {
+      if (intake.sourceClaimInput === "raw") await this.router.extractSourceClaimsForRun(run);
+      await this.router.auditAndAdmitSourceClaimsForRun(this.router.store.deliveryRun(run.id));
+      run = this.router.store.deliveryRun(run.id);
+    } catch (error) { return /source_claim_audit|admission_blocked/i.test(String(error?.message ?? error)) ? this.router.blockRunForSourceClaimAudit(run, error) : this.router.blockRunForSourceExtraction(run, error); }
+    // Admission is complete before Bootstrap may be queued.
     const bootstrap = this.router.startProject();
-    const run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: bootstrap.id, confirmRemotePush: this.router.isAutonomous(), sourceClaimManifestId, sourceClaimInputMode: "supplied", repositoryMode: this.router.config.project.repositoryMode, repositoryBaseSha: baselineDraft?.baseSha ?? null });
-    if (baselineDraft) this.router.store.recordRepositoryBaselineDraft(run.id, baselineDraft);
     this.router.store.linkTaskToDelivery(bootstrap.id, run.id);
+    // The immutable draft is finalized only after Bootstrap persists the
+    // ProductBlueprint it must bind.
+    this.router.store.updateDeliveryRun(run.id, { state: "running", confirmRemotePush: this.router.isAutonomous() });
+    if (baselineDraft) this.router.store.recordRepositoryBaselineDraft(run.id, baselineDraft);
     return this.#advance(run, { intake, overlayPath: overlay.path, ...adapters });
   }
 
@@ -71,21 +67,7 @@ export class DeliveryCoordinator {
     await this.router.recoverStaleDeliveries();
     const run = this.router.store.currentDeliveryRun();
     if (!run) throw new Error("No delivery run exists; start with npm run deliver -- --source <docs-dir>");
-    if (run.sourceClaimInputMode === "raw") {
-      if (run.sourceClaimExtractionId) {
-        try { await this.router.extractSourceClaimsForRun(run); }
-        catch (error) { return this.router.blockRunForSourceExtraction(run, error); }
-        return this.router.store.updateDeliveryRun(run.id, { state: "awaiting_source_claim_audit", publish: { ...(run.publish ?? {}), reason: "source_claim_extraction:candidate_persisted", recovery: { action: "Stage 04 audit/admission must independently validate and admit this candidate before Bootstrap." } } });
-      }
-      if (["interrupted", "blocked_credentials", "blocked_specification"].includes(run.state)) {
-        const resumed = run.state === "blocked_specification" ? this.router.resumeSourceClaimExtractionRun(run.id) : this.router.resumeDeliveryRun(run.id);
-        try {
-          const candidate = await this.router.extractSourceClaimsForRun(resumed);
-          return this.router.store.updateDeliveryRun(resumed.id, { state: "awaiting_source_claim_audit", publish: { reason: "source_claim_extraction:candidate_persisted", extractionId: candidate.extraction.extractionId, digest: candidate.digest, recovery: { action: "Stage 04 audit/admission must independently validate and admit this candidate before Bootstrap." } } });
-        } catch (error) { return this.router.blockRunForSourceExtraction(resumed, error); }
-      }
-      return run;
-    }
+    if (run.sourceClaimInputMode === "raw" && (!run.sourceClaimManifestId || !run.sourceClaimAuditId)) return this.router.blockRunForSourceCompleteness(run, new Error("source_claim_contract:persisted_audited_manifest_missing"));
     if (typeof this.router.assertRepositoryBaseline === "function") {
       try { this.router.assertRepositoryBaseline(run); }
       catch (error) { return this.router.blockRunForRepositoryBaseline(run, error); }

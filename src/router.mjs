@@ -20,9 +20,10 @@ import { validateSecurityGateReport } from "./security-gate.mjs";
 import { GitHubCiAdapter, GitHubMergeAdapter, GitHubPullRequestAdapter, RemoteAdapterError, RemoteCiAdapter, RemoteGitAdapter } from "./remote-adapters.mjs";
 import { runManagedProcess } from "./managed-process-runner.mjs";
 import { provisionDeterministicScaffold } from "./deterministic-scaffold.mjs";
-import { sourceClaimBlockers, specificationBlockers, validateControllerAuthorizedBlueprint } from "./product-blueprint.mjs";
+import { documentSetDigest, sourceClaimBlockers, specificationBlockers, validateControllerAuthorizedBlueprint } from "./product-blueprint.mjs";
 import { compileImportedSourceClaimManifest, createImportedSourceResolver, validateSourceClaimExtraction } from "./source-evidence.mjs";
 import { SourceClaimExtractionExecutor } from "./source-claim-extraction.mjs";
+import { SourceClaimAuditExecutor, admitAuditedSourceClaims, auditSubjectFromExtraction, auditSubjectFromManifest, deterministicSuppliedSourceClaimAudit, validateSourceClaimAudit } from "./source-claim-audit.mjs";
 import { PRODUCT_ACCEPTANCE_KIND, PRODUCT_ACCEPTANCE_SCHEMA_VERSION, productAcceptancePasses } from "./final-acceptance.mjs";
 import { compileWriteSurfaceTopology } from "./write-surface.mjs";
 import { assertRepositoryBaselineCurrent, captureRepositoryBaselineDraft, finalizeRepositoryBaseline, repositoryBaselineStatus, validateTaskBaselineBehaviorIds } from "./repository-baseline.mjs";
@@ -181,8 +182,16 @@ export class SwarmRouter extends EventEmitter {
 
   createDeliveryRun(details) {
     const sessionId = randomUUID();
-    const run = this.store.createDeliveryRun({ ...details, ownerPid: process.pid, ownerSessionId: sessionId });
+    let run = this.store.createDeliveryRun({ ...details, ownerPid: process.pid, ownerSessionId: sessionId });
     this.activateDeliveryRun(run.id, sessionId);
+    // Programmatic callers from before source-claim audit/admission supplied a
+    // compiled, persisted declaration directly.  It remains usable only after
+    // the same deterministic supplied-input audit as the normal intake path.
+    // Keep its immutable ID: a persisted Blueprint/replan may already bind it.
+    if (run.sourceClaimInputMode === "supplied" && run.sourceClaimManifestId && !run.sourceClaimAuditId) {
+      this.admitPersistedSuppliedManifestForRun(run);
+      run = this.store.deliveryRun(run.id);
+    }
     return run;
   }
 
@@ -219,6 +228,89 @@ export class SwarmRouter extends EventEmitter {
     return manifest.manifestId;
   }
 
+  async auditAndAdmitSourceClaimsForRun(run) {
+    if (!run || !["raw", "supplied"].includes(run.sourceClaimInputMode)) throw new Error("source_claim_audit:intake_mode_invalid");
+    // Preserve the identity used by a pre-Stage-04 supplied run (and any
+    // Blueprint/replan already bound to it).  This is still an admission: the
+    // deterministic supplied audit validates the current declaration first.
+    if (run.sourceClaimInputMode === "supplied" && run.sourceClaimManifestId) {
+      const manifest = this.admitPersistedSuppliedManifestForRun(run);
+      const admittedRun = this.store.deliveryRun(run.id);
+      const storedAudit = this.store.sourceClaimAudit(admittedRun.sourceClaimAuditId);
+      return { subject: auditSubjectFromManifest(manifest), audit: storedAudit.audit, manifest };
+    }
+    const resolver = this.#sourceEvidenceResolver();
+    let subject;
+    if (run.sourceClaimInputMode === "raw") {
+      const extraction = run.sourceClaimExtractionId ? this.store.sourceClaimExtraction(run.sourceClaimExtractionId) : null;
+      if (!extraction || extraction.deliveryRunId !== run.id) throw new Error("source_claim_audit:extraction_missing_or_foreign");
+      const verified = validateSourceClaimExtraction(extraction.extraction, { sourceResolver: resolver });
+      if (verified.digest !== extraction.digest) throw new Error("source_claim_audit:extraction_digest_mismatch");
+      subject = auditSubjectFromExtraction(verified);
+    } else {
+      subject = auditSubjectFromManifest(this.#currentSourceClaimManifest());
+    }
+    let storedAudit = run.sourceClaimAuditId ? this.store.sourceClaimAudit(run.sourceClaimAuditId) : null;
+    let audit;
+    if (storedAudit) {
+      if (storedAudit.deliveryRunId !== run.id || storedAudit.candidateId !== subject.candidateId || storedAudit.candidateDigest !== subject.candidateDigest) throw new Error("source_claim_audit:stored_audit_lineage_mismatch");
+      audit = validateSourceClaimAudit(storedAudit.audit, { subject, sourceResolver: resolver, policyRegistry: this.#controllerPolicyRegistry() });
+      if (audit.digest !== storedAudit.digest) throw new Error("source_claim_audit:stored_audit_digest_mismatch");
+    } else {
+      audit = run.sourceClaimInputMode === "supplied"
+        ? deterministicSuppliedSourceClaimAudit(subject, resolver)
+        : await new SourceClaimAuditExecutor(this.config).audit(subject);
+      const directory = join(this.config.repository, this.config.project.generatedDir, "source-claim-audits"); mkdirSync(directory, { recursive: true });
+      const path = join(directory, `${audit.auditId}.json`); const serialized = `${JSON.stringify(audit, null, 2)}\n`;
+      if (existsSync(path) && readFileSync(path, "utf8") !== serialized) throw new Error("source_claim_audit:existing_audit_artifact_mismatch");
+      if (!existsSync(path)) writeFileSync(path, serialized, "utf8");
+      storedAudit = this.store.recordSourceClaimAudit({ deliveryRunId: run.id, audit, artifactPath: relative(this.config.repository, path).split("\\").join("/") });
+    }
+    const manifest = admitAuditedSourceClaims({ subject, audit });
+    const manifestDirectory = join(this.config.repository, this.config.project.generatedDir, "source-claim-manifests"); mkdirSync(manifestDirectory, { recursive: true });
+    const manifestPath = join(manifestDirectory, `${manifest.manifestId}.json`); const manifestSerialized = `${JSON.stringify(manifest, null, 2)}\n`;
+    if (existsSync(manifestPath) && readFileSync(manifestPath, "utf8") !== manifestSerialized) throw new Error("source_claim_audit:existing_manifest_artifact_mismatch");
+    if (!existsSync(manifestPath)) writeFileSync(manifestPath, manifestSerialized, "utf8");
+    this.store.recordSourceClaimManifest(manifest);
+    this.store.linkSourceClaimManifestToDelivery(run.id, manifest.manifestId);
+    this.store.recordEvent(null, "source-claim-admission/admitted", { deliveryRunId: run.id, extractionId: run.sourceClaimExtractionId ?? null, auditId: audit.auditId, manifestId: manifest.manifestId, documentSetDigest: manifest.documentSetDigest, claimCount: manifest.claims.length });
+    return { subject, audit, manifest };
+  }
+
+  admitPersistedSuppliedManifestForRun(run) {
+    if (!run || run.sourceClaimInputMode !== "supplied" || !run.sourceClaimManifestId) throw new Error("source_claim_audit:supplied_manifest_required");
+    const persisted = this.store.sourceClaimManifest(run.sourceClaimManifestId);
+    if (!persisted?.manifest || persisted.manifest.digest !== persisted.digest) throw new Error("source_claim_audit:supplied_manifest_missing_or_corrupt");
+    const current = this.#currentSourceClaimManifest();
+    // The declaration compiler validates document inventory, coverage, and
+    // exact source fragments. Digest equality binds the old persisted artifact
+    // to that independently validated current declaration.
+    if (current.manifestId !== persisted.manifest.manifestId || current.digest !== persisted.digest) throw new Error("source_claim_audit:supplied_manifest_source_identity_mismatch");
+    const resolver = this.#sourceEvidenceResolver();
+    const subject = auditSubjectFromManifest(persisted.manifest);
+    const existing = run.sourceClaimAuditId ? this.store.sourceClaimAudit(run.sourceClaimAuditId) : null;
+    const audit = existing
+      ? validateSourceClaimAudit(existing.audit, { subject, sourceResolver: resolver, policyRegistry: this.#controllerPolicyRegistry() })
+      : deterministicSuppliedSourceClaimAudit(subject, resolver);
+    if (existing && (existing.deliveryRunId !== run.id || existing.digest !== audit.digest)) throw new Error("source_claim_audit:stored_audit_lineage_mismatch");
+    admitAuditedSourceClaims({ subject, audit });
+    // Retain the original identity but materialize the admitted historical
+    // artifact where Bootstrap expects controller-owned manifest evidence.
+    const manifestDirectory = join(this.config.repository, this.config.project.generatedDir, "source-claim-manifests"); mkdirSync(manifestDirectory, { recursive: true });
+    const manifestPath = join(manifestDirectory, `${persisted.manifest.manifestId}.json`); const manifestSerialized = `${JSON.stringify(persisted.manifest, null, 2)}\n`;
+    if (existsSync(manifestPath) && readFileSync(manifestPath, "utf8") !== manifestSerialized) throw new Error("source_claim_audit:existing_manifest_artifact_mismatch");
+    if (!existsSync(manifestPath)) writeFileSync(manifestPath, manifestSerialized, "utf8");
+    if (!existing) {
+      const directory = join(this.config.repository, this.config.project.generatedDir, "source-claim-audits"); mkdirSync(directory, { recursive: true });
+      const path = join(directory, `${audit.auditId}.json`); const serialized = `${JSON.stringify(audit, null, 2)}\n`;
+      if (existsSync(path) && readFileSync(path, "utf8") !== serialized) throw new Error("source_claim_audit:existing_audit_artifact_mismatch");
+      if (!existsSync(path)) writeFileSync(path, serialized, "utf8");
+      this.store.recordSourceClaimAudit({ deliveryRunId: run.id, audit, artifactPath: relative(this.config.repository, path).split("\\").join("/") });
+      this.store.recordEvent(null, "source-claim-admission/supplied-legacy-admitted", { deliveryRunId: run.id, auditId: audit.auditId, manifestId: persisted.manifest.manifestId, documentSetDigest: persisted.manifest.documentSetDigest, claimCount: persisted.manifest.claims.length });
+    }
+    return persisted.manifest;
+  }
+
   async extractSourceClaimsForRun(run) {
     if (!run || run.sourceClaimInputMode !== "raw") throw new Error("source_claim_extraction:raw_intake_required");
     const existing = run.sourceClaimExtractionId ? this.store.sourceClaimExtraction(run.sourceClaimExtractionId) : null;
@@ -238,8 +330,27 @@ export class SwarmRouter extends EventEmitter {
   }
 
   blockRunForSourceExtraction(run, error) {
-    const code = /malformed_json/i.test(String(error?.message ?? error)) ? "source_claim_extraction:malformed_json" : /provider_unavailable|transport|unsupported_capability/i.test(String(error?.message ?? error)) ? "source_claim_extraction:provider_unavailable" : /source_provenance|source_claim_contract/i.test(String(error?.message ?? error)) ? "source_claim_extraction:source_integrity_invalid" : "source_claim_extraction:failed";
+    const message = String(error?.message ?? error);
+    const prefix = /source_claim_audit/.test(message) ? "source_claim_audit" : "source_claim_extraction";
+    const code = /malformed_json/i.test(message) ? `${prefix}:malformed_json` : /provider_unavailable|transport|unsupported_capability/i.test(message) ? `${prefix}:provider_unavailable` : /admission_blocked/.test(message) ? "source_claim_audit:blocked_specification" : /source_provenance|source_claim_contract|source_claim_audit/.test(message) ? `${prefix}:source_integrity_or_coverage_invalid` : `${prefix}:failed`;
     return this.store.blockDeliveryForSpecification(run.id, { reason: code, recovery: { action: "Correct the imported documentation or extraction provider, then resume this intake or start a fresh delivery." } });
+  }
+
+  blockRunForSourceClaimAudit(run, error) {
+    const detail = String(error?.message ?? error);
+    const code = /malformed_json/i.test(detail)
+      ? "source_claim_audit:malformed_json"
+      : /provider_unavailable|transport|unsupported_capability/i.test(detail)
+        ? "source_claim_audit:provider_unavailable"
+        : /meaningful_source_material_unresolved|source_coverage_incomplete|admission_blocked|claim_decision_invalid|candidate_decision_incomplete/i.test(detail)
+          ? "source_claim_audit:unresolved_source_material"
+          : /source_provenance|source_claim_contract|lineage|digest|source_identity/i.test(detail)
+            ? "source_claim_audit:source_integrity_invalid"
+            : "source_claim_audit:failed";
+    return this.store.blockDeliveryForSpecification(run.id, {
+      reason: code,
+      recovery: { action: "Correct the source material, controller policy, or independent audit result, then start a fresh delivery." }
+    });
   }
 
   assertRunSourceCompleteness(run) { return this.#assertRunSourceCompleteness(run); }
@@ -501,10 +612,14 @@ export class SwarmRouter extends EventEmitter {
     if (existingBootstrap) return existingBootstrap;
     const activeTasks = this.store.listTasks().filter((task) => !["done", "failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted"].includes(task.status));
     if (activeTasks.length) throw new Error("This instance already has active orchestration tasks; recover or wait for the active delivery before starting another run");
+    const activeRun = this.store.currentDeliveryRun();
+    const admittedManifestPath = activeRun?.sourceClaimManifestId && activeRun?.sourceClaimAuditId
+      ? join(this.config.project.generatedDir, "source-claim-manifests", `${activeRun.sourceClaimManifestId}.json`).split("\\").join("/")
+      : null;
     return this.enqueue({
       role: "bootstrap",
       title: `Bootstrap ${this.config.project.name}`,
-      prompt: `Read ${this.config.project.documentationDir}/inventory.json, ${this.config.project.documentationDir}/source-claims.json, and the Markdown files the inventory lists. Produce the required structured blueprint for project '${this.config.project.name}'. Every declaration claim must have exactly one explicit sourceClaimIds disposition. For every requirement, sourceClaimIds and sourceRefs are an immutable pair: choose its declaration claim IDs, then copy every sourceRefs object from exactly those claims verbatim (same documentId, startLine, endLine, and excerptDigest); do not cite a subrange, superset, paraphrased reference, or unclaimed source reference. A mandatory claim must be closed by one mandatory requirement with acceptance criteria, or explicitly represented as an unresolved question or contradiction when the specification genuinely cannot be resolved.`,
+      prompt: `Read ${this.config.project.documentationDir}/inventory.json and the Markdown files the inventory lists${admittedManifestPath ? `, plus the controller-admitted immutable manifest ${admittedManifestPath}` : ""}. Produce the required structured blueprint for project '${this.config.project.name}'. The controller has already admitted one immutable SourceClaimManifest for this delivery; every admitted claim must have exactly one explicit sourceClaimIds disposition. For every requirement, sourceClaimIds and sourceRefs are an immutable pair: choose its admitted claim IDs, then copy every sourceRefs object from exactly those claims verbatim (same documentId, startLine, endLine, and excerptDigest); do not cite a subrange, superset, paraphrased reference, or unclaimed source reference. A mandatory claim must be closed by one mandatory requirement with acceptance criteria, or explicitly represented as an unresolved question or contradiction when the specification genuinely cannot be resolved.`,
     });
   }
 
@@ -783,7 +898,7 @@ export class SwarmRouter extends EventEmitter {
         } else {
         const sourceResolver = this.#sourceEvidenceResolver();
         const manifestRequired = Boolean(task.deliveryRunId);
-        const sourceClaimManifest = manifestRequired ? this.#currentSourceClaimManifest() : null;
+        const sourceClaimManifest = manifestRequired ? this.#manifestForRun(this.store.deliveryRun(task.deliveryRunId)) : null;
         const blueprint = validateBootstrap(extractOrchestrationJson(resultText), { sourceResolver, policyRegistry: this.#controllerPolicyRegistry(), sourceClaimManifest });
         const persisted = this.#persistBlueprint(task, blueprint);
         this.store.setResultPath(task.id, persisted.artifactPath);
@@ -1337,8 +1452,39 @@ export class SwarmRouter extends EventEmitter {
     return compileImportedSourceClaimManifest({ repository: this.config.repository, documentationDir: this.config.project.documentationDir });
   }
 
+  #manifestForRun(run) {
+    if (!run?.sourceClaimManifestId) throw new Error("source_claim_contract:persisted_audited_manifest_missing");
+    if (!run.sourceClaimAuditId && run.sourceClaimInputMode === "supplied") this.admitPersistedSuppliedManifestForRun(run);
+    run = this.store.deliveryRun(run.id);
+    if (!run?.sourceClaimAuditId) throw new Error("source_claim_contract:persisted_audited_manifest_missing");
+    const persisted = this.store.sourceClaimManifest(run.sourceClaimManifestId);
+    const storedAudit = this.store.sourceClaimAudit(run.sourceClaimAuditId);
+    if (!persisted?.manifest || !storedAudit?.audit || storedAudit.deliveryRunId !== run.id) throw new Error("source_claim_contract:persisted_audit_or_manifest_missing");
+    const resolver = this.#sourceEvidenceResolver(); const manifest = persisted.manifest;
+    const legacySuppliedManifest = run.sourceClaimInputMode === "supplied" && !manifest.audit;
+    if (manifest.digest !== persisted.digest || manifest.documentSetDigest !== storedAudit.documentSetDigest || (!legacySuppliedManifest && (manifest.audit?.auditId !== storedAudit.audit.auditId || manifest.audit?.digest !== storedAudit.digest || manifest.audit?.candidateId !== storedAudit.candidateId || manifest.audit?.candidateDigest !== storedAudit.candidateDigest))) throw new Error("source_claim_contract:audited_manifest_lineage_mismatch");
+    if (JSON.stringify(manifest.sourceDocuments) !== JSON.stringify(resolver.sourceDocuments) || manifest.documentSetDigest !== documentSetDigest(resolver.sourceDocuments)) throw new Error("source_claim_contract:audited_manifest_source_identity_mismatch");
+    for (const claim of manifest.claims ?? []) for (const ref of claim.sourceRefs ?? []) resolver.verify(ref, `audited source claim '${claim.claimId}'`);
+    // Re-validate the immutable audit against the current controller inventory.
+    let subject;
+    if (run.sourceClaimInputMode === "raw") {
+      const extraction = this.store.sourceClaimExtraction(run.sourceClaimExtractionId);
+      if (!extraction || extraction.deliveryRunId !== run.id) throw new Error("source_claim_contract:audited_extraction_lineage_mismatch");
+      subject = auditSubjectFromExtraction(validateSourceClaimExtraction(extraction.extraction, { sourceResolver: resolver }));
+    } else subject = auditSubjectFromManifest(this.#currentSourceClaimManifest());
+    const audit = validateSourceClaimAudit(storedAudit.audit, { subject, sourceResolver: resolver, policyRegistry: this.#controllerPolicyRegistry() });
+    if (audit.digest !== storedAudit.digest) throw new Error("source_claim_contract:audited_manifest_digest_mismatch");
+    const rebuilt = admitAuditedSourceClaims({ subject, audit });
+    if (!legacySuppliedManifest && (rebuilt.manifestId !== manifest.manifestId || rebuilt.digest !== persisted.digest)) throw new Error("source_claim_contract:audited_manifest_rebuild_mismatch");
+    if (legacySuppliedManifest && (subject.candidateId !== manifest.manifestId || subject.candidateDigest !== manifest.digest)) throw new Error("source_claim_contract:audited_manifest_rebuild_mismatch");
+    return manifest;
+  }
+
   #safeSpecificationReason(error) {
     const message = String(error?.message ?? error);
+    const auditCode = message.match(/source_claim_audit:[a-z_:-]+/)?.[0];
+    if (auditCode) return auditCode.slice(0, 160);
+    if (message.includes("source_claim_contract:persisted_audited_manifest_missing")) return "source_claim_contract:persisted_run_manifest_missing";
     const codes = [
       "source_claim_contract:persisted_run_manifest_missing",
       "source_claim_contract:persisted_manifest_missing_or_stale",
@@ -1347,7 +1493,11 @@ export class SwarmRouter extends EventEmitter {
       "source_claim_contract:blueprint_manifest_digest_mismatch",
       "source_claim_contract:current_manifest_mismatch",
       "source_claim_contract:current_manifest_unavailable",
-      "source_claim_contract:persisted_blueprint_source_validation_failed"
+      "source_claim_contract:persisted_blueprint_source_validation_failed",
+      "source_claim_contract:audited_manifest_lineage_mismatch",
+      "source_claim_contract:audited_manifest_source_identity_mismatch",
+      "source_claim_contract:audited_manifest_digest_mismatch",
+      "source_claim_contract:audited_manifest_rebuild_mismatch"
     ];
     return codes.find((code) => message.includes(code)) ?? "source_claim_contract:source_completeness_validation_failed";
   }
@@ -1381,13 +1531,8 @@ export class SwarmRouter extends EventEmitter {
 
   #assertBootstrapSourceIntake(run) {
     if (!run?.sourceClaimManifestId) throw new Error("source_claim_contract:persisted_run_manifest_missing");
-    const persisted = this.store.sourceClaimManifest(run.sourceClaimManifestId);
-    if (!persisted?.digest) throw new Error("source_claim_contract:persisted_manifest_missing_or_stale");
-    let current;
-    try { current = this.#currentSourceClaimManifest(); }
-    catch { throw new Error("source_claim_contract:current_manifest_unavailable"); }
-    if (current.manifestId !== run.sourceClaimManifestId || current.digest !== persisted.digest) throw new Error("source_claim_contract:current_manifest_mismatch");
-    return current;
+    try { return this.#manifestForRun(run); }
+    catch (error) { if (/^source_claim_contract:/.test(String(error.message))) throw error; throw new Error("source_claim_contract:current_manifest_unavailable"); }
   }
 
   #assertRunSourceCompleteness(run) {
@@ -1412,7 +1557,7 @@ export class SwarmRouter extends EventEmitter {
     }
     if (!stored?.sourceClaimManifestId) throw new Error("source_claim_contract:persisted_blueprint_manifest_missing");
     let sourceClaimManifest;
-    try { sourceClaimManifest = this.#currentSourceClaimManifest(); }
+    try { sourceClaimManifest = this.#manifestForRun(this.store.deliveryRun(stored.deliveryRunId)); }
     catch { throw new Error("source_claim_contract:current_manifest_unavailable"); }
     if (stored.sourceClaimManifestId !== sourceClaimManifest.manifestId) throw new Error("source_claim_contract:current_manifest_mismatch");
     if (stored.blueprint.sourceClaimManifest?.digest !== sourceClaimManifest.digest) throw new Error("source_claim_contract:blueprint_manifest_digest_mismatch");
@@ -1433,7 +1578,7 @@ export class SwarmRouter extends EventEmitter {
     if (existsSync(absolutePath)) throw new Error(`ProductBlueprint artifact already exists and is immutable: ${artifactPath}`);
     writeFileSync(absolutePath, serialized, { encoding: "utf8", flag: "wx" });
     const run = task.deliveryRunId ? this.store.deliveryRun(task.deliveryRunId) : null;
-    const sourceClaimManifest = run?.sourceClaimManifestId ? this.#currentSourceClaimManifest() : null;
+    const sourceClaimManifest = run?.sourceClaimManifestId ? this.#manifestForRun(run) : null;
     if (sourceClaimManifest) this.store.recordSourceClaimManifest(sourceClaimManifest);
     const persisted = this.store.recordProductBlueprint({ blueprint, artifactPath, digest, bootstrapTaskId: task.id, deliveryRunId: task.deliveryRunId ?? null, sourceClaimManifestId: sourceClaimManifest?.manifestId ?? null });
     if (task.deliveryRunId) {

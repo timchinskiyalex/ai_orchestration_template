@@ -22,6 +22,7 @@ export class StateStore {
     this.hasResolutionAuthorityEvidence = this.#hasTable("specification_resolution_evidence");
     this.hasSourceClaimManifests = this.#hasTable("source_claim_manifests");
     this.hasSourceClaimExtractions = this.#hasTable("source_claim_extractions");
+    this.hasSourceClaimAudits = this.#hasTable("source_claim_audits");
     this.hasRepositoryBaselines = this.#hasTable("repository_baselines") && this.#hasColumn("delivery_runs", "repository_mode");
     this.hasManagedWorktrees = this.#hasTable("managed_worktrees");
     if (readOnly) return;
@@ -213,6 +214,12 @@ export class StateStore {
         schema_version INTEGER NOT NULL, digest TEXT NOT NULL, document_set_digest TEXT NOT NULL,
         artifact_path TEXT NOT NULL, extraction_json TEXT NOT NULL, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS source_claim_audits (
+        audit_id TEXT PRIMARY KEY, delivery_run_id TEXT NOT NULL REFERENCES delivery_runs(id),
+        schema_version INTEGER NOT NULL, digest TEXT NOT NULL, document_set_digest TEXT NOT NULL,
+        candidate_id TEXT NOT NULL, candidate_digest TEXT NOT NULL, artifact_path TEXT NOT NULL,
+        audit_json TEXT NOT NULL, created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS repository_baseline_drafts (
         delivery_run_id TEXT PRIMARY KEY REFERENCES delivery_runs(id),
         schema_version INTEGER NOT NULL, draft_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -319,6 +326,7 @@ export class StateStore {
     this.hasResolutionAuthorityEvidence = true;
     this.hasSourceClaimManifests = true;
     this.hasSourceClaimExtractions = true;
+    this.hasSourceClaimAudits = true;
     this.hasRepositoryBaselines = true;
     this.hasManagedWorktrees = true;
     this.#addColumnIfMissing("tasks", "dependencies_json", "TEXT NOT NULL DEFAULT '[]'");
@@ -388,6 +396,7 @@ export class StateStore {
     this.#addColumnIfMissing("delivery_runs", "completion_contract_version", "INTEGER NOT NULL DEFAULT 0");
     this.#addColumnIfMissing("delivery_runs", "source_claim_manifest_id", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "source_claim_extraction_id", "TEXT");
+    this.#addColumnIfMissing("delivery_runs", "source_claim_audit_id", "TEXT");
     this.#addColumnIfMissing("delivery_runs", "source_claim_input_mode", "TEXT NOT NULL DEFAULT 'supplied'");
     this.#addColumnIfMissing("delivery_runs", "repository_mode", "TEXT NOT NULL DEFAULT 'legacy'");
     this.#addColumnIfMissing("delivery_runs", "repository_base_sha", "TEXT");
@@ -1073,6 +1082,27 @@ export class StateStore {
     return row ? { id: row.extraction_id, extraction: JSON.parse(row.extraction_json), artifactPath: row.artifact_path, digest: row.digest, documentSetDigest: row.document_set_digest, deliveryRunId: row.delivery_run_id, createdAt: row.created_at } : null;
   }
 
+  recordSourceClaimAudit({ deliveryRunId, audit, artifactPath }) {
+    if (!this.hasSourceClaimAudits || !this.deliveryRun(deliveryRunId) || !audit?.auditId || !audit?.digest || !audit?.documentSetDigest || !audit?.candidateId || !audit?.candidateDigest || typeof artifactPath !== "string" || !artifactPath) throw new Error("SourceClaimAudit identity is invalid");
+    const recordId = `${audit.auditId}@${deliveryRunId}`;
+    const existing = this.db.prepare("SELECT digest, delivery_run_id FROM source_claim_audits WHERE audit_id = ?").get(recordId);
+    if (existing && (existing.digest !== audit.digest || existing.delivery_run_id !== deliveryRunId)) throw new Error(`SourceClaimAudit '${audit.auditId}' is immutable and mismatched`);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (!existing) this.db.prepare("INSERT INTO source_claim_audits(audit_id,delivery_run_id,schema_version,digest,document_set_digest,candidate_id,candidate_digest,artifact_path,audit_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(recordId, deliveryRunId, audit.schemaVersion, audit.digest, audit.documentSetDigest, audit.candidateId, audit.candidateDigest, artifactPath, JSON.stringify(audit), now());
+      this.db.prepare("UPDATE delivery_runs SET source_claim_audit_id = ?, updated_at = ? WHERE id = ? AND source_claim_audit_id IS NULL").run(recordId, now(), deliveryRunId);
+      this.#insertEvent(null, "source-claim-audit/persisted", { deliveryRunId, auditId: audit.auditId, digest: audit.digest, candidateId: audit.candidateId, decisionCount: audit.decisions.length });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.sourceClaimAudit(recordId);
+  }
+
+  sourceClaimAudit(auditId) {
+    if (!this.hasSourceClaimAudits) return null;
+    const row = this.db.prepare("SELECT * FROM source_claim_audits WHERE audit_id = ?").get(auditId);
+    return row ? { id: row.audit_id, audit: JSON.parse(row.audit_json), artifactPath: row.artifact_path, digest: row.digest, documentSetDigest: row.document_set_digest, candidateId: row.candidate_id, candidateDigest: row.candidate_digest, deliveryRunId: row.delivery_run_id, createdAt: row.created_at } : null;
+  }
+
   recordProductBlueprint({ blueprint, artifactPath, digest, bootstrapTaskId = null, deliveryRunId = null, sourceClaimManifestId = null }) {
     const existing = this.db.prepare("SELECT artifact_path FROM product_blueprints WHERE blueprint_id = ?").get(blueprint.blueprintId);
     if (existing) throw new Error(`ProductBlueprint '${blueprint.blueprintId}' is immutable and already persisted at ${existing.artifact_path}`);
@@ -1289,7 +1319,7 @@ export class StateStore {
   }
 
   #mapDeliveryRun(row) {
-    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, sourceClaimManifestId: row.source_claim_manifest_id ?? null, sourceClaimExtractionId: row.source_claim_extraction_id ?? null, sourceClaimInputMode: row.source_claim_input_mode ?? "supplied", repositoryMode: row.repository_mode ?? "legacy", repositoryBaseSha: row.repository_base_sha ?? null, repositoryBaselineId: row.repository_baseline_id ?? null, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
+    return { id: row.id, schemaVersion: row.schema_version, state: row.state, source: row.source, bootstrapTaskId: row.bootstrap_task_id, blueprintId: row.blueprint_id, sourceClaimManifestId: row.source_claim_manifest_id ?? null, sourceClaimExtractionId: row.source_claim_extraction_id ?? null, sourceClaimAuditId: row.source_claim_audit_id ?? null, sourceClaimInputMode: row.source_claim_input_mode ?? "supplied", repositoryMode: row.repository_mode ?? "legacy", repositoryBaseSha: row.repository_base_sha ?? null, repositoryBaselineId: row.repository_baseline_id ?? null, completionContractVersion: row.completion_contract_version ?? 0, integrationPath: row.integration_path, candidate: row.candidate_branch && row.candidate_sha ? { branch: row.candidate_branch, sha: row.candidate_sha } : null, publicationCheckpoint: parse(row.publication_checkpoint_json, null), publish: parse(row.publish_json, null), confirmRemotePush: Boolean(row.confirm_remote_push), ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id, heartbeatAt: row.heartbeat_at, interruptedAt: row.interrupted_at, recovery: parse(row.recovery_json, null), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   #mapScopedReplan(row) {

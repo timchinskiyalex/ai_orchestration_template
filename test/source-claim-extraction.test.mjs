@@ -28,8 +28,11 @@ class ExtractionClient {
 function fixture(resultFor) {
   const root = mkdtempSync(join(tmpdir(), "source-claim-extraction-")); const source = join(root, "raw"); mkdirSync(source);
   execFileSync("git", ["-C", root, "init", "-b", "main"]);
+  execFileSync("git", ["-C", root, "commit", "--allow-empty", "-m", "base", "--no-gpg-sign", "--author", "Extraction Test <extraction@example.test>"]);
   const path = "requirements.md"; const text = "# Product\nUse token SUPERSECRET only for deployment.\nUsers must be able to sign in.\n";
   writeFileSync(join(source, path), text);
+  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "source-claim-extraction-fixture", packageManager: "npm@10", scripts: { test: "node --test" } })); writeFileSync(join(root, "package-lock.json"), "{}");
+  execFileSync("git", ["-C", root, "add", "package.json", "package-lock.json"]); execFileSync("git", ["-C", root, "commit", "-m", "fixture-package", "--no-gpg-sign", "--author", "Extraction Test <extraction@example.test>"]);
   const file = { documentId: documentIdForPath(path), path, sha256: sha256(text) };
   const calls = { turns: 0, shutdown: 0 };
   const config = { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { documentationDir: "docs/in", generatedDir: "docs/out", repositoryMode: "legacy" }, router: { turnTimeoutMs: 1000, maxConcurrentTasks: 1, maxChildrenPerTask: 1, maxDelegationDepth: 1, maxPlanTasks: 1, defaultParentBudget: 100, approvalMode: "deny" }, delivery: { sourceClaimExtractionTokenBudget: 100 }, budget: { weeklyTokenLimit: 1000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, autonomy: { mode: "autonomous" }, roles, executionProviderFactory: () => provider(new ExtractionClient(resultFor({ file, text }), calls)) };
@@ -42,11 +45,11 @@ function candidate({ file, text }, mutate = (value) => value) {
   return mutate({ schemaVersion: 1, kind: "SourceClaimExtraction", documentSetDigest: documentSetDigest([file]), claims });
 }
 
-test("raw Markdown persists atomic extraction candidates without exposing sensitive source in status", async () => {
+test("raw Markdown persists atomic extraction candidates but never queues Bootstrap before independent audit admission", async () => {
   const subject = fixture(candidate); const router = new SwarmRouter(subject.config); const coordinator = new DeliveryCoordinator(router);
   try {
     const run = await coordinator.begin({ source: subject.source });
-    assert.equal(run.state, "awaiting_source_claim_audit", JSON.stringify(run.publish)); assert.equal(subject.calls.turns, 1); assert.equal(router.list().length, 0);
+    assert.equal(run.state, "blocked_specification", JSON.stringify(run.publish)); assert.equal(subject.calls.turns, 2); assert.equal(router.list().length, 0);
     const stored = router.store.sourceClaimExtraction(run.sourceClaimExtractionId);
     assert.equal(stored.extraction.claims.length, 2); assert.equal(stored.extraction.claims[0].startLine, stored.extraction.claims[1].startLine);
     assert.ok(readFileSync(join(subject.root, stored.artifactPath), "utf8").includes("Deployment requires a token."));
@@ -61,7 +64,7 @@ test("malformed, unknown, and changed raw sources become bounded specification b
     const coordinator = new DeliveryCoordinator(malformedRouter);
     assert.equal((await coordinator.begin({ source: malformed.source })).state, "blocked_specification");
     malformed.config.executionProviderFactory = () => provider(new ExtractionClient(candidate({ file: malformed.file, text: malformed.text }), malformed.calls));
-    assert.equal((await coordinator.resume()).state, "awaiting_source_claim_audit");
+    assert.equal((await coordinator.resume()).state, "blocked_specification");
   }
   finally { malformedRouter.close(); rmSync(malformed.root, { recursive: true, force: true }); }
   const unknown = fixture((context) => candidate(context, (value) => { value.claims[0].documentId = "doc-unknown"; return value; })); const unknownRouter = new SwarmRouter(unknown.config);
@@ -69,7 +72,7 @@ test("malformed, unknown, and changed raw sources become bounded specification b
   finally { unknownRouter.close(); rmSync(unknown.root, { recursive: true, force: true }); }
   const changed = fixture(candidate); const first = new SwarmRouter(changed.config);
   try {
-    const run = await new DeliveryCoordinator(first).begin({ source: changed.source }); assert.equal(run.state, "awaiting_source_claim_audit"); first.close();
+    const run = await new DeliveryCoordinator(first).begin({ source: changed.source }); assert.equal(run.state, "blocked_specification"); first.close();
     writeFileSync(join(changed.root, "docs/in/requirements.md"), "# Product\nChanged source.\n");
     const restarted = new SwarmRouter(changed.config);
     try { assert.equal((await new DeliveryCoordinator(restarted).resume()).state, "blocked_specification"); }
@@ -86,9 +89,9 @@ test("supplied declarations remain a high-assurance intake route and candidate r
   } finally { rmSync(supplied.root, { recursive: true, force: true }); }
   const raw = fixture(candidate); const router = new SwarmRouter(raw.config);
   try {
-    const first = await new DeliveryCoordinator(router).begin({ source: raw.source }); assert.equal(first.state, "awaiting_source_claim_audit"); router.close();
+    const first = await new DeliveryCoordinator(router).begin({ source: raw.source }); assert.equal(first.state, "blocked_specification"); router.close();
     const restarted = new SwarmRouter(raw.config);
-    try { assert.equal((await new DeliveryCoordinator(restarted).resume()).state, "awaiting_source_claim_audit"); assert.equal(raw.calls.turns, 1); }
+    try { assert.equal((await new DeliveryCoordinator(restarted).resume()).state, "blocked_specification"); assert.equal(raw.calls.turns, 2); }
     finally { restarted.close(); }
   } finally { if (!router.closed) router.close(); rmSync(raw.root, { recursive: true, force: true }); }
 });
