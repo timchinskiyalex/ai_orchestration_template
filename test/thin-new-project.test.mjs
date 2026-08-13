@@ -33,7 +33,8 @@ test("new project creates a source snapshot and baseline before injected thin de
   assert.equal(received[0].verify, "node --test");
   assert.match(result.baselineSha, /^[0-9a-f]{40}$/);
   assert.equal(readFileSync(join(target, "docs", "source", "nested", "details.md"), "utf8"), "# Details\nUse tests.\n");
-  assert.match(git(target, ["log", "-1", "--format=%s"]), /source documentation baseline/);
+  assert.match(git(target, ["log", "-1", "--format=%s"]), /controller input boundary/);
+  assert.equal(git(target, ["ls-files", "--", "docs/source"]), "");
 });
 
 test("existing target is refused before delivery and never overwritten", async (t) => {
@@ -68,12 +69,13 @@ test("remote is configured and pushed only after a verified candidate", async (t
   const { docs, target } = fixture(t); const gitCalls = [];
   const gitRunner = async ({ cwd, args }) => {
     gitCalls.push(args);
-    if (args[0] === "push") return "";
+    if (args[0] === "push" || args[0] === "remote" || args[0] === "branch") return "";
+    if (args[0] === "rev-parse" && String(args.at(-1)).includes("pilot/thin^")) return "abcdef1234567";
     return git(cwd, args);
   };
   const result = await createThinNewProject({
-    target, docs, verify: "node --test", remote: "https://example.test/repo.git", branch: "pilot/thin", confirm: true,
-    deliveryRunner: async () => ({ ok: true, candidateSha: "abcdef1234567" }), gitRunner, stdout: () => {},
+    target, docs, verify: "node --test", repairSurface: "apps/api", acceptance: true, remote: "https://example.test/repo.git", branch: "pilot/thin", security: true, confirm: true,
+    deliveryRunner: async () => ({ ok: true, candidateSha: "abcdef1234567" }), acceptanceRunner: async () => ({ ok: true, candidateSha: "abcdef1234567" }), securityRunner: async () => ({ ok: true }), gitRunner, stdout: () => {},
   });
   assert.equal(result.ok, true);
   const baseline = gitCalls.findIndex((args) => args.includes("commit"));
@@ -88,11 +90,13 @@ test("acceptance runs after delivery and before remote publication", async (t) =
   const gitRunner = async ({ cwd, args }) => {
     gitCalls.push(args);
     if (args[0] === "remote" || args[0] === "push") { order.push(args[0]); return ""; }
+    if (args[0] === "branch") return "";
+    if (args[0] === "rev-parse" && String(args.at(-1)).includes("orchestrated/new-product^")) return "fedcba7654321";
     return git(cwd, args);
   };
   const result = await createThinNewProject({
     target, docs, verify: "node --test", repairSurface: "apps/api,apps/web", acceptance: true,
-    remote: "https://example.test/repo.git", branch: "orchestrated/new-product", confirm: true, gitRunner,
+    remote: "https://example.test/repo.git", branch: "orchestrated/new-product", security: true, confirm: true, gitRunner,
     deliveryRunner: async () => { order.push("delivery"); return { ok: true, candidateSha: "abcdef1234567" }; },
     acceptanceRunner: async (request) => {
       order.push("acceptance");
@@ -100,10 +104,11 @@ test("acceptance runs after delivery and before remote publication", async (t) =
       assert.deepEqual(request.repairSurface, ["apps/api", "apps/web"]);
       return { ok: true, candidateSha: "fedcba7654321" };
     },
+    securityRunner: async (request) => { order.push("security"); assert.equal(request.candidateSha, "fedcba7654321"); return { ok: true }; },
     stdout: () => {},
   });
   assert.equal(result.ok, true); assert.equal(result.candidateSha, "fedcba7654321");
-  assert.deepEqual(order, ["delivery", "acceptance", "remote", "push"]);
+  assert.deepEqual(order, ["delivery", "acceptance", "security", "remote", "push"]);
   const pushed = gitCalls.find((args) => args[0] === "push");
   assert.deepEqual(pushed, ["push", "--set-upstream", "origin", "orchestrated/new-product:orchestrated/new-product"]);
 });
@@ -113,13 +118,14 @@ test("a repaired acceptance candidate is the only remote ref pushed", async (t) 
   const gitRunner = async ({ cwd, args }) => {
     gitCalls.push(args);
     if (args[0] === "remote" || args[0] === "push") return "";
+    if (args[0] === "rev-parse" && String(args.at(-1)).includes("thin/acceptance-candidate-repair-1^")) return "fedcba7654321";
     return git(cwd, args);
   };
   const result = await createThinNewProject({
     target, docs, verify: "node --test", repairSurface: "apps/api", acceptance: true,
-    remote: "https://example.test/repo.git", branch: "orchestrated/new-product", confirm: true, gitRunner,
+    remote: "https://example.test/repo.git", branch: "orchestrated/new-product", security: true, confirm: true, gitRunner,
     deliveryRunner: async () => ({ ok: true, candidateSha: "abcdef1234567" }),
-    acceptanceRunner: async () => ({ ok: true, candidateSha: "fedcba7654321", candidateBranch: "thin/acceptance-candidate-repair-1" }),
+    acceptanceRunner: async () => ({ ok: true, candidateSha: "fedcba7654321", candidateBranch: "thin/acceptance-candidate-repair-1" }), securityRunner: async () => ({ ok: true }),
     stdout: () => {},
   });
   assert.equal(result.ok, true); assert.equal(result.branch, "thin/acceptance-candidate-repair-1");
@@ -132,11 +138,25 @@ test("failed acceptance preserves the target and blocks all remote actions", asy
   const gitRunner = async ({ cwd, args }) => { gitCalls.push(args); return git(cwd, args); };
   const result = await createThinNewProject({
     target, docs, verify: "node --test", repairSurface: "apps/api", acceptance: true,
-    remote: "https://example.test/repo.git", branch: "orchestrated/new-product", confirm: true, gitRunner,
-    deliveryRunner: async () => ({ ok: true, candidateSha: "abcdef1234567" }),
+    remote: "https://example.test/repo.git", branch: "orchestrated/new-product", security: true, confirm: true, gitRunner,
+    deliveryRunner: async () => ({ ok: true, candidateSha: "abcdef1234567" }), securityRunner: async () => ({ ok: true }),
     acceptanceRunner: async () => ({ ok: false }), stdout: () => {},
   });
   assert.equal(result.ok, false); assert.equal(result.code, "acceptance_failed"); assert.equal(existsSync(join(target, ".git")), true);
+  assert.equal(gitCalls.some((args) => args[0] === "remote" || args[0] === "push"), false);
+});
+
+test("security failure blocks remote publication after acceptance", async (t) => {
+  const { docs, target } = fixture(t); const gitCalls = []; const order = [];
+  const gitRunner = async ({ cwd, args }) => { gitCalls.push(args); return git(cwd, args); };
+  const result = await createThinNewProject({
+    target, docs, verify: "node --test", repairSurface: "apps/api", acceptance: true, security: true,
+    remote: "https://example.test/repo.git", branch: "orchestrated/new-product", confirm: true, gitRunner,
+    deliveryRunner: async () => { order.push("delivery"); return { ok: true, candidateSha: "abcdef1234567" }; },
+    acceptanceRunner: async () => { order.push("acceptance"); return { ok: true, candidateSha: "abcdef1234567" }; },
+    securityRunner: async () => { order.push("security"); return { ok: false }; }, stdout: () => {},
+  });
+  assert.equal(result.code, "security_failed"); assert.deepEqual(order, ["delivery", "acceptance", "security"]);
   assert.equal(gitCalls.some((args) => args[0] === "remote" || args[0] === "push"), false);
 });
 
@@ -153,7 +173,7 @@ test("failed delivery never configures or pushes a remote", async (t) => {
     return git(cwd, args);
   };
   const result = await createThinNewProject({
-    target, docs, verify: "node --test", remote: "https://example.test/repo.git", branch: "pilot/thin", confirm: true,
+    target, docs, verify: "node --test", repairSurface: "apps/api", acceptance: true, remote: "https://example.test/repo.git", branch: "pilot/thin", security: true, confirm: true,
     deliveryRunner: async () => ({ ok: false }), gitRunner, stdout: () => {},
   });
   assert.equal(result.ok, false);
@@ -166,13 +186,15 @@ test("Windows-safe path and remote validation rejects unsafe input before target
   await assert.rejects(createThinNewProject({ target, docs, verify: "node --test", repairSurface: "../src", confirm: true }), /traversal/);
   await assert.rejects(createThinNewProject({ target, docs, verify: "node --test", remote: "https://example.test/repo.git", confirm: true }), /supplied together/);
   await assert.rejects(createThinNewProject({ target, docs, verify: "node --test", remote: "https://example.test/repo.git", branch: "main", confirm: true }), /must not be main/);
+  await assert.rejects(createThinNewProject({ target, docs, verify: "node --test", remote: "https://example.test/repo.git", branch: "pilot/acceptance", security: true, confirm: true }), /requires --acceptance/);
+  await assert.rejects(createThinNewProject({ target, docs, verify: "node --test", repairSurface: "apps/api", acceptance: true, remote: "https://example.test/repo.git", branch: "pilot/security", confirm: true }), /requires --security/);
   assert.equal(existsSync(target), false);
 });
 
 test("argument parsing and CLI report safe failures", async (t) => {
   const { docs, target } = fixture(t); const errors = [];
   assert.deepEqual(parseThinNewProjectArgs(["--target", target, "--docs", docs, "--verify", "node --test", "--confirm-spend-quota"]), {
-    target, docs, verify: "node --test", repairSurface: null, remote: null, branch: null, confirm: true, acceptance: false,
+    target, docs, verify: "node --test", repairSurface: null, remote: null, branch: null, confirm: true, acceptance: false, security: false,
   });
   assert.match(thinNewProjectUsage(), /thin-new-project/);
   const code = await runThinNewProject({ argv: ["--target", target, "--docs", docs], stdout: () => {}, stderr: (line) => errors.push(line) });

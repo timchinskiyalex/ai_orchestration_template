@@ -1,4 +1,4 @@
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
@@ -10,15 +10,16 @@ const MAX_MARKDOWN_BYTES = 2_000_000;
 const BASELINE_IDENTITY = { name: "Thin Orchestrator", email: "thin-orchestrator@local" };
 
 export function thinNewProjectUsage() {
-  return "Usage: node scripts/thin-new-project.mjs --target <new-absolute-directory> --docs <absolute-markdown-file-or-directory> --verify <command> --confirm-spend-quota [--acceptance --repair-surface <path,path>] [--remote <url> --branch <branch>]";
+  return "Usage: node scripts/thin-new-project.mjs --target <new-absolute-directory> --docs <absolute-markdown-file-or-directory> --verify <command> --confirm-spend-quota [--acceptance --repair-surface <path,path>] [--security] [--remote <url> --branch <branch>]";
 }
 
 export function parseThinNewProjectArgs(argv) {
-  const options = { target: null, docs: null, verify: null, repairSurface: null, remote: null, branch: null, confirm: false, acceptance: false };
+  const options = { target: null, docs: null, verify: null, repairSurface: null, remote: null, branch: null, confirm: false, acceptance: false, security: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--confirm-spend-quota") options.confirm = true;
     else if (flag === "--acceptance") options.acceptance = true;
+    else if (flag === "--security") options.security = true;
     else if (["--target", "--docs", "--verify", "--repair-surface", "--remote", "--branch"].includes(flag)) {
       const value = argv[++index];
       if (typeof value !== "string" || value.trim() === "" || value.startsWith("--")) throw new Error(`${flag} requires a value`);
@@ -42,8 +43,10 @@ export async function createThinNewProject({
   branch = null,
   confirm = false,
   acceptance = false,
+  security = false,
   deliveryRunner = defaultDeliveryRunner,
   acceptanceRunner = defaultAcceptanceRunner,
+  securityRunner = defaultSecurityRunner,
   gitRunner = defaultGitRunner,
   stdout = console.log,
 } = {}) {
@@ -54,7 +57,9 @@ export async function createThinNewProject({
   validateRemoteOptions({ remote, branch });
   if (confirm !== true) throw new Error("--confirm-spend-quota is required before thin delivery");
   if (acceptance === true && !normalizedRepairSurface?.length) throw new Error("--acceptance requires an explicit --repair-surface");
-  if (typeof deliveryRunner !== "function" || typeof acceptanceRunner !== "function" || typeof gitRunner !== "function") throw new TypeError("deliveryRunner, acceptanceRunner, and gitRunner must be functions");
+  if (remote && acceptance !== true) throw new Error("--remote requires --acceptance so publication cannot bypass product acceptance");
+  if (remote && security !== true) throw new Error("--remote requires --security so publication cannot bypass the security gate");
+  if (typeof deliveryRunner !== "function" || typeof acceptanceRunner !== "function" || typeof securityRunner !== "function" || typeof gitRunner !== "function") throw new TypeError("deliveryRunner, acceptanceRunner, securityRunner, and gitRunner must be functions");
   if (lstatSync(docsPath).isDirectory() && isInside(targetPath, docsPath)) {
     throw new Error("target must not be inside the documentation source path");
   }
@@ -64,15 +69,16 @@ export async function createThinNewProject({
     mkdirSync(targetPath);
     const copied = copyMarkdownSnapshot({ source: docsPath, destination: join(targetPath, "docs", "source") });
     if (!copied.length) throw new Error("docs must contain at least one Markdown file");
-    // A remotely published project must start on the explicit, non-protected
-    // branch selected by the caller.  It is never renamed to, or pushed to,
-    // main after delivery/acceptance has begun.
-    await gitRunner({ cwd: targetPath, args: remote ? ["init", `--initial-branch=${branch}`] : ["init"] });
-    await gitRunner({ cwd: targetPath, args: ["add", "--", "docs/source"] });
+    // Documents are controller input. The planner and acceptance gates read
+    // the local snapshot, but source text is never made part of product Git
+    // history or remote publication by default.
+    await gitRunner({ cwd: targetPath, args: ["init"] });
+    writeFileSync(join(targetPath, ".gitignore"), "docs/source/\n", { encoding: "utf8", flag: "wx" });
+    await gitRunner({ cwd: targetPath, args: ["add", "--", ".gitignore"] });
     await gitRunner({ cwd: targetPath, args: [
       "-c", `user.name=${BASELINE_IDENTITY.name}`,
       "-c", `user.email=${BASELINE_IDENTITY.email}`,
-      "commit", "-m", "chore: add source documentation baseline",
+      "commit", "-m", "chore: initialize controller input boundary",
     ] });
     baselineSha = await gitRunner({ cwd: targetPath, args: ["rev-parse", "HEAD"] });
     stdout(`[baseline] created ${baselineSha}`);
@@ -107,12 +113,25 @@ export async function createThinNewProject({
       stdout(`[acceptance] accepted ${acceptedCandidateSha}${acceptanceCandidateBranch ? ` branch=${acceptanceCandidateBranch}` : ""}`);
     }
 
+    if (security === true) {
+      const secured = await securityRunner({
+        repository: targetPath,
+        candidateSha: acceptedCandidateSha,
+        verify: verificationCommand,
+        stdout,
+      });
+      if (!secured?.ok) return failed("security_failed", targetPath, baselineSha, stdout);
+      stdout(`[security] passed ${acceptedCandidateSha}`);
+    }
+
     if (remote) {
-      await gitRunner({ cwd: targetPath, args: ["remote", "add", "origin", remote] });
       const pushBranch = acceptanceCandidateBranch ?? branch;
-      // In the repaired case `pushBranch` is the controller-created branch
-      // whose local ref was verified by thin-accept.  Do not infer HEAD and
-      // do not alter the initial branch.
+      // Do not push HEAD: bind and verify a local branch that denotes exactly
+      // the accepted SHA. A repair path already creates its own durable branch.
+      if (!acceptanceCandidateBranch) await gitRunner({ cwd: targetPath, args: ["branch", "--force", pushBranch, acceptedCandidateSha] });
+      const localBranchSha = await gitRunner({ cwd: targetPath, args: ["rev-parse", "--verify", `${pushBranch}^{commit}`] });
+      if (String(localBranchSha).trim().toLowerCase() !== acceptedCandidateSha.toLowerCase()) throw new Error("candidate branch does not resolve to the accepted candidate SHA");
+      await gitRunner({ cwd: targetPath, args: ["remote", "add", "origin", remote] });
       await gitRunner({ cwd: targetPath, args: ["push", "--set-upstream", "origin", `${pushBranch}:${pushBranch}`] });
       stdout(`[remote] pushed ${pushBranch}`);
     }
@@ -280,6 +299,17 @@ async function defaultAcceptanceRunner({ repository, docs, candidateSha, verify,
   });
   const completed = [...output].reverse().map((line) => /^\[completed\] accepted candidate ([0-9a-f]{7,64})(?: branch=(thin\/acceptance-candidate-[A-Za-z0-9._-]+(?:-[A-Za-z0-9._-]+)*))?$/i.exec(line)).find(Boolean);
   return { ok: code === 0 && Boolean(completed), candidateSha: completed?.[1] ?? null, candidateBranch: completed?.[2] ?? null };
+}
+
+async function defaultSecurityRunner({ repository, candidateSha, verify, stdout }) {
+  const { runThinSecurity } = await import("./thin-security.mjs");
+  const output = [];
+  const code = await runThinSecurity({
+    argv: ["--repo", repository, "--candidate", candidateSha, "--verify", verify],
+    stdout: (line) => { output.push(String(line)); stdout(line); },
+    stderr: (line) => { output.push(String(line)); stdout(line); },
+  });
+  return { ok: code === 0 && output.some((line) => new RegExp(`^\\[security\\] passed ${candidateSha}$`, "i").test(line)) };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
