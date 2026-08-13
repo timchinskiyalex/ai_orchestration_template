@@ -1,0 +1,35 @@
+name: product-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: dotnet test apps/api/Guides.Api.sln --configuration Release
+      - run: npm ci
+        working-directory: apps/web
+      - run: npm run build
+        working-directory: apps/web
+      # Fail publication on known high/critical npm advisories. NuGet output is
+      # retained in CI logs; applications can replace this scaffold with a
+      # policy-specific parser when they add third-party .NET packages.
+      - run: npm audit --audit-level=high
+        working-directory: apps/web
+      - run: dotnet list apps/api/Guides.Api.sln package --vulnerable --include-transitive
