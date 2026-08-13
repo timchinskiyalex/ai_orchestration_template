@@ -15,7 +15,7 @@ const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend",
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 class ControlledProvider extends EventEmitter {
-  constructor(mode = "normal") { super(); this.mode = mode; this.calls = { accountRead: 0, startThread: 0, startTurn: 0, interrupts: [], approvals: [] }; this.next = 1; this.terminals = []; this.turn = null; }
+  constructor(mode = "normal") { super(); this.mode = mode; this.calls = { accountRead: 0, startThread: 0, startTurn: 0, reconciliations: [], interrupts: [], approvals: [] }; this.next = 1; this.terminals = []; this.turn = null; }
   #ok(operation, args, data) { return envelope({ operation, correlationId: args.correlationId, success: true, data }); }
   async handshake(args) {
     if (this.mode === "unowned") queueMicrotask(() => this.emit("lifecycle", lifecycleEvent({ kind: "approval_requested", correlationId: "orphan-correlation", data: { threadId: "orphan-thread", turnId: "orphan-turn", requestId: "orphan-request", approvalKind: "command" } })));
@@ -31,6 +31,14 @@ class ControlledProvider extends EventEmitter {
   }
   async observeTerminal(args) {
     return await new Promise((resolve, reject) => { this.terminals.push({ resolve, reject, args }); });
+  }
+  async reconcileTerminal(args) {
+    this.calls.reconciliations.push({ ...args.data });
+    if (this.mode === "no-durable") return envelope({ operation: "reconcile_terminal", correlationId: args.correlationId, success: false, errorCode: "terminal_reconciliation_unavailable", errorClass: "transport", diagnostics: "durable thread/read unavailable" });
+    if (this.mode === "hold-reconciliation") await new Promise((resolve) => { this.releaseReconciliation = resolve; });
+    const terminalClass = this.mode === "durable-interrupted" ? "interrupted" : "completed";
+    const resolvedTurnId = this.mode === "durable-alias" ? "durable-resolved-turn" : this.turn.turnId;
+    return this.#ok("reconcile_terminal", args, { providerRunId: "controlled", threadId: this.turn.threadId, turnId: resolvedTurnId, terminalClass, requestedTurnId: args.data.turnId, resolvedTurnId, reconciliationSource: "thread_read", verifiedEquivalence: resolvedTurnId === args.data.turnId ? "exact" : "observed_alias" });
   }
   async readFinalResult(args) { return this.#ok("read_final_result", args, { providerRunId: "controlled", threadId: args.data.threadId, turnId: args.data.turnId, resultText: "safe result" }); }
   async interruptTurn(args) { this.calls.interrupts.push({ threadId: args.data.threadId, turnId: args.data.turnId }); this.#settleTerminal("interrupted"); return this.#ok("interrupt_turn", args, { providerRunId: "controlled", threadId: args.data.threadId, turnId: args.data.turnId, terminalClass: "interrupted" }); }
@@ -56,6 +64,9 @@ class ControlledProvider extends EventEmitter {
     if (this.mode === "approval") return this.#event("approval_requested", { requestId: "approval-1", approvalKind: "command" });
     if (this.mode === "permissions-approval") return this.#event("approval_requested", { requestId: "approval-1", approvalKind: "permissions" });
     if (this.mode === "alias-usage") { this.#event("turn_alias", { turnId: "canonical-turn", requestedTurnId: this.turn.turnId, resolvedTurnId: "canonical-turn" }); this.#event("usage_updated", { turnId: "canonical-turn", usage: { totalTokens: 7 } }); this.turn.turnId = "canonical-turn"; return this.#settleTerminal(); }
+    if (this.mode === "lifecycle-interrupted-durable-completed") { this.#event("turn_completed", { terminalClass: "interrupted" }); return this.#settleTerminal("interrupted"); }
+    if (this.mode === "lifecycle-failed-durable-completed") { this.#event("turn_completed", { terminalClass: "failed" }); return this.#settleTerminal("failed"); }
+    if (this.mode === "lifecycle-completed-durable-completed") { this.#event("turn_completed", { terminalClass: "completed" }); return this.#settleTerminal("completed"); }
     if (this.mode === "duplicate-terminal") { this.#event("turn_completed"); this.#event("turn_completed"); return this.#settleTerminal(); }
     if (this.mode === "process-exit-after-terminal") { this.#settleTerminal(); return setTimeout(() => this.emit("lifecycle", lifecycleEvent({ kind: "process_exit", providerGlobal: true, success: false, errorCode: "process_exit", errorClass: "transport" })), 0); }
     this.#settleTerminal();
@@ -135,6 +146,65 @@ test("duplicate valid terminal lifecycle events do not duplicate Router finaliza
     const task = subject.router.enqueue({ role: "bootstrap", title: "duplicate", prompt: "no-op" }); let doneTransitions = 0; const transition = subject.router.store.transition.bind(subject.router.store);
     subject.router.store.transition = (id, state, patch) => { if (id === task.id && state === "done") doneTransitions += 1; return transition(id, state, patch); };
     await subject.router.runUntilIdle(); assert.equal(subject.router.store.getTask(task.id).status, "done"); assert.equal(doneTransitions, 1); assert.equal(subject.router.store.workerArtifact(task.id), null);
+  } finally { subject.dispose(); }
+});
+
+for (const mode of ["lifecycle-interrupted-durable-completed", "lifecycle-failed-durable-completed", "lifecycle-completed-durable-completed"]) test(`${mode} persists only the durable completed terminal`, async () => {
+  const provider = new ControlledProvider(mode); const subject = fixture(provider);
+  try {
+    await subject.ready;
+    const task = subject.router.enqueue({ role: "bootstrap", title: mode, prompt: "no-op" });
+    await subject.router.runUntilIdle();
+    const diagnostics = await subject.router.collectTaskDiagnostics(task.id);
+    assert.equal(subject.router.store.getTask(task.id).status, "done");
+    assert.equal(diagnostics.terminalReconciliation.lifecycleTerminalCandidateStatus, mode.includes("interrupted") ? "interrupted" : mode.includes("failed") ? "failed" : "completed");
+    assert.equal(diagnostics.terminalReconciliation.durableReconciledStatus, "completed");
+    assert.equal(diagnostics.terminalReconciliation.reconciliationSource, "thread_read");
+  } finally { subject.dispose(); }
+});
+
+test("durable interrupted terminal wins over a completed lifecycle candidate", async () => {
+  const provider = new ControlledProvider("durable-interrupted"); const subject = fixture(provider);
+  try {
+    await subject.ready;
+    const task = subject.router.enqueue({ role: "bootstrap", title: "durable interrupt", prompt: "no-op" });
+    await subject.router.runUntilIdle();
+    const diagnostics = await subject.router.collectTaskDiagnostics(task.id);
+    assert.equal(subject.router.store.getTask(task.id).status, "interrupted");
+    assert.equal(diagnostics.terminalReconciliation.durableReconciledStatus, "interrupted");
+  } finally { subject.dispose(); }
+});
+
+test("missing durable terminal is a provider reconciliation failure, never a dependency deadlock", async () => {
+  const provider = new ControlledProvider("no-durable"); const subject = fixture(provider);
+  try {
+    await subject.ready;
+    const run = subject.router.createDeliveryRun({ id: "no-durable-terminal", bootstrapTaskId: null });
+    const predecessor = subject.router.enqueue({ role: "backend", title: "reconcile", prompt: "no-op", deliveryRunId: run.id });
+    subject.router.enqueue({ role: "backend", title: "dependent", prompt: "no-op", dependencies: [predecessor.id], deliveryRunId: run.id });
+    const execution = await subject.router.runUntilIdle({ deliveryRunId: run.id });
+    const persisted = subject.router.store.deliveryRun(run.id);
+    const diagnostics = await subject.router.collectTaskDiagnostics(predecessor.id);
+    assert.equal(execution.dependencyDeadlock, null);
+    assert.equal(persisted.recovery.primaryFailure.taxonomy, "execution_provider_terminal_reconciliation_unavailable");
+    assert.match(diagnostics.terminalReconciliation.reason, /terminal_reconciliation_unavailable/);
+  } finally { subject.dispose(); }
+});
+
+test("verified durable alias normalizes the resolved turn and stale lifecycle events remain diagnostics only", async () => {
+  const provider = new ControlledProvider("durable-alias"); const subject = fixture(provider);
+  try {
+    await subject.ready;
+    const task = subject.router.enqueue({ role: "bootstrap", title: "alias reconciliation", prompt: "no-op" });
+    await subject.router.runUntilIdle();
+    const before = subject.router.store.getTask(task.id);
+    provider.emit("lifecycle", lifecycleEvent({ kind: "turn_completed", correlationId: provider.turn.correlationId, data: { threadId: provider.turn.threadId, turnId: "stale-requested-turn", terminalClass: "interrupted" } }));
+    const after = subject.router.store.getTask(task.id);
+    const diagnostics = await subject.router.collectTaskDiagnostics(task.id);
+    assert.equal(before.status, "done"); assert.equal(after.status, "done");
+    assert.equal(after.turnId, "durable-resolved-turn");
+    assert.equal(diagnostics.terminalReconciliation.resolvedTurnId, "durable-resolved-turn");
+    assert.ok(subject.router.lifecycleEvents().some((event) => event.type === "execution provider protocol violation" && /stale/i.test(event.reason)));
   } finally { subject.dispose(); }
 });
 

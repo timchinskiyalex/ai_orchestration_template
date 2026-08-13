@@ -4,18 +4,19 @@ export const EXECUTION_PROVIDER_VERSION = "execution-provider/v1";
 
 export const REQUIRED_EXECUTION_CAPABILITIES = Object.freeze([
   "lifecycle_completion", "final_result_read", "idempotent_interrupt",
-  "usage_updates", "account_reads", "bounded_diagnostics", "approval_requests"
+  "usage_updates", "account_reads", "bounded_diagnostics", "approval_requests",
+  "durable_terminal_reconciliation"
 ]);
 
 export const EXECUTION_OPERATIONS = Object.freeze([
   "handshake", "account_read", "start_thread", "set_goal", "start_turn",
-  "observe_terminal", "read_final_result", "interrupt_turn", "approval_response",
+  "observe_terminal", "reconcile_terminal", "read_final_result", "interrupt_turn", "approval_response",
   "shutdown", "diagnostics"
 ]);
 
 export const EXECUTION_OPERATION_METHODS = Object.freeze({
   handshake: "handshake", account_read: "accountRead", start_thread: "startThread",
-  set_goal: "setGoal", start_turn: "startTurn", observe_terminal: "observeTerminal",
+  set_goal: "setGoal", start_turn: "startTurn", observe_terminal: "observeTerminal", reconcile_terminal: "reconcileTerminal",
   read_final_result: "readFinalResult", interrupt_turn: "interruptTurn",
   approval_response: "approvalResponse", shutdown: "shutdown", diagnostics: "diagnostics"
 });

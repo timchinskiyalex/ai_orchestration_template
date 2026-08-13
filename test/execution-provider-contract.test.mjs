@@ -9,7 +9,7 @@ class Transport extends EventEmitter {
   async request(method) { return method === "account/read" ? { account: {} } : method === "account/usage/read" ? { dailyUsageBuckets: [] } : { rateLimits: null }; }
   async startThread() { return { thread: { id: "thread-1" } }; } async setGoal() {}
   async startTurn() { return { turn: { id: "turn-1" } }; } async waitForTurn() { return { id: "turn-1", status: "completed" }; }
-  async readThread() { return { thread: { turns: [{ id: "turn-1", items: [{ type: "agentMessage", text: "done" }] }] } }; } async interruptTurn() {} respond(id, response) { this.response = { id, response }; }
+  async readThread() { return { thread: { turns: [{ id: "turn-1", status: "completed", items: [{ type: "agentMessage", text: "done" }] }] } }; } async interruptTurn() {} respond(id, response) { this.response = { id, response }; }
 }
 class DeterministicProvider {
   async handshake(args) { return envelope({ operation: "handshake", correlationId: args.correlationId, success: true, data: { capabilities: [...REQUIRED_EXECUTION_CAPABILITIES], providerRunId: "fake" } }); }
@@ -18,6 +18,7 @@ class DeterministicProvider {
   async setGoal(args) { return envelope({ operation: "set_goal", correlationId: args.correlationId, success: true, data: { providerRunId: "fake", threadId: "thread-1" } }); }
   async startTurn(args) { return envelope({ operation: "start_turn", correlationId: args.correlationId, success: true, data: { providerRunId: "fake", threadId: "thread-1", turnId: "turn-1" } }); }
   async observeTerminal(args) { return envelope({ operation: "observe_terminal", correlationId: args.correlationId, success: true, data: { providerRunId: "fake", threadId: "thread-1", turnId: "turn-1", terminalClass: "completed", usage: { totalTokens: 3 } } }); }
+  async reconcileTerminal(args) { return envelope({ operation: "reconcile_terminal", correlationId: args.correlationId, success: true, data: { providerRunId: "fake", threadId: "thread-1", turnId: "turn-1", terminalClass: "completed", requestedTurnId: args.data.turnId, resolvedTurnId: "turn-1", reconciliationSource: "thread_read", verifiedEquivalence: "exact" } }); }
   async readFinalResult(args) { return envelope({ operation: "read_final_result", correlationId: args.correlationId, success: true, data: { providerRunId: "fake", threadId: "thread-1", turnId: "turn-1", resultText: "done" } }); }
   async interruptTurn(args) { return envelope({ operation: "interrupt_turn", correlationId: args.correlationId, success: true, data: { providerRunId: "fake", threadId: "thread-1", turnId: "turn-1", terminalClass: "interrupted" } }); }
   async approvalResponse(args) { return envelope({ operation: "approval_response", correlationId: args.correlationId, success: true, data: { providerRunId: "fake", requestId: args.data.requestId } }); }
@@ -37,6 +38,7 @@ test("App Server adapter and complete deterministic provider share full v1 opera
     await call(provider, "set_goal", { threadId: "thread-1" }, ["threadId"]);
     await call(provider, "start_turn", { threadId: "thread-1" }, ["threadId", "turnId"]);
     const terminal = await call(provider, "observe_terminal", { threadId: "thread-1", turnId: "turn-1", timeoutMs: 5 }, ["threadId", "turnId"]); assert.equal(terminal.terminalClass, "completed");
+    const reconciled = await call(provider, "reconcile_terminal", { threadId: "thread-1", turnId: "turn-1", timeoutMs: 5 }, ["threadId", "turnId"]); assert.equal(reconciled.terminalClass, "completed");
     await call(provider, "read_final_result", { threadId: "thread-1", turnId: "turn-1" }, ["threadId", "turnId", "resultText"]);
     if (provider.client) provider.client.emit("serverRequest", { id: 7, method: "item/commandExecution/requestApproval", params: { threadId: "thread-1", turnId: "turn-1" } });
     await call(provider, "approval_response", { requestId: provider.client ? "7" : "approval-1", response: { decision: "cancel" } }, ["requestId"]);

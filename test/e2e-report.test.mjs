@@ -56,7 +56,7 @@ test("E2E reporter creates a safe run directory, updates latest, and finalizes f
     assert.equal(latest.diagnostics.primaryFailure.taxonomy, "execution_provider_process_exit");
     assert.deepEqual(latest.diagnostics.primaryFailure.impactedTaskIds, ["security-actual"]);
     assert.doesNotMatch(latest.diagnostics.primaryFailure.reason, /top-secret/);
-    assert.deepEqual(latest.diagnostics.activeTurns, [{ taskId: "security-actual", threadId: "thread-actual", turnId: "turn-actual", requestedTurnId: null, authoritativeTerminal: false }]);
+    assert.deepEqual(latest.diagnostics.activeTurns, [{ taskId: "security-actual", threadId: "thread-actual", turnId: "turn-actual", requestedTurnId: null, authoritativeTerminal: false, lifecycleTerminalCandidateStatus: null, durableReconciledStatus: null }]);
     assert.deepEqual(latest.diagnostics.primaryFailure.activeTasks, [{ taskId: "security-actual", threadId: "thread-actual", turnId: "turn-actual", status: "running" }]);
   } finally { rmSync(reportsRoot, { recursive: true, force: true }); }
 });

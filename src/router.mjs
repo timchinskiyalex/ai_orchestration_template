@@ -147,6 +147,7 @@ export class SwarmRouter extends EventEmitter {
     this.budgetInterruptedTasks = new Set();
     this.pendingBudgetWatchdogs = new Set();
     this.activeTurns = new Map();
+    this.terminalReconciliations = new Map();
     this.lastActiveTurnSnapshot = [];
     this.activeScheduler = null;
     this.providerProcessExit = null;
@@ -426,7 +427,8 @@ export class SwarmRouter extends EventEmitter {
       lifecycleEvents: this.lifecycleEvents(),
       appServer: this.lastAppServerDiagnostics ?? null,
       processExit: this.providerProcessExit?.diagnostics ?? null,
-      activeTurns: this.activeTurnSnapshot()
+      activeTurns: this.activeTurnSnapshot(),
+      terminalReconciliations: [...this.terminalReconciliations.entries()].map(([taskId, reconciliation]) => ({ taskId, ...reconciliation }))
     };
   }
 
@@ -434,7 +436,9 @@ export class SwarmRouter extends EventEmitter {
     const turns = [...this.activeTurns.values()].map((turn) => ({
       taskId: turn.taskId, threadId: turn.threadId, turnId: turn.turnId ?? null,
       requestedTurnId: turn.requestedTurnId ?? null,
-      authoritativeTerminal: turn.authoritativeTerminal === true
+      authoritativeTerminal: turn.authoritativeTerminal === true,
+      lifecycleTerminalCandidateStatus: turn.lifecycleTerminalCandidateStatus ?? null,
+      durableReconciledStatus: turn.durableReconciledStatus ?? null
     }));
     return turns.length ? turns : [...this.lastActiveTurnSnapshot];
   }
@@ -442,7 +446,10 @@ export class SwarmRouter extends EventEmitter {
   async collectTaskDiagnostics(taskId, { threadReadTimeoutMs = 1_500 } = {}) {
     const task = this.store.getTask(taskId);
     const run = task?.deliveryRunId ? this.store.deliveryRun(task.deliveryRunId) : (this.activeDeliveryRunId ? this.store.deliveryRun(this.activeDeliveryRunId) : null);
-    let threadRead = this.providerProcessExit?.terminalByTask?.get(taskId) ?? { available: false, reason: "thread/read unavailable" };
+    const terminalReconciliation = this.terminalReconciliations.get(taskId) ?? null;
+    let threadRead = terminalReconciliation
+      ? { available: Boolean(terminalReconciliation.durableReconciledStatus), source: terminalReconciliation.reconciliationSource, threadId: terminalReconciliation.threadId, turnId: terminalReconciliation.resolvedTurnId, turnStatus: terminalReconciliation.durableReconciledStatus, reason: terminalReconciliation.reason ?? null }
+      : this.providerProcessExit?.terminalByTask?.get(taskId) ?? { available: false, reason: "thread/read unavailable" };
     if (!threadRead.available && task?.threadId && task.turnId && this.activeClient) {
       try {
         const result = await this.#provider(this.activeClient, "read_final_result", { threadId: task.threadId, turnId: task.turnId, timeoutMs: threadReadTimeoutMs }, ["threadId", "turnId"]);
@@ -451,7 +458,7 @@ export class SwarmRouter extends EventEmitter {
         threadRead = { available: false, threadId: task.threadId, turnId: task.turnId, error: "thread/read failed" };
       }
     }
-    return { task, threadRead, ...this.appServerDiagnostics(), primaryFailure: run?.recovery?.primaryFailure ?? null };
+    return { task, threadRead, terminalReconciliation, ...this.appServerDiagnostics(), primaryFailure: run?.recovery?.primaryFailure ?? null };
   }
 
   enqueue({ role, title, prompt, parentTaskId = null, allowedPaths = [], acceptanceChecks = [], dependencies = [], estimatedTokens = null, humanApprovalRequired = false, riskFlags = [], supportingDomains = [], artifactBaseSha = null, artifactDependencies = [], remediationRound = 0, sourceWriterTaskId = null, blueprintId = null, requirementIds = [], baselineBehaviorIds = [], deliveryRunId = this.activeDeliveryRunId }) {
@@ -824,6 +831,7 @@ export class SwarmRouter extends EventEmitter {
     this.budgetInterruptedTasks.clear();
     this.pendingBudgetWatchdogs.clear();
     this.activeTurns.clear();
+    this.terminalReconciliations.clear();
     this.providerProcessExit = null;
     client.on?.("lifecycle", (event) => this.#onProviderLifecycle(event));
     const onSigint = () => { this.requestShutdown("interrupted_controller_exit: SIGINT received").catch(() => {}); };
@@ -1038,16 +1046,31 @@ export class SwarmRouter extends EventEmitter {
       terminal = await this.#recoverTerminalAfterProviderExit(client, task);
       if (!terminal) throw error;
     }
-    if (terminal.threadId !== threadId || !TERMINAL_TURN_CLASSES.has(terminal.terminalClass)) throw new ExecutionProviderError("protocol_violation", "authoritative terminal completion is invalid");
+    if (terminal.threadId !== threadId || !TERMINAL_TURN_CLASSES.has(terminal.terminalClass)) throw new ExecutionProviderError("protocol_violation", "terminal lifecycle candidate is invalid");
     const watched = { turn: { id: terminal.turnId, status: terminal.terminalClass, usage: terminal.usage ?? null } };
     const turn = watched.turn;
-    const resolvedTurnId = turn.id ?? turnId;
+    const activeBeforeReconciliation = this.activeTurns.get(task.id);
+    if (!activeBeforeReconciliation?.lifecycleTerminalCandidateStatus) {
+      this.activeTurns.set(task.id, { ...activeBeforeReconciliation, lifecycleTerminalCandidateStatus: terminal.terminalClass });
+      this.#lifecycle("turn terminal candidate", { taskId: task.id, threadId, turnId: terminal.turnId ?? turnId, itemStatus: terminal.terminalClass });
+    }
+    const normalizedTurnId = activeBeforeReconciliation?.turnId ?? turnId;
+    const durable = await this.#reconcileDurableTerminal(client, task, {
+      lifecycleCandidate: terminal,
+      requestedTurnId: activeBeforeReconciliation?.requestedTurnId ?? turnId,
+      normalizedTurnId,
+      correlationId: activeBeforeReconciliation?.correlationId ?? turnCorrelationId
+    });
+    const resolvedTurnId = durable.turnId;
+    turn.id = resolvedTurnId;
+    turn.status = durable.terminalClass;
+    watched.resultText = durable.resultText ?? watched.resultText;
     this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
     // A provider observation is authority for the turn only.  Retain the
     // active registration until the task's terminal persistence below has
     // committed, so no scheduler worker can reuse this capacity early.
     const activeTurn = this.activeTurns.get(task.id);
-    if (activeTurn) this.activeTurns.set(task.id, { ...activeTurn, authoritativeTerminal: true, terminalClass: terminal.terminalClass });
+    if (activeTurn) this.activeTurns.set(task.id, { ...activeTurn, authoritativeTerminal: true, terminalClass: durable.terminalClass });
     const current = this.store.getTask(task.id);
     if (this.budgetInterruptedTasks.has(task.id) && current.status === "running") this.store.transition(task.id, "blocked_budget", { error: "budget_interrupt confirmed before result processing" });
     // Lifecycle policy may already have made this turn terminal (for example,
@@ -1264,7 +1287,7 @@ export class SwarmRouter extends EventEmitter {
   }
 
   async #provider(provider, operation, data, requiredIds = [], correlationId = randomUUID()) {
-    const names = { handshake: "handshake", account_read: "accountRead", start_thread: "startThread", set_goal: "setGoal", start_turn: "startTurn", observe_terminal: "observeTerminal", read_final_result: "readFinalResult", interrupt_turn: "interruptTurn", approval_response: "approvalResponse", shutdown: "shutdown", diagnostics: "diagnostics" };
+    const names = { handshake: "handshake", account_read: "accountRead", start_thread: "startThread", set_goal: "setGoal", start_turn: "startTurn", observe_terminal: "observeTerminal", reconcile_terminal: "reconcileTerminal", read_final_result: "readFinalResult", interrupt_turn: "interruptTurn", approval_response: "approvalResponse", shutdown: "shutdown", diagnostics: "diagnostics" };
     const method = provider?.[names[operation]];
     if (typeof method !== "function") throw new ExecutionProviderError("unsupported_capability", `provider does not implement ${operation}`);
     let result;
@@ -1546,16 +1569,17 @@ export class SwarmRouter extends EventEmitter {
         const requestedTurnId = retry.turnId;
         this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
         const completion = this.#provider(client, "observe_terminal", { threadId, turnId: requestedTurnId, timeoutMs: this.config.router.turnTimeoutMs }, ["threadId", "turnId", "terminalClass"], turnCorrelationId);
-        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, correlationId: turnCorrelationId, permittedTurnIds: new Set([requestedTurnId]), completion });
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, requestedTurnId, correlationId: turnCorrelationId, permittedTurnIds: new Set([requestedTurnId]), completion });
         this.#lifecycle("planner repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1 });
         const terminal = await completion;
         if (terminal.threadId !== threadId) throw new ExecutionProviderError("protocol_violation", "planner terminal thread mismatch");
-        const turn = { id: terminal.turnId, status: terminal.terminalClass };
-        const resolvedTurnId = turn.id ?? requestedTurnId;
+        const durable = await this.#reconcileDurableTerminal(client, task, { lifecycleCandidate: terminal, requestedTurnId, normalizedTurnId: this.activeTurns.get(task.id)?.turnId ?? requestedTurnId, correlationId: turnCorrelationId });
+        const turn = { id: durable.turnId, status: durable.terminalClass };
+        const resolvedTurnId = durable.turnId;
         this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
         this.activeTurns.delete(task.id);
         if (turn.status !== "completed") throw new Error(`Planner corrective turn did not complete: ${turn.error?.message ?? turn.status}`);
-        resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
+        resultText = durable.resultText ?? await this.#readAgentResult(client, threadId, resolvedTurnId);
       }
     }
     throw new Error("Planner validation retry loop terminated unexpectedly");
@@ -1582,16 +1606,17 @@ export class SwarmRouter extends EventEmitter {
         const requestedTurnId = retry.turnId;
         this.store.setThread(task.id, { threadId, turnId: requestedTurnId });
         const completion = this.#provider(client, "observe_terminal", { threadId, turnId: requestedTurnId, timeoutMs: this.config.router.turnTimeoutMs }, ["threadId", "turnId", "terminalClass"], turnCorrelationId);
-        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, correlationId: turnCorrelationId, permittedTurnIds: new Set([requestedTurnId]), completion });
+        this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId: requestedTurnId, requestedTurnId, correlationId: turnCorrelationId, permittedTurnIds: new Set([requestedTurnId]), completion });
         this.#lifecycle("writer repair turn started", { taskId: task.id, threadId, turnId: requestedTurnId, attempt: attempt + 1 });
         const terminal = await completion;
         if (terminal.threadId !== threadId) throw new ExecutionProviderError("protocol_violation", "writer terminal thread mismatch");
-        const turn = { id: terminal.turnId, status: terminal.terminalClass };
-        const resolvedTurnId = turn.id ?? requestedTurnId;
+        const durable = await this.#reconcileDurableTerminal(client, task, { lifecycleCandidate: terminal, requestedTurnId, normalizedTurnId: this.activeTurns.get(task.id)?.turnId ?? requestedTurnId, correlationId: turnCorrelationId });
+        const turn = { id: durable.turnId, status: durable.terminalClass };
+        const resolvedTurnId = durable.turnId;
         this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
         this.activeTurns.delete(task.id);
         if (turn.status !== "completed") throw new Error(`Writer corrective turn did not complete: ${turn.error?.message ?? turn.status}`);
-        resultText = await this.#readAgentResult(client, threadId, resolvedTurnId);
+        resultText = durable.resultText ?? await this.#readAgentResult(client, threadId, resolvedTurnId);
       }
     }
     throw new Error("Writer verification retry loop terminated unexpectedly");
@@ -1775,6 +1800,57 @@ export class SwarmRouter extends EventEmitter {
 
   async #readAgentResult(client, threadId, turnId) {
     return (await this.#provider(client, "read_final_result", { threadId, turnId }, ["threadId", "turnId", "resultText"])).resultText;
+  }
+
+  async #reconcileDurableTerminal(client, task, { lifecycleCandidate, requestedTurnId, normalizedTurnId, correlationId }) {
+    const active = this.activeTurns.get(task.id);
+    const persistedTask = this.store.getTask(task.id) ?? task;
+    const threadId = active?.threadId ?? persistedTask.threadId;
+    const candidateStatus = lifecycleCandidate?.terminalClass ?? null;
+    const base = {
+      lifecycleTerminalCandidateStatus: candidateStatus,
+      requestedTurnId: requestedTurnId ?? null,
+      resolvedTurnId: normalizedTurnId ?? null,
+      threadId,
+      reconciliationSource: "thread_read",
+      durableReconciledStatus: null,
+      reason: null
+    };
+    if (active) {
+      this.activeTurns.set(task.id, { ...active, lifecycleTerminalCandidateStatus: candidateStatus, reconciliationPending: true });
+    }
+    this.terminalReconciliations.set(task.id, base);
+    this.#lifecycle("durable terminal reconciliation started", { taskId: task.id, threadId, turnId: normalizedTurnId, requestedTurnId, itemStatus: candidateStatus });
+    let durable;
+    try {
+      durable = await this.#provider(client, "reconcile_terminal", {
+        threadId, turnId: normalizedTurnId,
+        timeoutMs: Math.min(2_500, this.config.router.turnTimeoutMs ?? 2_500)
+      }, ["threadId", "turnId", "terminalClass"], correlationId);
+    } catch (error) {
+      const reason = `terminal_reconciliation_unavailable: ${String(error.errorCode ?? error.message ?? error).slice(0, 300)}`;
+      this.terminalReconciliations.set(task.id, { ...base, reason });
+      this.#lifecycle("durable terminal reconciliation unavailable", { taskId: task.id, threadId, turnId: normalizedTurnId, requestedTurnId, itemStatus: candidateStatus, reason });
+      if (error instanceof ExecutionProviderError && error.errorCode === "terminal_reconciliation_unavailable") throw error;
+      const failure = new ExecutionProviderError("terminal_reconciliation_unavailable", reason, { errorClass: "transport", diagnostics: error?.diagnostics ?? error?.message });
+      failure.providerOperation = "reconcile_terminal";
+      throw failure;
+    }
+    const resolvedTurnId = durable.resolvedTurnId ?? durable.turnId;
+    const exact = resolvedTurnId === normalizedTurnId;
+    const permittedAlias = active?.permittedTurnIds?.has(resolvedTurnId) || active?.turnId === resolvedTurnId;
+    const verifiedAlias = durable.verifiedEquivalence === "observed_alias" && durable.requestedTurnId === normalizedTurnId;
+    if (durable.threadId !== threadId || !TERMINAL_TURN_CLASSES.has(durable.terminalClass) || (!exact && !permittedAlias && !verifiedAlias)) {
+      const reason = "terminal_reconciliation_invalid: durable thread/read did not prove the requested/resolved turn identity";
+      this.terminalReconciliations.set(task.id, { ...base, resolvedTurnId, reason });
+      throw new ExecutionProviderError("terminal_reconciliation_unavailable", reason, { errorClass: "protocol" });
+    }
+    const reconciliation = { ...base, resolvedTurnId, durableReconciledStatus: durable.terminalClass, reconciliationSource: durable.reconciliationSource ?? "thread_read" };
+    this.terminalReconciliations.set(task.id, reconciliation);
+    const latest = this.activeTurns.get(task.id);
+    if (latest) this.activeTurns.set(task.id, { ...latest, turnId: resolvedTurnId, durableReconciledStatus: durable.terminalClass, reconciliationPending: false, permittedTurnIds: new Set([...(latest.permittedTurnIds ?? []), resolvedTurnId]) });
+    this.#lifecycle("durable terminal reconciled", { taskId: task.id, threadId, turnId: resolvedTurnId, requestedTurnId, resolvedTurnId, itemStatus: durable.terminalClass });
+    return { ...durable, turnId: resolvedTurnId };
   }
 
   #saveAgentResult(task, resultText) {
@@ -2447,7 +2523,17 @@ export class SwarmRouter extends EventEmitter {
       return;
     }
     if (normalized.kind === "approval_requested") { this.#handleApprovalRequest(taskId, data, normalized.correlationId).catch((error) => this.#lifecycle("approval response failed", { taskId, errorCode: error.errorCode ?? "transport_failure" })); return; }
-    if (["item_started", "item_completed", "turn_completed"].includes(normalized.kind)) this.#lifecycle(normalized.kind.replace("_", " "), { taskId, threadId: data.threadId, turnId: data.turnId, itemType: data.itemType ?? null, itemStatus: data.itemStatus ?? data.terminalClass ?? null });
+    if (normalized.kind === "turn_completed") {
+      // Lifecycle delivery is advisory only.  In particular, an interrupted
+      // notification can race durable completion.  Keep it as a diagnostic
+      // candidate; #runTask performs the authoritative thread/read barrier.
+      const candidateStatus = data.terminalClass ?? data.itemStatus ?? null;
+      const currentActive = this.activeTurns.get(taskId);
+      if (currentActive) this.activeTurns.set(taskId, { ...currentActive, lifecycleTerminalCandidateStatus: candidateStatus });
+      this.#lifecycle("turn terminal candidate", { taskId, threadId: data.threadId, turnId: data.turnId, itemStatus: candidateStatus });
+      return;
+    }
+    if (["item_started", "item_completed"].includes(normalized.kind)) this.#lifecycle(normalized.kind.replace("_", " "), { taskId, threadId: data.threadId, turnId: data.turnId, itemType: data.itemType ?? null, itemStatus: data.itemStatus ?? null });
   }
 
   #handleActiveProtocolViolation(active, event = null, error = new ExecutionProviderError("protocol_violation", "task lifecycle identity mismatch")) {

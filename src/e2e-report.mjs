@@ -73,7 +73,26 @@ function safeDiagnostics(runtime = null) {
     lifecycleEvents: (runtime.lifecycleEvents ?? []).slice(-100).map(safeLifecycleEvent).filter(Boolean),
     activeTurns: (runtime.activeTurns ?? runtime.appServer?.activeTurns ?? []).slice(-20).map((turn) => ({
       taskId: turn?.taskId ?? null, threadId: turn?.threadId ?? null, turnId: turn?.turnId ?? null,
-      requestedTurnId: turn?.requestedTurnId ?? null, authoritativeTerminal: turn?.authoritativeTerminal === true
+      requestedTurnId: turn?.requestedTurnId ?? null, authoritativeTerminal: turn?.authoritativeTerminal === true,
+      lifecycleTerminalCandidateStatus: turn?.lifecycleTerminalCandidateStatus ?? null,
+      durableReconciledStatus: turn?.durableReconciledStatus ?? null
+    })),
+    terminalReconciliation: runtime.terminalReconciliation ? {
+      lifecycleTerminalCandidateStatus: runtime.terminalReconciliation.lifecycleTerminalCandidateStatus ?? null,
+      durableReconciledStatus: runtime.terminalReconciliation.durableReconciledStatus ?? null,
+      requestedTurnId: runtime.terminalReconciliation.requestedTurnId ?? null,
+      resolvedTurnId: runtime.terminalReconciliation.resolvedTurnId ?? null,
+      reconciliationSource: runtime.terminalReconciliation.reconciliationSource ?? null,
+      reason: redact(runtime.terminalReconciliation.reason)
+    } : null,
+    terminalReconciliations: (runtime.terminalReconciliations ?? runtime.appServer?.terminalReconciliations ?? []).slice(-20).map((item) => ({
+      taskId: item?.taskId ?? null,
+      lifecycleTerminalCandidateStatus: item?.lifecycleTerminalCandidateStatus ?? null,
+      durableReconciledStatus: item?.durableReconciledStatus ?? null,
+      requestedTurnId: item?.requestedTurnId ?? null,
+      resolvedTurnId: item?.resolvedTurnId ?? null,
+      reconciliationSource: item?.reconciliationSource ?? null,
+      reason: redact(item?.reason)
     })),
     primaryFailure: runtime.primaryFailure ? {
       taxonomy: runtime.primaryFailure.taxonomy ?? null,

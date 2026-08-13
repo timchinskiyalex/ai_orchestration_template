@@ -61,6 +61,37 @@ export class AppServerExecutionProvider extends EventEmitter {
     this.#bind(args.data.threadId, turnId, args.correlationId);
     return { threadId: args.data.threadId, turnId, providerRunId: `${args.data.threadId}:${turnId}`, terminalClass: turn.status, usage: usage(turn) };
   }); }
+  async reconcileTerminal(args) { return this.#raw("reconcile_terminal", args, async () => {
+    // This is deliberately independent of lifecycle delivery: it is the
+    // controller-requested, bounded, read-only thread/read authority used
+    // before any task terminal state or review evidence is persisted.
+    const requestedTurnId = args.data.turnId;
+    let turn, reconciliationSource = "thread_read";
+    if (typeof this.client.readTerminalTurn === "function") {
+      turn = (await this.client.readTerminalTurn(args.data.threadId, requestedTurnId, args.data.timeoutMs))?.terminal;
+    } else {
+      const result = await this.client.readThread({ threadId: args.data.threadId, includeTurns: true });
+      const exact = (result?.thread?.turns ?? result?.turns ?? []).find((item) => item?.id === requestedTurnId);
+      // Older App Server schema fixtures omit the turn status but retain the
+      // exact, durable final agent message.  That is a narrowly defined
+      // equivalence contract for completed only; failed/interrupted still
+      // require an explicit durable terminal status.
+      const finalMessage = (exact?.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text;
+      turn = terminal.has(exact?.status) ? exact : (finalMessage?.trim() ? { ...exact, status: "completed" } : null);
+      if (turn?.status === "completed" && !terminal.has(exact?.status)) reconciliationSource = "thread_read_result_equivalence";
+    }
+    if (!turn || !terminal.has(turn.status)) throw new Error("terminal_reconciliation_unavailable");
+    const resolvedTurnId = turn.id ?? requestedTurnId;
+    const resultText = (turn.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text;
+    this.#bind(args.data.threadId, resolvedTurnId, args.correlationId);
+    return {
+      threadId: args.data.threadId, turnId: resolvedTurnId, providerRunId: `${args.data.threadId}:${resolvedTurnId}`,
+      terminalClass: turn.status, requestedTurnId, resolvedTurnId,
+      reconciliationSource,
+      verifiedEquivalence: resolvedTurnId === requestedTurnId ? "exact" : "observed_alias",
+      ...(resultText?.trim() ? { resultText } : {})
+    };
+  }); }
   async readFinalResult(args) { return this.#raw("read_final_result", args, async () => { const result = await this.client.readThread({ threadId: args.data.threadId, includeTurns: true }); const turns = result?.thread?.turns ?? result?.turns ?? []; const turn = turns.find((item) => item?.id === args.data.turnId); const text = (turn?.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text; if (!text?.trim()) throw new Error("result_unavailable"); return { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: `${args.data.threadId}:${args.data.turnId}`, resultText: text }; }); }
   async interruptTurn(args) { const key = `${args.data.threadId}:${args.data.turnId}`; if (this.interrupted.has(key)) return this.#ok("interrupt_turn", args, { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: key, terminalClass: "interrupted" }); this.interrupted.add(key); return this.#raw("interrupt_turn", args, async () => { await this.client.interruptTurn(args.data); return { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: key, terminalClass: "interrupted" }; }); }
   async approvalResponse(args) { return this.#raw("approval_response", args, async () => { const { requestId, response } = args.data; if (typeof requestId !== "string" || !response || typeof response !== "object") throw new Error("invalid approval response"); const rawId = this.approvalRequests.get(requestId); if (rawId === undefined) throw new Error("unknown approval request"); this.client.respond(rawId, response); this.approvalRequests.delete(requestId); return { providerRunId: "app-server", requestId }; }); }

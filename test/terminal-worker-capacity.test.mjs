@@ -20,7 +20,7 @@ const eventually = async (predicate, label) => {
 const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: false }]));
 
 class DeferredProvider extends EventEmitter {
-  constructor({ badStart = false } = {}) { super(); this.badStart = badStart; this.next = 0; this.turns = new Map(); this.starts = []; this.maximumActive = 0; }
+  constructor({ badStart = false } = {}) { super(); this.badStart = badStart; this.next = 0; this.turns = new Map(); this.durable = new Map(); this.aliases = new Map(); this.starts = []; this.maximumActive = 0; this.reconciliationGate = null; }
   #ok(operation, args, data) { return envelope({ operation, correlationId: args.correlationId, success: true, data }); }
   async handshake(args) { return this.#ok("handshake", args, { providerRunId: "deferred", capabilities: [...REQUIRED_EXECUTION_CAPABILITIES] }); }
   async accountRead(args) { return this.#ok("account_read", args, { account: {}, usage: {}, rateLimits: {} }); }
@@ -34,6 +34,12 @@ class DeferredProvider extends EventEmitter {
     return this.#ok("start_turn", args, { providerRunId: "deferred", threadId: args.data.threadId, turnId });
   }
   async observeTerminal(args) { return await new Promise((resolve) => this.turns.set(args.data.turnId, { args, resolve })); }
+  async reconcileTerminal(args) {
+    if (this.reconciliationGate) await this.reconciliationGate;
+    const terminal = this.durable.get(args.data.turnId);
+    if (!terminal) return envelope({ operation: "reconcile_terminal", correlationId: args.correlationId, success: false, errorCode: "terminal_reconciliation_unavailable", errorClass: "transport", diagnostics: "no durable terminal" });
+    return this.#ok("reconcile_terminal", args, { providerRunId: "deferred", threadId: args.data.threadId, turnId: terminal.turnId, terminalClass: terminal.status, requestedTurnId: args.data.turnId, resolvedTurnId: terminal.turnId, reconciliationSource: "thread_read", verifiedEquivalence: terminal.turnId === args.data.turnId ? "exact" : "observed_alias" });
+  }
   async readFinalResult(args) { return this.#ok("read_final_result", args, { providerRunId: "deferred", threadId: args.data.threadId, turnId: args.data.turnId, resultText: "safe" }); }
   async interruptTurn(args) { this.complete(args.data.turnId, "interrupted"); return this.#ok("interrupt_turn", args, { providerRunId: "deferred", threadId: args.data.threadId, turnId: args.data.turnId, terminalClass: "interrupted" }); }
   async approvalResponse(args) { return this.#ok("approval_response", args, { providerRunId: "deferred", requestId: args.data.requestId }); }
@@ -41,11 +47,14 @@ class DeferredProvider extends EventEmitter {
   async diagnostics(args) { return this.#ok("diagnostics", args, { diagnostics: { process: { alive: true, exited: false, code: null, signal: null }, stderrTail: "token=secret", protocolEvents: [] } }); }
   alias(turnId, resolvedTurnId = `alias-${turnId}`) {
     const turn = this.turns.get(turnId); assert.ok(turn, "turn must be observed before emitting an alias");
+    this.aliases.set(turnId, resolvedTurnId);
     this.emit("lifecycle", lifecycleEvent({ kind: "turn_alias", correlationId: turn.args.correlationId, data: { threadId: turn.args.data.threadId, turnId: resolvedTurnId, requestedTurnId: turnId, resolvedTurnId } }));
   }
   complete(turnId, terminalClass = "completed") {
     const turn = this.turns.get(turnId); if (!turn) return;
     this.turns.delete(turnId);
+    const resolvedTurnId = this.aliases.get(turnId) ?? turnId;
+    this.durable.set(resolvedTurnId, { turnId: resolvedTurnId, status: terminalClass });
     turn.resolve(this.#ok("observe_terminal", turn.args, { providerRunId: "deferred", threadId: turn.args.data.threadId, turnId, terminalClass }));
   }
 }
@@ -92,6 +101,25 @@ test("workers=2 never starts more than two unresolved provider turns", async () 
     await eventually(() => provider.starts.length === 3, "third provider turn after one terminal completion");
     assert.equal(provider.maximumActive <= 2, true);
     for (const turnId of [...provider.turns.keys()]) provider.complete(turnId);
+    await running;
+  } finally { subject.dispose(); }
+});
+
+test("workers=1 retains capacity while controller-owned durable reconciliation is pending", async () => {
+  const provider = new DeferredProvider(); const subject = fixture(provider, 1);
+  try {
+    await subject.router.ensureProjectOverlay();
+    subject.router.enqueue({ role: "frontend", title: "first", prompt: "safe" });
+    subject.router.enqueue({ role: "backend", title: "second", prompt: "safe" });
+    const running = subject.router.runUntilIdle();
+    await eventually(() => provider.starts.length === 1, "first provider turn");
+    let release; provider.reconciliationGate = new Promise((resolve) => { release = resolve; });
+    provider.complete(provider.starts[0].turnId);
+    await delay(25);
+    assert.equal(provider.starts.length, 1, "durable reconciliation retains the only scheduler slot");
+    release();
+    await eventually(() => provider.starts.length === 2, "second provider turn after reconciliation persistence");
+    provider.complete(provider.starts[1].turnId);
     await running;
   } finally { subject.dispose(); }
 });

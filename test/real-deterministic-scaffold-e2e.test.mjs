@@ -82,6 +82,14 @@ test("real App Server controlled E2E: deterministic scaffold, parallel writers, 
     assertMaxObservedActiveTurns(lifecycle, workerCount);
     if (workerCount >= 2) assertObservedParallelTurns(lifecycle, 2);
     assert.equal(execution.dependencyDeadlock, null, "provider failure must not be relabelled as dependency_deadlock");
+    const providerReviews = allTasks.filter((task) => ["security", "qa"].includes(task.role) && !scaffoldReviews.some((review) => review.id === task.id));
+    for (const review of providerReviews) {
+      const candidate = lifecycle.findIndex((event) => event.type === "turn terminal candidate" && event.taskId === review.id);
+      const durable = lifecycle.findIndex((event) => event.type === "durable terminal reconciled" && event.taskId === review.id);
+      const accepted = lifecycle.findIndex((event) => ["security gate passed", "quality gate passed"].includes(event.type) && event.taskId === review.id);
+      assert.ok(candidate >= 0 && durable > candidate, `review ${review.id} must expose lifecycle candidate then durable terminal reconciliation`);
+      assert.ok(accepted > durable, `review ${review.id} result may be accepted only after durable terminal reconciliation`);
+    }
     const artifacts = [scaffold, frontend, backend].map((task) => router.store.workerArtifact(task.id));
     assert.equal(artifacts.every((artifact) => artifact.verificationResults.every((result) => result.status === "passed")), true, "controller QA verification must pass for every artifact");
     progress("controller QA/local verification passed");
