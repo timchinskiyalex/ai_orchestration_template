@@ -410,6 +410,14 @@ export class SwarmRouter extends EventEmitter {
   enqueue({ role, title, prompt, parentTaskId = null, allowedPaths = [], acceptanceChecks = [], dependencies = [], estimatedTokens = null, humanApprovalRequired = false, riskFlags = [], supportingDomains = [], artifactBaseSha = null, artifactDependencies = [], remediationRound = 0, sourceWriterTaskId = null, blueprintId = null, requirementIds = [], baselineBehaviorIds = [], deliveryRunId = this.activeDeliveryRunId }) {
     assertRole(role);
     if (!title?.trim() || !prompt?.trim()) throw new Error("title and prompt are required");
+    // `[[product-scaffold]]` is a controller capability, never a prompt-level
+    // hint for an arbitrary worker.  Failing here prevents legacy/direct
+    // callers from silently spending an App Server turn when they omitted the
+    // immutable greenfield delivery identity.
+    if (prompt.trim().startsWith("[[product-scaffold]]")) {
+      const run = deliveryRunId ? this.store.deliveryRun(deliveryRunId) : null;
+      if (!run || this.#assertProjectMode(run).mode !== "greenfield") throw new Error("product_scaffold:controller_owned_greenfield_delivery_required");
+    }
     const roleConfig = this.config.roles[role];
     const estimate = estimatedTokens ?? roleConfig.tokenBudget;
     if (!Number.isInteger(estimate) || estimate < 1 || estimate > roleConfig.tokenBudget) throw new Error(`Invalid token estimate for ${role}; it must be between 1 and ${roleConfig.tokenBudget}`);
@@ -654,6 +662,39 @@ export class SwarmRouter extends EventEmitter {
       title: `Bootstrap ${this.config.project.name}`,
       prompt: `Read ${this.config.project.documentationDir}/inventory.json and the Markdown files the inventory lists${admittedManifestPath ? `, plus the controller-admitted immutable manifest ${admittedManifestPath}` : ""}. Produce the required structured blueprint for project '${this.config.project.name}'. The controller has already admitted one immutable SourceClaimManifest for this delivery; every admitted claim must have exactly one explicit sourceClaimIds disposition. For every requirement, sourceClaimIds and sourceRefs are an immutable pair: choose its admitted claim IDs, then copy every sourceRefs object from exactly those claims verbatim (same documentId, startLine, endLine, and excerptDigest); do not cite a subrange, superset, paraphrased reference, or unclaimed source reference. A mandatory claim must be closed by one mandatory requirement with acceptance criteria, or explicitly represented as an unresolved question or contradiction when the specification genuinely cannot be resolved.`,
     });
+  }
+
+  // Controller-owned entry point for an already-authorized, immutable plan.
+  // It is used by non-interactive delivery initiators that possess a validated
+  // ProductBlueprint/PlanBatch rather than an App Server Bootstrap/Planner
+  // conversation.  The same source, ProjectMode, plan, topology, and lineage
+  // admission path is used; callers cannot fabricate artifacts or releases.
+  admitPrecompiledPlan({ deliveryRunId, blueprint, plan }) {
+    const run = this.store.deliveryRun(deliveryRunId);
+    if (!run || this.#assertProjectMode(run).mode !== "greenfield") throw new Error("precompiled_plan:greenfield_delivery_required");
+    if (run.blueprintId || this.store.planBatches(run.id).length) throw new Error("precompiled_plan:delivery_already_materialized");
+    const sourceClaimManifest = this.#manifestForRun(run);
+    const admittedBlueprint = validateBootstrap(blueprint, {
+      sourceResolver: this.#sourceEvidenceResolver(),
+      policyRegistry: this.#controllerPolicyRegistry(),
+      sourceClaimManifest
+    });
+    admittedBlueprint.projectMode = this.#assertProjectMode(run);
+    const planner = this.enqueue({
+      role: "planner", title: `Controller-admitted plan ${this.config.project.name}`,
+      prompt: "Controller-owned precompiled PlanBatch admission; no App Server thread or turn is permitted.",
+      deliveryRunId: run.id,
+      estimatedTokens: this.config.roles.planner.tokenBudget
+    });
+    this.store.transition(planner.id, "preparing");
+    this.store.transition(planner.id, "running");
+    const persisted = this.#persistBlueprint(this.store.getTask(planner.id), admittedBlueprint);
+    this.store.linkBlueprintToDelivery(run.id, admittedBlueprint.blueprintId);
+    this.#materializePlan({ ...this.store.getTask(planner.id), blueprintId: admittedBlueprint.blueprintId }, plan);
+    this.store.transition(planner.id, "done");
+    this.store.heartbeatDeliveryLease(run.id, this.activeDeliverySessionId);
+    this.#lifecycle("precompiled plan admitted", { deliveryRunId: run.id, plannerTaskId: planner.id, blueprintId: persisted.blueprint.blueprintId });
+    return { deliveryRun: this.store.deliveryRun(run.id), planner: this.store.getTask(planner.id), blueprint: persisted, plan: this.store.planBatches(run.id).at(-1) };
   }
 
   approveHumanGate(taskId) {
@@ -1831,7 +1872,12 @@ export class SwarmRouter extends EventEmitter {
       if (hasCycle(task.id, task.id)) add(task, "cyclic_writer_predecessor");
       for (const id of parents) {
         const predecessor = byId.get(id);
-        if (!predecessor || ["failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted"].includes(predecessor.status)) add(task, "unreachable_writer_predecessor", id);
+        // An execution-provider outage has already persisted a primary,
+        // resumable delivery failure.  Its interrupted predecessors are not a
+        // DAG integrity defect and must never be relabelled as a deadlock.
+        if (!predecessor || ["failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted"].includes(predecessor.status)) {
+          if (!this.#hasExecutionProviderPrimaryFailure(predecessor)) add(task, "unreachable_writer_predecessor", id);
+        }
         // A non-terminal predecessor can be waiting for its own review or a
         // controller fan-in barrier. That is normal scheduler progress, not a
         // deadlock; only immutable absence/terminal failure is integrity-blocked.
@@ -1854,6 +1900,12 @@ export class SwarmRouter extends EventEmitter {
     if (this.activeDeliveryRunId) this.store.updateDeliveryRun(this.activeDeliveryRunId, { state: "failed", publish: { reason: "dependency_deadlock", classification: "integrity-blocked", taskIds: outcome.taskIds, reasons: outcome.reasons } });
     this.#lifecycle("dependency deadlock", { taskIds: outcome.taskIds, reasons: outcome.reasons });
     return { ...outcome, recordId: stored.id };
+  }
+
+  #hasExecutionProviderPrimaryFailure(predecessor) {
+    const run = predecessor?.deliveryRunId ? this.store.deliveryRun(predecessor.deliveryRunId) : null;
+    const taxonomy = run?.recovery?.primaryFailure?.taxonomy;
+    return typeof taxonomy === "string" && taxonomy.startsWith("execution_provider_");
   }
 
   async #failFastAfterTaskFailure(client, scheduler, failedTaskId, error) {
@@ -2102,8 +2154,17 @@ export class SwarmRouter extends EventEmitter {
     if (normalized.providerGlobal) {
       if (normalized.kind === "account_updated" && normalized.success) this.account.onRateLimitsUpdated({ rateLimits: normalized.data.rateLimits ?? {} });
       else if (normalized.kind === "process_exit") {
-        this.#lifecycle("execution provider lifecycle failure", { errorCode: normalized.errorCode ?? "process_exit" });
-        if (!this.stopRequested && !this.expectedClientShutdown && this.activeDeliveryRunId) this.#markInterrupted("interrupted_controller_exit: execution provider process exited");
+        const taxonomy = "execution_provider_process_exit";
+        this.#lifecycle("execution provider lifecycle failure", { errorCode: normalized.errorCode ?? "process_exit", taxonomy });
+        if (!this.stopRequested && !this.expectedClientShutdown && this.activeDeliveryRunId) {
+          this.#markInterrupted("interrupted_controller_exit: execution provider process exited", {
+            primaryFailure: {
+              taxonomy,
+              providerErrorCode: normalized.errorCode ?? "process_exit",
+              recoveryState: "resume_delivery_after_execution_provider_recovery"
+            }
+          });
+        }
       }
       return;
     }

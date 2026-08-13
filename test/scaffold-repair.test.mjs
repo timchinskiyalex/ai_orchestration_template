@@ -5,13 +5,13 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 import { SwarmRouter } from "../src/router.mjs";
 import { AppServerExecutionProvider } from "../src/app-server-execution-provider.mjs";
 import { fakeBlueprint } from "./product-blueprint-fixture.mjs";
 import { createHash } from "node:crypto";
 import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
 import { sourceFragmentDigest } from "../src/source-evidence.mjs";
+import { ingestDocumentation } from "../src/project-intake.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 const productRoots = [{ id: "frontend", path: "frontend", adapter: "next-node" }, { id: "backend", path: "backend", adapter: "dotnet" }];
@@ -63,15 +63,17 @@ test("deterministic scaffold creates a WorkerArtifact before two dependent write
   try {
     git(root, ["init", "-b", "main"]); mkdirSync(source); const text = "# Product\nCreate frontend and backend."; const file = { documentId: documentIdForPath("spec.md"), path: "spec.md", sha256: createHash("sha256").update(text).digest("hex") }; const ref = (line) => ({ documentId: file.documentId, startLine: line, endLine: line, excerptDigest: sourceFragmentDigest(text, line, line) }); writeFileSync(join(source, "spec.md"), text); writeFileSync(join(source, "source-claims.json"), JSON.stringify({ schemaVersion: 1, kind: "SourceClaimsDeclaration", documentSetDigest: documentSetDigest([file]), documents: [{ ...file, coverage: [{ claimId: "fix-value-claim", ...ref(1) }, { claimId: "context-claim", ...ref(2) }] }], claims: [{ claimId: "fix-value-claim", classification: "mandatory", sourceRefs: [ref(1)] }, { claimId: "context-claim", classification: "non_mandatory", sourceRefs: [ref(2)] }] })); writeFileSync(join(root, "package.json"), JSON.stringify({ name: "controller-only" })); git(root, ["add", "."]); git(root, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
     router = new SwarmRouter(configuration(root, client));
-    const run = await new DeliveryCoordinator(router).begin({ source,
-      remoteGitAdapter: { async pushCandidate({ sha }) { return { status: "pushed", verifiedSha: sha }; } },
-      pullRequestAdapter: { async ensurePullRequest({ sha }) { return { status: "open", number: 1, url: "https://example.test/pr/1", headSha: sha }; } },
-      remoteCiAdapter: { async waitForChecks() { return { status: "passed", checkRuns: [] }; } },
-      productEvidenceAdapter: { async verify({ candidate }) { return { candidateSha: candidate.sha, results: [{ requirementId: "fix-value", criterionId: "value-test", status: "pass", testId: "e2e/value-test", reference: "deterministic-product-check", candidateSha: candidate.sha }] }; } },
-      mergeAdapter: { async merge() { return { status: "merged", mainSha: "a".repeat(40), mergeSha: "a".repeat(40), targetVerified: true }; } }
-    });
+    await router.ensureProjectOverlay(); ingestDocumentation({ source, repository: root, destinationRelative: "docs/orchestration-input" });
+    const manifestId = router.sourceClaimManifestIdentity();
+    const run = router.createDeliveryRun({ id: "precompiled-greenfield", source, bootstrapTaskId: null, sourceClaimInputMode: "supplied", sourceClaimManifestId: manifestId, projectMode: router.projectMode, repositoryMode: "greenfield" });
+    router.admitPrecompiledPlan({ deliveryRunId: run.id, blueprint: fakeBlueprint(root), plan: { blueprintId: "pb-test", tasks: [
+      { id: "scaffold-product", title: "Scaffold product roots", prompt: "Create every declared product root", primaryDomain: "devops", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 20, dependsOn: [], allowedPaths: ["frontend", "backend"], acceptanceChecks: ["roots exist"], requirementIds: ["fix-value"] },
+      { id: "frontend-feature", title: "Build frontend feature", prompt: "Create frontend feature", primaryDomain: "frontend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 20, dependsOn: ["scaffold-product"], allowedPaths: ["frontend"], acceptanceChecks: ["feature exists"], requirementIds: ["fix-value"] },
+      { id: "backend-feature", title: "Build backend feature", prompt: "Create backend feature", primaryDomain: "backend", supportingDomains: [], riskFlags: [], humanApprovalRequired: false, estimatedTokens: 20, dependsOn: ["scaffold-product"], allowedPaths: ["backend"], acceptanceChecks: ["feature exists"], requirementIds: ["fix-value"] }
+    ] } });
+    await router.runUntilIdle({ deliveryRunId: run.id });
     const scaffold = router.list().find((task) => task.title === "Scaffold product roots");
-    assert.equal(run.state, "completed_merged");
+    assert.equal(router.store.deliveryRun(run.id).projectMode.mode, "greenfield");
     assert.equal(client.scaffoldTurnStarts, 0, "the App Server never receives a scaffold turn");
     assert.ok(router.store.workerArtifact(scaffold.id));
     assert.equal(existsSync(join(scaffold.worktree, "frontend", "package.json")), true);
@@ -81,5 +83,6 @@ test("deterministic scaffold creates a WorkerArtifact before two dependent write
     const writers = router.list().filter((task) => ["Build frontend feature", "Build backend feature"].includes(task.title));
     assert.equal(writers.every((task) => task.dependencies.includes(scaffold.id) && task.status === "done" && router.store.workerArtifact(task.id)), true);
     assert.ok(router.lifecycleEvents().some((event) => event.type === "deterministic scaffold completed"));
+    assert.equal((await router.integrateFinalized([scaffold.id, ...writers.map((task) => task.id)])).manifest.status, "candidate_ready");
   } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
 });

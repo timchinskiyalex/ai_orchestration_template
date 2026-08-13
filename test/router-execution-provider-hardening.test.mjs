@@ -39,6 +39,10 @@ class ControlledProvider extends EventEmitter {
   async diagnostics(args) { return this.#ok("diagnostics", args, { diagnostics: "safe" }); }
   #event(kind, { correlationId = this.turn.correlationId, threadId = this.turn.threadId, turnId = this.turn.turnId, ...data } = {}) { this.emit("lifecycle", lifecycleEvent({ kind, correlationId, data: { threadId, turnId, ...data } })); }
   #emitScenario() {
+    if (this.mode === "process-exit") {
+      this.emit("lifecycle", lifecycleEvent({ kind: "process_exit", providerGlobal: true, success: false, errorCode: "process_exit", errorClass: "transport" }));
+      return this.terminal?.();
+    }
     if (this.mode === "wrong-correlation") return this.#event("turn_completed", { correlationId: "wrong-correlation" });
     if (this.mode === "wrong-thread") return this.#event("turn_completed", { threadId: "wrong-thread" });
     if (this.mode === "wrong-turn") return this.#event("turn_completed", { turnId: "wrong-turn" });
@@ -68,6 +72,16 @@ test("Router startup rejects an incomplete v1 provider before task claim, worktr
     subject.router.store.claimNext = () => { claims += 1; return claimNext(); }; subject.router.worktrees.create = async (...args) => { creates += 1; return await create(...args); };
     await assert.rejects(subject.router.runUntilIdle(), /provider does not implement account_read/);
     assert.equal(subject.router.store.getTask(task.id).status, "queued"); assert.equal(claims, 0); assert.equal(creates, 0); assert.equal(provider.calls.startThread, 0); assert.equal(provider.calls.startTurn, 0);
+  } finally { subject.dispose(); }
+});
+
+test("manual malformed product scaffold enqueue fails closed before any execution-provider side effect", async () => {
+  const provider = new ControlledProvider(); const subject = fixture(provider);
+  try {
+    await subject.ready;
+    assert.throws(() => subject.router.enqueue({ role: "devops", title: "unsafe scaffold", prompt: "[[product-scaffold]] bypass delivery admission" }), /product_scaffold:controller_owned_greenfield_delivery_required/);
+    assert.equal(subject.router.list().length, 0);
+    assert.equal(provider.calls.startThread, 0); assert.equal(provider.calls.startTurn, 0);
   } finally { subject.dispose(); }
 });
 
@@ -153,5 +167,38 @@ test("canonical alias and usage continue through the Router path", async () => {
     await subject.ready;
     const task = subject.router.enqueue({ role: "bootstrap", title: "alias", prompt: "no-op" }); await subject.router.runUntilIdle();
     const current = subject.router.store.getTask(task.id); assert.equal(current.status, "done"); assert.equal(current.turnId, "canonical-turn"); assert.equal(current.tokenUsed, 7); assert.equal(provider.calls.interrupts.length, 0);
+  } finally { subject.dispose(); }
+});
+
+test("provider process failure remains the persisted primary failure and is not relabelled as dependency_deadlock", async () => {
+  const provider = new ControlledProvider("process-exit"); const subject = fixture(provider);
+  try {
+    await subject.ready;
+    const run = subject.router.createDeliveryRun({ id: "provider-exit-run", bootstrapTaskId: null });
+    const predecessor = subject.router.enqueue({ role: "backend", title: "provider exit predecessor", prompt: "no-op", deliveryRunId: run.id });
+    subject.router.enqueue({ role: "backend", title: "blocked successor", prompt: "no-op", dependencies: [predecessor.id], deliveryRunId: run.id });
+    const execution = await subject.router.runUntilIdle({ deliveryRunId: run.id });
+    const persisted = subject.router.store.deliveryRun(run.id);
+    assert.equal(execution.dependencyDeadlock, null);
+    assert.equal(persisted.state, "interrupted");
+    assert.equal(persisted.recovery.primaryFailure.taxonomy, "execution_provider_process_exit");
+    assert.equal(persisted.recovery.primaryFailure.recoveryState, "resume_delivery_after_execution_provider_recovery");
+    assert.equal(subject.router.store.getTask(predecessor.id).status, "interrupted");
+    assert.equal(subject.router.store.db.prepare("SELECT count(*) AS count FROM dependency_deadlocks WHERE delivery_run_id = ?").get(run.id).count, 0);
+  } finally { subject.dispose(); }
+});
+
+test("persisted missing writer lineage still records a structured dependency_deadlock", async () => {
+  const provider = new ControlledProvider(); const subject = fixture(provider);
+  try {
+    await subject.ready;
+    subject.router.config.roles.backend.sandbox = "workspace-write"; subject.router.config.roles.backend.usesWorktree = true;
+    const predecessor = subject.router.enqueue({ role: "backend", title: "unreachable predecessor", prompt: "no-op" });
+    subject.router.store.transition(predecessor.id, "preparing"); subject.router.store.transition(predecessor.id, "running"); subject.router.store.transition(predecessor.id, "failed", { error: "persisted writer failure" });
+    const successor = subject.router.enqueue({ role: "backend", title: "unreachable successor", prompt: "no-op", dependencies: [predecessor.id] });
+    const execution = await subject.router.runUntilIdle();
+    assert.equal(execution.integrityBlocked, true);
+    assert.ok(execution.dependencyDeadlock.reasons.some((item) => item.taskId === successor.id && item.code === "unreachable_writer_predecessor" && item.predecessorId === predecessor.id));
+    assert.equal(subject.router.store.db.prepare("SELECT count(*) AS count FROM dependency_deadlocks").get().count, 1);
   } finally { subject.dispose(); }
 });
