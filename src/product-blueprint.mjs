@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { validateRepositoryVerificationReference } from "./project-overlay.mjs";
 
 const types = new Set(["functional", "nfr", "data", "integration", "constraint"]);
 const priorities = new Set(["must", "should", "could"]);
@@ -76,7 +77,7 @@ function authorizationForQuestion(question, registry, strictClaims = false) {
   if (!scopeMatches(policy)) return { ...base, state: "unresolved", reason: "policy_scope_mismatch", proposedPolicyId: proposal.policyId };
   return { ...base, state: "resolved_by_policy", reason: "trusted_policy_match", policyId: policy.policyId, policyVersion: policy.version, policyDigest: policy.digest, claimIds: question.sourceClaimIds ?? [], resolvedValue: policy.resolvedValue, registryDigest: registry.digest };
 }
-export function validateProductBlueprint(value, { sourceDocuments = null, sourceResolver = null, sourceClaimManifest = null } = {}) {
+export function validateProductBlueprint(value, { sourceDocuments = null, sourceResolver = null, sourceClaimManifest = null, projectOverlay = null } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("must be an object");
   for (const key of ["schemaVersion", "kind", "blueprintId", "createdAt", "documentSetDigest", "sourceDocuments", "requirements", "nfrs", "modules", "integrations", "dataModel", "constraints", "assumptions", "decisions", "unresolvedQuestions", "contradictions"]) if (!(key in value)) fail(`missing '${key}'`);
   if (![1, 2, PRODUCT_BLUEPRINT_SCHEMA_VERSION].includes(value.schemaVersion) || value.kind !== "ProductBlueprint") fail("schemaVersion must be 1, 2, or 3 and kind must be ProductBlueprint");
@@ -116,6 +117,10 @@ export function validateProductBlueprint(value, { sourceDocuments = null, source
       if (!criterion || typeof criterion !== "object") fail(`requirement '${requirement.requirementId}' has invalid acceptance criterion`);
       id(criterion.criterionId, "criterionId");
       if (criteria.has(criterion.criterionId) || typeof criterion.description !== "string" || !criterion.description.trim() || (criterion.verificationHint !== undefined && typeof criterion.verificationHint !== "string")) fail(`requirement '${requirement.requirementId}' has invalid acceptance criterion`);
+      if (criterion.repositoryVerification !== undefined) {
+        try { criterion.repositoryVerification = validateRepositoryVerificationReference(criterion.repositoryVerification, projectOverlay); }
+        catch (error) { fail(`requirement '${requirement.requirementId}' ${error.message}`); }
+      }
       criteria.add(criterion.criterionId);
     }
     verifySourceRefs(requirement.sourceRefs, `requirement '${requirement.requirementId}'`, sourceResolver, documents);
@@ -169,8 +174,8 @@ function verifySourceRefs(refs, label, sourceResolver, documents) {
 
 // Bootstrap provides claims only.  This controller-owned derivation discards
 // agent statuses, defaults, and free-text resolutions before it assigns state.
-export function authorizeBootstrapClaims(blueprint, { sourceDocuments = null, sourceResolver = null, policyRegistry = null, sourceClaimManifest = null } = {}) {
-  const claims = validateProductBlueprint(blueprint, { sourceDocuments, sourceResolver });
+export function authorizeBootstrapClaims(blueprint, { sourceDocuments = null, sourceResolver = null, policyRegistry = null, sourceClaimManifest = null, projectOverlay = null } = {}) {
+  const claims = validateProductBlueprint(blueprint, { sourceDocuments, sourceResolver, projectOverlay });
   const registry = policyRegistryStatus(policyRegistry);
   const copy = structuredClone(claims);
   copy.schemaVersion = PRODUCT_BLUEPRINT_SCHEMA_VERSION;
@@ -195,17 +200,17 @@ export function authorizeBootstrapClaims(blueprint, { sourceDocuments = null, so
     if (!copy.decisions.some((decision) => decision.adrId === adrId)) copy.decisions.push({ adrId, decision: evidence.resolvedValue, rationale: `Controller-authorized policy ${evidence.policyId}@${evidence.policyVersion}`, sourceRefs: [] });
   }
   if (sourceClaimManifest) {
-    validateProductBlueprint(copy, { sourceDocuments, sourceResolver, sourceClaimManifest });
+    validateProductBlueprint(copy, { sourceDocuments, sourceResolver, sourceClaimManifest, projectOverlay });
     assertSourceClaimCompleteness(copy, sourceClaimManifest);
   }
   return copy;
 }
 
-export function validateControllerAuthorizedBlueprint(blueprint, { sourceDocuments = null, sourceResolver = null, policyRegistry = null, persistedResolutionAuthority = undefined, sourceClaimManifest = null } = {}) {
-  const stored = validateProductBlueprint(blueprint, { sourceDocuments, sourceResolver, sourceClaimManifest });
+export function validateControllerAuthorizedBlueprint(blueprint, { sourceDocuments = null, sourceResolver = null, policyRegistry = null, persistedResolutionAuthority = undefined, sourceClaimManifest = null, projectOverlay = null } = {}) {
+  const stored = validateProductBlueprint(blueprint, { sourceDocuments, sourceResolver, sourceClaimManifest, projectOverlay });
   if (stored.schemaVersion !== PRODUCT_BLUEPRINT_SCHEMA_VERSION) fail("legacy resolution authority cannot be proven for autonomous delivery");
   if (persistedResolutionAuthority !== undefined && canonical(stored.resolutionAuthority) !== canonical(persistedResolutionAuthority)) fail("persisted controller resolution authority evidence is missing or tampered");
-  const rederived = authorizeBootstrapClaims(stored, { sourceDocuments, sourceResolver, policyRegistry, sourceClaimManifest });
+  const rederived = authorizeBootstrapClaims(stored, { sourceDocuments, sourceResolver, policyRegistry, sourceClaimManifest, projectOverlay });
   if (canonical(stored.unresolvedQuestions) !== canonical(rederived.unresolvedQuestions) || canonical(stored.contradictions) !== canonical(rederived.contradictions) || canonical(stored.resolutionAuthority) !== canonical(rederived.resolutionAuthority)) fail("controller resolution authority evidence is missing, tampered, or no longer trusted");
   for (const evidence of stored.resolutionAuthority.records.filter((item) => item.state === "resolved_by_policy")) {
     const adrId = policyAdrId(evidence.targetId);

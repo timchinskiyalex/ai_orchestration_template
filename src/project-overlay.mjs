@@ -129,6 +129,19 @@ export function projectOverlayExecutionSnapshot(overlay) {
   return { schemaVersion: 1, sourceOverlayVersion: overlay.schemaVersion, baseSha: overlay.repository?.baseSha ?? null, architectureBlueprint: overlay.architectureBlueprint ? { digest: overlay.architectureBlueprint.digest, registryVersion: overlay.architectureBlueprint.registryVersion } : null, stack: { adapter: overlay.stack?.adapter ?? null, adapterSupport: overlay.stack?.adapterSupport ?? null, components: (overlay.components ?? []).map((component) => ({ id: component.id, root: component.root, adapter: component.adapter, adapterVersion: component.adapterVersion ?? null, state: component.state })) }, verificationCommands: (overlay.verificationCommands ?? []).map(({ id, component, cwd, executable, args, confidence }) => ({ id, component, cwd, executable, args, confidence })), agents: (overlay.agents ?? []).map((agent) => ({ path: agent.path, scope: agent.scope, confidence: agent.confidence })), pathPolicies: { approvalRequired: overlay.pathPolicies?.approvalRequired ?? [], generatedDoNotEdit: overlay.pathPolicies?.generatedDoNotEdit ?? [] }, modules: Object.fromEntries(Object.entries(overlay.modules ?? {}).map(([name, value]) => [name, { present: Boolean(value?.present), confidence: value?.confidence ?? "unknown" }])) };
 }
 
+// This deliberately identifies controller-observed repository operations
+// separately from source-backed product evidence.  A Bootstrap claim may
+// select one of these commands, but the controller must bind it again against
+// the current overlay before any later consumer can use it.
+export function validateRepositoryVerificationReference(reference, overlay) {
+  if (!reference || typeof reference !== "object" || Array.isArray(reference) || reference.schemaVersion !== 1 || reference.source !== "project_overlay" || typeof reference.commandId !== "string" || !reference.commandId.trim() || typeof reference.overlayBaseSha !== "string" || !/^[a-f0-9]{40,64}$/i.test(reference.overlayBaseSha)) throw new Error("repository verification reference is invalid");
+  if (!overlay || overlay.schemaVersion !== OVERLAY_VERSION || typeof overlay.repository?.baseSha !== "string" || !/^[a-f0-9]{40,64}$/i.test(overlay.repository.baseSha)) throw new Error("repository verification reference has no supported current ProjectOverlay");
+  if (reference.overlayBaseSha.toLowerCase() !== overlay.repository.baseSha.toLowerCase()) throw new Error("repository verification reference overlay base SHA is stale");
+  const command = (overlay.verificationCommands ?? []).find((item) => item?.id === reference.commandId);
+  if (!command) throw new Error(`repository verification reference command '${reference.commandId}' is unavailable`);
+  return structuredClone({ schemaVersion: 1, source: "project_overlay", commandId: command.id, overlayBaseSha: overlay.repository.baseSha });
+}
+
 // Persisted overlays are untrusted input on resume.  Re-derive the immutable
 // blueprint from controller configuration and check every adapter object and
 // command instead of accepting a historic adapter name or executable path.

@@ -66,7 +66,8 @@ test("the selected adapter verification commands propagate unchanged into Produc
   try {
     const blueprint = architectureBlueprintFromProductRoots(roots, projectModeFor("greenfield")); provisionDeterministicScaffold({ worktree: root, productRoots: blueprint.components });
     const { overlay } = await generateProjectOverlay({ repository: root, baseRef: "main", project: { projectMode: projectModeFor("greenfield"), architectureBlueprint: blueprint } });
-    const manifest = generateVerificationManifest({ overlay, architectureBlueprint: blueprint, projectMode: projectModeFor("greenfield"), blueprint: { blueprintId: "fixture", requirements: [{ requirementId: "works", acceptanceCriteria: [{ criterionId: "verified" }] }] }, integration: { id: "integration", candidateSha: "a".repeat(40) } });
-    assert.deepEqual(manifest.commands.map(({ id, component, cwd, executable, args }) => ({ id, component, cwd, executable, args })), overlay.verificationCommands.map(({ id, component, cwd, executable, args }) => ({ id, component, cwd, executable, args })));
+    const selected = overlay.verificationCommands[0];
+    const manifest = generateVerificationManifest({ overlay, architectureBlueprint: blueprint, projectMode: projectModeFor("greenfield"), blueprint: { blueprintId: "fixture", requirements: [{ requirementId: "works", acceptanceCriteria: [{ criterionId: "verified", repositoryVerification: { schemaVersion: 1, source: "project_overlay", commandId: selected.id, overlayBaseSha: overlay.repository.baseSha } }] }] }, integration: { id: "integration", candidateSha: "a".repeat(40) } });
+    assert.deepEqual(manifest.commands.map(({ id, component, cwd, executable, args }) => ({ id, component, cwd, executable, args })), [{ id: selected.id, component: selected.component, cwd: selected.cwd, executable: selected.executable, args: selected.args }]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

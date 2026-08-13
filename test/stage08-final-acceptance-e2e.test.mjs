@@ -42,11 +42,12 @@ function blueprint(root) {
   const claims = canonicalizeSourceClaimExtractionCandidate(rawExtraction(root), { sourceResolver: createImportedSourceResolver({ repository: root, documentationDir: "docs/orchestration-input" }) }).claims;
   const source = inventory.files[0];
   const text = readFileSync(join(root, "docs", "orchestration-input", source.path), "utf8");
+  const overlayBaseSha = git(root, ["rev-parse", "HEAD"]);
   const requirement = (id, line, criterionId, description) => ({
     requirementId: id, type: "functional", priority: "must", mandatory: true, description,
     sourceClaimIds: [claims.find((claim) => claim.startLine === line).claimId],
     sourceRefs: [{ documentId: source.documentId, startLine: line, endLine: line, excerptDigest: sourceFragmentDigest(text, line, line) }],
-    acceptanceCriteria: [{ criterionId, description: `${description} is verified.`, verificationHint: "npm test" }], constraints: []
+    acceptanceCriteria: [{ criterionId, description: `${description} is verified.`, repositoryVerification: { schemaVersion: 1, source: "project_overlay", commandId: "package-script:test", overlayBaseSha } }], constraints: []
   });
   return { schemaVersion: 1, kind: "ProductBlueprint", blueprintId: "stage08-blueprint", createdAt: "2026-01-01T00:00:00.000Z", documentSetDigest: documentSetDigest(inventory.files), sourceDocuments: inventory.files, requirements: [requirement("writer-a-behavior", 1, "writer-a-check", "Implement behavior 1."), requirement("writer-c-behavior", 2, "writer-c-check", "Implement behavior 2."), requirement("writer-b-behavior", 3, "writer-b-check", "Implement behavior 3."), requirement("final-behavior", 4, "final-check", "Implement behavior 4.")], nfrs: [], modules: [], integrations: [], dataModel: {}, constraints: [], assumptions: [], decisions: [], unresolvedQuestions: [], contradictions: [] };
 }

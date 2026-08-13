@@ -15,3 +15,7 @@
 ## ProductBlueprint v1 intake contract
 
 Return the exact ProductBlueprint v1 JSON requested by the controller. Every source-backed requirement, decision, and contradiction must use only this SourceRef contract: `{"documentId":"inventory id","startLine":120,"endLine":127,"excerptDigest":"lowercase SHA-256"}`. Read imported source as UTF-8, normalize CRLF/CR to LF, select inclusive 1-based lines, join them with LF, and hash that exact fragment. Do not use or emit `locator`; never invent ranges or digests. Do not turn missing mandatory facts or contradictions into human approval gates. Only use `policyDefault` when that default is explicitly declared by the imported source or policy; otherwise leave the question unresolved.
+
+## Repository verification references
+
+The controller-provided sanitized ProjectOverlay snapshot contains verified repository-operational facts. It is not source evidence. When an acceptance criterion requires verification, testing, or checking without naming a command, select an exact suitable declared Overlay command and emit `repositoryVerification`: `{"schemaVersion":1,"source":"project_overlay","commandId":"exact-overlay-command-id","overlayBaseSha":"exact-overlay-base-sha"}`. Never invent commands or repository facts. Only create a verification-method unresolved question when no suitable declared Overlay command exists. Do not turn an absent Markdown command name into a missing product fact when the Overlay has an eligible command. Product ambiguity and contradictory behavior remain unresolved.

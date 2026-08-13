@@ -15,7 +15,7 @@ import { provider } from "./execution-provider-test-adapter.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 const digest = (value) => createHash("sha256").update(value.replace(/\r\n?/g, "\n")).digest("hex");
-const explicitSource = "# Requirements\nImplement `src/alpha.mjs` exporting `alpha = true`.\nImplement `src/beta.mjs` exporting `beta = true`.\nThe alpha implementation owns only `src/alpha.mjs`.\nThe beta implementation owns only `src/beta.mjs`.\nAlpha and beta have no dependency on each other.\nBoth are eligible to start concurrently.\nEach must be implemented and verified separately.\n";
+const explicitSource = "# Requirements\nImplement `src/alpha.mjs` exporting `alpha = true`.\nImplement `src/beta.mjs` exporting `beta = true`.\nThe alpha implementation owns only `src/alpha.mjs`.\nThe beta implementation owns only `src/beta.mjs`.\nAlpha and beta have no dependency on each other.\nBoth are eligible to start concurrently.\nEach task must be implemented and verified separately.\n";
 
 function explicitClaims(file) {
   const claim = (line, claimType, normalizedStatement) => ({ claimType, normalizedStatement, classification: "mandatory", sourceLocation: { documentId: file.documentId, startLine: line, endLine: line } });
@@ -26,7 +26,7 @@ function explicitClaims(file) {
     claim(5, "constraint", "Beta implementation owns only src/beta.mjs."),
     claim(6, "constraint", "Alpha and beta have no dependency on each other."),
     claim(7, "constraint", "Alpha and beta are eligible to start concurrently."),
-    claim(8, "constraint", "Alpha and beta must each be implemented and verified separately.")
+    claim(8, "constraint", "Each task must be implemented and verified separately.")
   ];
 }
 
@@ -34,12 +34,12 @@ function sourceRef(file, text, line) {
   return { documentId: file.documentId, startLine: line, endLine: line, excerptDigest: sourceFragmentDigest(text, line, line) };
 }
 
-function explicitBlueprint(file, claims) {
+function explicitBlueprint(file, claims, overlayBaseSha) {
   const claimId = (claim) => sourceClaimCandidateId({ documentId: file.documentId, startLine: claim.sourceLocation.startLine, endLine: claim.sourceLocation.endLine, claimType: claim.claimType, normalizedStatement: claim.normalizedStatement });
   const requirement = (requirementId, description, indexes, criterionId) => ({
     requirementId, type: "functional", priority: "must", mandatory: true, description,
     sourceClaimIds: indexes.map((index) => claimId(claims[index])), sourceRefs: indexes.map((index) => sourceRef(file, explicitSource, claims[index].sourceLocation.startLine)),
-    acceptanceCriteria: [{ criterionId, description, verificationHint: "npm test" }], constraints: []
+    acceptanceCriteria: [{ criterionId, description, repositoryVerification: { schemaVersion: 1, source: "project_overlay", commandId: "package-script:test", overlayBaseSha } }], constraints: []
   });
   return {
     schemaVersion: 1, kind: "ProductBlueprint", blueprintId: "pb-g2g3-explicit", createdAt: "2026-01-01T00:00:00.000Z", documentSetDigest: documentSetDigest([file]), sourceDocuments: [file],
@@ -86,10 +86,11 @@ function setupExplicitFixture() {
   writeFileSync(join(root, "package.json"), JSON.stringify({ private: true, packageManager: "npm@10", scripts: { test: "node --test" } })); writeFileSync(join(root, "package-lock.json"), "{}"); git(root, ["add", "package.json", "package-lock.json", "raw-requirements/requirements.md"]); git(root, ["-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "base"]);
   const extraction = { schemaVersion: 1, kind: "SourceClaimExtractionCandidate", claims };
   const audit = { decisions: claims.map((claim) => ({ claimId: sourceClaimCandidateId({ documentId: file.documentId, startLine: claim.sourceLocation.startLine, endLine: claim.sourceLocation.endLine, claimType: claim.claimType, normalizedStatement: claim.normalizedStatement }), decision: "admitted", classification: "mandatory", reasonCodes: ["explicit_fixture_constraint"] })) };
-  const client = new DeterministicG2G3Client({ extraction, audit, blueprint: explicitBlueprint(file, claims), plan: explicitPlan() });
+  const overlayBaseSha = git(root, ["rev-parse", "main"]);
+  const client = new DeterministicG2G3Client({ extraction, audit, blueprint: explicitBlueprint(file, claims, overlayBaseSha), plan: explicitPlan() });
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: role === "backend" ? "workspace-write" : "read-only", approvalPolicy: "never", tokenBudget: 4_000, interruptThresholdTokens: 3_500, usesWorktree: role === "backend" }]));
   const config = { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fixture", project: { name: "g2g3-explicit", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", projectMode: { schemaVersion: 1, kind: "ProjectMode", mode: "greenfield" }, productRoots: [] }, router: { maxConcurrentTasks: 2, maxChildrenPerTask: 12, maxDelegationDepth: 5, maxPlanTasks: 8, defaultParentBudget: 20_000, turnTimeoutMs: 1_000, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: true, autoCreatePullRequest: true, autoMerge: true }, budget: { weeklyTokenLimit: 100_000, weeklyWindowDays: 7, hardRunTokenLimit: 90_000, interruptSafetyMarginTokens: 1_000, enforceLocalLimits: false }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxWaves: 2 }, remote: { enabled: false, remoteName: "origin", allowedRemotes: ["origin"], candidateBranchPrefix: "swarm/candidate/", requireCi: false, mergeMethod: "merge" }, roles, executionProviderFactory: () => provider(client) };
-  return { root, source, file, claims, client, router: new SwarmRouter(config) };
+  return { root, source, file, claims, client, overlayBaseSha, router: new SwarmRouter(config) };
 }
 
 test("G2/G3 explicit source fixture admits canonical intake and plans two parallel-eligible writers without controller semantic inference", async () => {
@@ -107,6 +108,8 @@ test("G2/G3 explicit source fixture admits canonical intake and plans two parall
     const audit = fx.router.store.sourceClaimAudit(run.sourceClaimAuditId).audit;
     assert.deepEqual(manifest.claims.map((claim) => claim.sourceRefs[0].startLine).sort((a, b) => a - b), [2, 3, 4, 5, 6, 7, 8]);
     assert.deepEqual(audit.decisions.map((decision) => [decision.decision, decision.classification, decision.reasonCodes]).sort((left, right) => left[2][0].localeCompare(right[2][0])), Array.from({ length: 7 }, () => ["admitted", "mandatory", ["explicit_fixture_constraint"]]));
+    const persistedBlueprint = fx.router.store.productBlueprint(fx.router.store.deliveryRun(run.id).blueprintId).blueprint;
+    assert.deepEqual(persistedBlueprint.requirements.flatMap((requirement) => requirement.acceptanceCriteria.map((criterion) => criterion.repositoryVerification)), Array.from({ length: 3 }, () => ({ schemaVersion: 1, source: "project_overlay", commandId: "package-script:test", overlayBaseSha: fx.overlayBaseSha })));
     const planner = fx.router.list().find((task) => task.role === "planner"); const writers = fx.router.list().filter((task) => task.role === "backend" && ["Implement alpha", "Implement beta"].includes(task.title)).sort((left, right) => left.title.localeCompare(right.title));
     assert.equal(writers.length, 2, JSON.stringify({ run: fx.router.store.deliveryRun(run.id), tasks: fx.router.list().map((task) => ({ role: task.role, title: task.title, status: task.status, error: task.error })) })); assert.deepEqual(writers.map((task) => [task.title, task.allowedPaths, task.requirementIds]), [["Implement alpha", ["src/alpha.mjs"], ["alpha-implementation", "independent-delivery"]], ["Implement beta", ["src/beta.mjs"], ["beta-implementation"]]]);
     assert.ok(writers.every((task) => task.status === "queued" && task.executionReleaseState === "pending"));

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { relative, resolve, sep } from "node:path";
-import { assertProjectOverlayAdapterIntegrity, commandCwd, loadProjectOverlay } from "./project-overlay.mjs";
+import { assertProjectOverlayAdapterIntegrity, commandCwd, loadProjectOverlay, validateRepositoryVerificationReference } from "./project-overlay.mjs";
 import { assertAdapterVerificationCommand } from "./stack-adapter.mjs";
 
 const SHA = /^[a-f0-9]{40,64}$/i;
@@ -55,14 +55,19 @@ function allowedCommand(command, overlay, architectureBlueprint = null, projectM
 // criterion mapping per acceptance criterion.
 export function generateVerificationManifest({ overlay, blueprint, integration, architectureBlueprint = null, projectMode = null }) {
   if (!overlay || overlay.schemaVersion !== 1 || !blueprint?.blueprintId || !SHA.test(integration?.candidateSha ?? "") || !stable(integration?.id)) throw new Error("VerificationManifest requires a supported ProjectOverlay, blueprint, and candidate integration manifest");
-  const criteria = blueprint.requirements.flatMap((requirement) => (requirement.acceptanceCriteria ?? []).map((criterion) => ({ requirementId: requirement.requirementId, criterionId: criterion.criterionId })));
-  const commands = overlay.verificationCommands ?? [];
+  const criteria = blueprint.requirements.flatMap((requirement) => (requirement.acceptanceCriteria ?? []).map((criterion) => ({ requirementId: requirement.requirementId, criterionId: criterion.criterionId, repositoryVerification: criterion.repositoryVerification })));
+  const declared = new Map((overlay.verificationCommands ?? []).map((command) => [command.id, command]));
+  const references = criteria.map((criterion) => {
+    try { return validateRepositoryVerificationReference(criterion.repositoryVerification, overlay); }
+    catch (error) { throw new Error(`VerificationManifest criterion '${criterion.requirementId}:${criterion.criterionId}' ${error.message}`); }
+  });
+  const commands = [...new Map(references.map((reference) => [reference.commandId, declared.get(reference.commandId)])).values()];
   if (!criteria.length || !commands.length || commands.some((command) => !allowedCommand(command, overlay, architectureBlueprint, projectMode))) throw new Error("VerificationManifest has no supported allowlisted product verification commands");
   const seenCommands = new Set();
   if (commands.some((command) => seenCommands.has(command.id) || !seenCommands.add(command.id))) throw new Error("VerificationManifest contains duplicate command ids");
   const mappings = criteria.map((criterion, index) => {
-    const command = commands[index % commands.length];
-    return { ...criterion, commandId: command.id, testId: `product/${command.id}/${criterion.requirementId}/${criterion.criterionId}` };
+    const reference = references[index]; const command = declared.get(reference.commandId);
+    return { requirementId: criterion.requirementId, criterionId: criterion.criterionId, repositoryVerification: reference, commandId: command.id, testId: `product/${command.id}/${criterion.requirementId}/${criterion.criterionId}` };
   });
   const seenMappings = new Set();
   if (mappings.some((mapping) => seenMappings.has(`${mapping.requirementId}:${mapping.criterionId}`) || !seenMappings.add(`${mapping.requirementId}:${mapping.criterionId}`))) throw new Error("VerificationManifest contains duplicate criterion mappings");
