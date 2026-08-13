@@ -134,7 +134,13 @@ export class AppServerClient extends EventEmitter {
     const key = `${threadId}:${turnId}`;
     const existing = this.terminalReadAttempts.get(key);
     if (existing) return existing;
-    const attempt = this.readThread({ threadId, includeTurns: true }, { timeoutMs }).then((result) => {
+    // A process exit invalidates the primary transport.  A newly connected
+    // App Server may still read the durable terminal state, and this remains
+    // a read-only, bounded, one-attempt recovery path.
+    const read = this.process.exited
+      ? this.independentThreadRead({ threadId, turnId, timeoutMs })
+      : this.readThread({ threadId, includeTurns: true }, { timeoutMs });
+    const attempt = Promise.resolve(read).then((result) => {
       const terminal = this.#terminalTurnFromThread(result, threadId, turnId);
       return { terminal: terminal?.turn ?? null, summary: {
         available: true, threadId: result?.thread?.id ?? threadId, turnId,

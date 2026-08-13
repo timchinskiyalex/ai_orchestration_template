@@ -12,12 +12,20 @@ import { ingestDocumentation } from "../src/project-intake.mjs";
 import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
 import { sourceFragmentDigest } from "../src/source-evidence.mjs";
 import { fakeBlueprint } from "./product-blueprint-fixture.mjs";
+import { deterministicScaffoldFixtureRouterConfig, parseLiveE2eWorkers, selectLiveE2eFailureTask } from "../src/live-e2e-contract.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 const enabled = process.env.RUN_REAL_CODEX_E2E === "1";
 const timeoutMs = Number(process.env.CODEX_E2E_TIMEOUT_MS ?? 240_000);
+const workerCount = parseLiveE2eWorkers(process.env.CODEX_E2E_WORKERS ?? 1);
 const reporter = process.env.E2E_REPORT_DIR ? openE2eRunReporter(process.env.E2E_REPORT_DIR) : null;
 const productRoots = [{ id: "frontend", path: "frontend", adapter: "next-node" }, { id: "backend", path: "backend", adapter: "dotnet" }];
+
+test("live E2E fixture receives the CLI worker count", { skip: process.env.CODEX_E2E_WORKER_CONFIG_PROBE === "1" ? false : "worker propagation probe only" }, () => {
+  const router = deterministicScaffoldFixtureRouterConfig({ workers: workerCount, timeoutMs });
+  assert.equal(router.maxConcurrentTasks, workerCount);
+  console.log(`worker-config-probe fixture.maxConcurrentTasks=${router.maxConcurrentTasks}`);
+});
 
 test("real App Server controlled E2E: deterministic scaffold, parallel writers, controller QA, and integration", { skip: enabled ? false : "set RUN_REAL_CODEX_E2E=1 to intentionally spend account quota" }, async () => {
   assert.equal(Number.isInteger(timeoutMs) && timeoutMs >= 1_000, true, "CODEX_E2E_TIMEOUT_MS must be an integer of at least 1000");
@@ -42,8 +50,8 @@ test("real App Server controlled E2E: deterministic scaffold, parallel writers, 
     // This E2E isolates successful controller lifecycle integration. The
     // quota-free suite separately exercises enforced thresholds and delayed
     // usage interrupts; the upstream protocol has no server-side turn cap.
-    router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: process.env.CODEX_E2E_MODEL ?? "gpt-5.6-terra", project: { name: "disposable-greenfield-e2e", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", projectMode: { schemaVersion: 1, kind: "ProjectMode", mode: "greenfield" }, productRoots }, router: { maxConcurrentTasks: 2, maxChildrenPerTask: 12, maxDelegationDepth: 3, maxPlanTasks: 8, defaultParentBudget: 120_000, turnTimeoutMs: timeoutMs, approvalMode: "deny" }, autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: false, autoCreatePullRequest: false, autoMerge: false, maxRemediationRounds: 1 }, budget: { weeklyTokenLimit: 180_000, weeklyWindowDays: 7, hardRunTokenLimit: 150_000, interruptSafetyMarginTokens: 1_000, enforceLocalLimits: false }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 1, shutdownGraceMs: 3_000 }, remote: { enabled: false, remoteName: "origin", allowedRemotes: ["origin"], candidateBranchPrefix: "swarm/candidate/", requireCi: false, mergeMethod: "merge" }, roles });
-    router.on("lifecycle", (event) => { lifecycle.push(event); progress(event.type, event); });
+    router = new SwarmRouter({ repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: process.env.CODEX_E2E_MODEL ?? "gpt-5.6-terra", project: { name: "disposable-greenfield-e2e", documentationDir: "docs/orchestration-input", generatedDir: "docs/orchestration-generated", projectMode: { schemaVersion: 1, kind: "ProjectMode", mode: "greenfield" }, productRoots }, router: deterministicScaffoldFixtureRouterConfig({ workers: workerCount, timeoutMs }), autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true, autoPush: false, autoCreatePullRequest: false, autoMerge: false, maxRemediationRounds: 1 }, budget: { weeklyTokenLimit: 180_000, weeklyWindowDays: 7, hardRunTokenLimit: 150_000, interruptSafetyMarginTokens: 1_000, enforceLocalLimits: false }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, delivery: { maxRemediationRounds: 1, shutdownGraceMs: 3_000 }, remote: { enabled: false, remoteName: "origin", allowedRemotes: ["origin"], candidateBranchPrefix: "swarm/candidate/", requireCi: false, mergeMethod: "merge" }, roles });
+    router.on("lifecycle", (event) => { lifecycle.push(event); if (event.taskId) currentTaskId = event.taskId; progress(event.type, event); });
     await router.ensureProjectOverlay(); ingestDocumentation({ source, repository: root, destinationRelative: "docs/orchestration-input" });
     const manifestId = router.sourceClaimManifestIdentity();
     const run = router.createDeliveryRun({ id: "real-greenfield-e2e", source, bootstrapTaskId: null, sourceClaimInputMode: "supplied", sourceClaimManifestId: manifestId, projectMode: router.projectMode, repositoryMode: "greenfield" });
@@ -60,12 +68,18 @@ test("real App Server controlled E2E: deterministic scaffold, parallel writers, 
       if (execution.blockedBudget) throw new Error("blocked_budget: the controlled E2E reached its configured local guardrail");
       if (execution.failed || execution.interrupted) throw new Error("controlled E2E worker lifecycle did not reach a successful terminal state");
     }, diagnostics: (runtime) => formatE2eDiagnostics({ stage: "workers", taskId: currentTaskId, task: router.store.getTask(currentTaskId), runtime }), onTimeout: async () => { const diagnostics = await router.collectTaskDiagnostics(currentTaskId); reporter?.setDiagnostics(diagnostics); await router.requestShutdown("interrupted_controller_exit: controlled E2E timeout"); return diagnostics; } });
+    const allTasks = router.list();
+    const scaffoldReviews = allTasks.filter((task) => task.sourceWriterTaskId === scaffold.id);
     const tasks = [scaffold, frontend, backend].map((task) => router.store.getTask(task.id));
     assert.equal(tasks.every((task) => task.status === "done"), true, "all deterministic scaffold and writer tasks must pass");
+    assert.deepEqual(scaffoldReviews.map((task) => task.role), ["security", "qa"], "deterministic scaffold must retain its explicit controller-local Security -> QA chain");
+    assert.equal(scaffoldReviews.every((task) => router.store.getTask(task.id).status === "done"), true, "controller-local scaffold reviews must pass before writers are released");
     assert.equal(router.store.workerArtifact(scaffold.id) !== null, true);
     assert.equal(lifecycle.some((event) => event.type === "turn started" && event.taskId === scaffold.id), false, "scaffold must not spend an App Server turn");
-    assert.equal(lifecycle.filter((event) => event.type === "turn started" && [frontend.id, backend.id].includes(event.taskId)).length, 2, "only frontend/backend writer turns are real App Server implementation turns");
-    assertObservedParallelTurns(lifecycle, 2);
+    assert.equal(lifecycle.some((event) => event.type === "turn started" && scaffoldReviews.some((task) => task.id === event.taskId)), false, "controller-local scaffold reviews must not spend App Server turns");
+    const startedRoles = lifecycle.filter((event) => event.type === "turn started").map((event) => router.store.getTask(event.taskId)?.role).sort();
+    assert.deepEqual(startedRoles, ["backend", "frontend", "qa", "qa", "security", "security"], "the live fixture must start exactly the two writer and four provider-owned review turns");
+    if (workerCount >= 2) assertObservedParallelTurns(lifecycle, 2);
     const artifacts = [scaffold, frontend, backend].map((task) => router.store.workerArtifact(task.id));
     assert.equal(artifacts.every((artifact) => artifact.verificationResults.every((result) => result.status === "passed")), true, "controller QA verification must pass for every artifact");
     progress("controller QA/local verification passed");
@@ -75,9 +89,10 @@ test("real App Server controlled E2E: deterministic scaffold, parallel writers, 
     reporter?.finalize({ status: "passed", task: router.store.getTask(frontend.id), artifact: router.store.workerArtifact(frontend.id), integration, diagnostics: router.appServerDiagnostics() });
     succeeded = true;
   } catch (error) {
-    const task = currentTaskId && router ? router.store.getTask(currentTaskId) : null;
+    const task = router ? selectLiveE2eFailureTask(router.list(), currentTaskId) : null;
     const delivery = router?.activeDeliveryRunId ? router.store.deliveryRun(router.activeDeliveryRunId) : null;
-    reporter?.finalize({ status: "failed", task, integration, diagnostics: { appServer: router?.appServerDiagnostics(), primaryFailure: delivery?.recovery?.primaryFailure ?? null, dependencyDeadlocks: router ? router.store.db.prepare("SELECT outcome_json AS outcome FROM dependency_deadlocks").all().map((item) => JSON.parse(item.outcome)) : [] }, error, recoveryRoot: root, recoveryAction: `Preserved disposable E2E root: ${root}` });
+    const diagnostics = task && router ? await router.collectTaskDiagnostics(task.id) : router?.appServerDiagnostics();
+    reporter?.finalize({ status: "failed", task, integration, diagnostics: { ...diagnostics, primaryFailure: delivery?.recovery?.primaryFailure ?? null, dependencyDeadlocks: router ? router.store.db.prepare("SELECT outcome_json AS outcome FROM dependency_deadlocks").all().map((item) => JSON.parse(item.outcome)) : [] }, error, recoveryRoot: root, recoveryAction: `Preserved disposable E2E root: ${root}` });
     throw error;
   } finally {
     try { router?.stop(); router?.close(); } catch { /* preserve the primary result */ }

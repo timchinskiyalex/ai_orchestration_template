@@ -78,7 +78,9 @@ The controller root is not a product root. Configure allowlisted product roots:
 ]
 ```
 
-Greenfield repositories are valid before either root exists. Planner must create `scaffold-product`; every product task directly depends on it. After scaffold, the controller refreshes the ProjectOverlay from the scaffold worktree. Frontend verification runs only declared scripts in `frontend/package.json`; backend verification runs allowlisted `dotnet test` against the discovered solution/project in `backend/`. A scaffolded component without a declared/allowlisted verification command blocks integration rather than passing empty QA.
+Greenfield repositories are valid before either root exists. Planner must create `scaffold-product`; every product task directly depends on it. The controller deterministically creates the roots, finalizes its artifact, then performs an explicit controller-local Security → QA chain before releasing that artifact to frontend/backend writers. Those scaffold review tasks never start an App Server turn; QA runs the same declared frontend and backend verification commands. After release, the controller refreshes the ProjectOverlay from the scaffold worktree. Frontend verification runs only declared scripts in `frontend/package.json`; backend verification runs allowlisted `dotnet test` against the discovered solution/project in `backend/`. A scaffolded component without a declared/allowlisted verification command blocks integration rather than passing empty QA.
+
+`npm run e2e:live -- --confirm-spend-quota --workers N` accepts `N` from 1 through 10 and applies it to the deterministic-scaffold live fixture scheduler's `maxConcurrentTasks`. `--workers 1` is sequential and makes no parallelism assertion; use `--workers 2` or higher when asserting parallel writer turns. `npm run e2e:live -- --verify-worker-config --workers N` is a quota-free propagation check.
 
 ### Stack adapters (Stage 07)
 

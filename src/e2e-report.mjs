@@ -23,14 +23,60 @@ function safeTask(task) {
   return { id: task.id ?? null, status: task.status ?? null, threadId: task.threadId ?? null, turnId: task.turnId ?? null, worktree: task.worktree ?? null };
 }
 
+function safeProcess(process = null) {
+  if (!process || typeof process !== "object") return null;
+  return {
+    alive: process.alive === true,
+    exited: process.exited === true,
+    code: process.code != null && Number.isFinite(Number(process.code)) ? Number(process.code) : null,
+    signal: typeof process.signal === "string" ? bounded(process.signal, 80) : null
+  };
+}
+
+function safeProtocolEvent(event) {
+  if (!event || typeof event !== "object") return null;
+  return {
+    timestamp: event.timestamp ?? null, direction: event.direction ?? null, method: event.method ?? null,
+    threadId: event.threadId ?? null, turnId: event.turnId ?? null,
+    requestedTurnId: event.requestedTurnId ?? null, resolvedTurnId: event.resolvedTurnId ?? null,
+    itemType: event.itemType ?? null, itemStatus: event.itemStatus ?? null,
+    errorCode: event.errorCode ?? null, errorMessage: redact(event.errorMessage)
+  };
+}
+
+function safeLifecycleEvent(event) {
+  if (!event || typeof event !== "object") return null;
+  return {
+    timestamp: event.timestamp ?? null, type: event.type ?? null, taskId: event.taskId ?? null,
+    threadId: event.threadId ?? null, turnId: event.turnId ?? null, itemStatus: event.itemStatus ?? null,
+    errorCode: event.errorCode ?? null, taxonomy: event.taxonomy ?? null
+  };
+}
+
 function safeDiagnostics(runtime = null) {
   if (!runtime) return null;
+  const appServer = runtime.appServer?.appServer ?? runtime.appServer ?? null;
+  const processExit = runtime.processExit ?? appServer?.processExit ?? null;
   return {
-    threadRead: runtime.threadRead ?? null,
-    process: runtime.appServer?.process ?? null,
-    stderrTail: runtime.appServer?.stderrTail ?? "",
-    protocolEvents: (runtime.appServer?.protocolEvents ?? []).slice(-100),
-    lifecycleEvents: (runtime.lifecycleEvents ?? []).slice(-100)
+    task: safeTask(runtime.task),
+    threadRead: runtime.threadRead ? {
+      available: runtime.threadRead.available === true, source: runtime.threadRead.source ?? null,
+      threadId: runtime.threadRead.threadId ?? null, turnId: runtime.threadRead.turnId ?? null,
+      turnStatus: runtime.threadRead.turnStatus ?? null, resultAvailable: runtime.threadRead.resultAvailable === true,
+      reason: redact(runtime.threadRead.reason), error: redact(runtime.threadRead.error)
+    } : null,
+    process: safeProcess(appServer?.process ?? processExit?.process ?? processExit?.processExit ?? null),
+    stderrTail: redact(appServer?.stderrTail ?? ""),
+    protocolEvents: (appServer?.protocolEvents ?? []).slice(-100).map(safeProtocolEvent).filter(Boolean),
+    lifecycleEvents: (runtime.lifecycleEvents ?? []).slice(-100).map(safeLifecycleEvent).filter(Boolean),
+    primaryFailure: runtime.primaryFailure ? {
+      taxonomy: runtime.primaryFailure.taxonomy ?? null,
+      providerErrorCode: runtime.primaryFailure.providerErrorCode ?? null,
+      recoveryState: runtime.primaryFailure.recoveryState ?? null,
+      activeTasks: Array.isArray(runtime.primaryFailure.activeTasks)
+        ? runtime.primaryFailure.activeTasks.slice(-10).map((task) => ({ taskId: task?.taskId ?? null, threadId: task?.threadId ?? null, turnId: task?.turnId ?? null, status: task?.status ?? null }))
+        : []
+    } : null
   };
 }
 

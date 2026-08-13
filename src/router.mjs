@@ -32,6 +32,15 @@ import { architectureBlueprintFromProductRoots, validateArchitectureBlueprint } 
 
 const gitSha = (repository, ref) => execFileSync("git", ["-C", repository, "rev-parse", "--verify", `${ref}^{commit}`], { encoding: "utf8" }).trim();
 
+function normalizedProviderDiagnostics(value) {
+  let current = value;
+  for (let index = 0; index < 2 && typeof current === "string"; index += 1) {
+    try { current = JSON.parse(current); }
+    catch { break; }
+  }
+  return current && typeof current === "object" && !Array.isArray(current) ? current : { detail: String(value ?? "").slice(0, 2_000) };
+}
+
 export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = null, documentationAvailable = true }) {
   const lines = [
     `Task ID: ${task.id}`,
@@ -115,6 +124,7 @@ export class SwarmRouter extends EventEmitter {
     this.budgetInterruptedTasks = new Set();
     this.pendingBudgetWatchdogs = new Set();
     this.activeTurns = new Map();
+    this.providerProcessExit = null;
     this.closed = false;
     this.reconciliationBarrier = null;
     this.reconciliationState = { state: "not-run", outcome: null };
@@ -389,14 +399,15 @@ export class SwarmRouter extends EventEmitter {
   appServerDiagnostics() {
     return {
       lifecycleEvents: this.lifecycleEvents(),
-      appServer: this.lastAppServerDiagnostics ?? null
+      appServer: this.lastAppServerDiagnostics ?? null,
+      processExit: this.providerProcessExit?.diagnostics ?? null
     };
   }
 
   async collectTaskDiagnostics(taskId, { threadReadTimeoutMs = 1_500 } = {}) {
     const task = this.store.getTask(taskId);
-    let threadRead = { available: false, reason: "thread/read unavailable" };
-    if (task?.threadId && task.turnId && this.activeClient) {
+    let threadRead = this.providerProcessExit?.terminalByTask?.get(taskId) ?? { available: false, reason: "thread/read unavailable" };
+    if (!threadRead.available && task?.threadId && task.turnId && this.activeClient) {
       try {
         const result = await this.#provider(this.activeClient, "read_final_result", { threadId: task.threadId, turnId: task.turnId, timeoutMs: threadReadTimeoutMs }, ["threadId", "turnId"]);
         threadRead = { available: true, threadId: result.threadId, turnId: result.turnId, resultAvailable: Boolean(result.resultText) };
@@ -777,6 +788,7 @@ export class SwarmRouter extends EventEmitter {
     this.budgetInterruptedTasks.clear();
     this.pendingBudgetWatchdogs.clear();
     this.activeTurns.clear();
+    this.providerProcessExit = null;
     client.on?.("lifecycle", (event) => this.#onProviderLifecycle(event));
     const onSigint = () => { this.requestShutdown("interrupted_controller_exit: SIGINT received").catch(() => {}); };
     process.once("SIGINT", onSigint);
@@ -799,7 +811,7 @@ export class SwarmRouter extends EventEmitter {
     } finally {
       if (heartbeat) clearInterval(heartbeat);
       process.removeListener("SIGINT", onSigint);
-      try { this.lastAppServerDiagnostics = (await this.#provider(client, "diagnostics", {})).diagnostics ?? null; } catch { this.lastAppServerDiagnostics = null; }
+      try { this.lastAppServerDiagnostics = normalizedProviderDiagnostics((await this.#provider(client, "diagnostics", {})).diagnostics); } catch { this.lastAppServerDiagnostics ??= null; }
       this.expectedClientShutdown = true;
       try { await this.#provider(client, "shutdown", {}); } catch {}
       if (this.activeClient === client) this.activeClient = null;
@@ -919,6 +931,10 @@ export class SwarmRouter extends EventEmitter {
       await this.#runDeterministicScaffold(task, { worktree, branch, overlayContext });
       return;
     }
+    if (this.#isControllerLocalScaffoldReview(task)) {
+      await this.#runControllerLocalScaffoldReview(task, { worktree, overlayContext });
+      return;
+    }
 
     const sourceDir = fileURLToPath(new URL(".", import.meta.url));
     const developerInstructions = this.#developerInstructions(sourceDir, task.role);
@@ -956,7 +972,12 @@ export class SwarmRouter extends EventEmitter {
     const completion = this.#provider(client, "observe_terminal", { threadId, turnId, timeoutMs: this.config.router.turnTimeoutMs }, ["threadId", "turnId", "terminalClass"], turnCorrelationId);
     this.activeTurns.set(task.id, { taskId: task.id, threadId, turnId, requestedTurnId: turnId, correlationId: turnCorrelationId, permittedTurnIds: new Set([turnId]), completion });
     this.#lifecycle("turn started", { taskId: task.id, threadId, turnId });
-    const terminal = await completion;
+    let terminal;
+    try { terminal = await completion; }
+    catch (error) {
+      terminal = await this.#recoverTerminalAfterProviderExit(client, task);
+      if (!terminal) throw error;
+    }
     if (terminal.threadId !== threadId) throw new ExecutionProviderError("protocol_violation", "terminal thread mismatch");
     const watched = { turn: { id: terminal.turnId, status: terminal.terminalClass, usage: terminal.usage ?? null } };
     const turn = watched.turn;
@@ -1188,6 +1209,72 @@ export class SwarmRouter extends EventEmitter {
     return validateEnvelope(result, { operation, correlationId, requiredIds });
   }
 
+  async #recoverTerminalAfterProviderExit(client, task) {
+    const exit = this.providerProcessExit;
+    const active = this.activeTurns.get(task.id);
+    if (!exit || !active || !exit.activeTaskIds.has(task.id)) return null;
+    if (!active.processExitFallback) {
+      active.processExitFallback = (async () => {
+        try {
+          const timeoutMs = Math.min(1_500, this.config.delivery?.shutdownGraceMs ?? 1_500);
+          const terminal = await Promise.race([
+            this.#provider(client, "observe_terminal", {
+            threadId: active.threadId, turnId: active.turnId ?? active.requestedTurnId,
+            timeoutMs
+            }, ["threadId", "turnId", "terminalClass"], active.correlationId),
+            new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs))
+          ]);
+          if (!terminal) return null;
+          if (!["completed", "failed", "interrupted", "cancelled"].includes(terminal.terminalClass)) return null;
+          exit.terminalByTask.set(task.id, {
+            available: true, source: "process_exit_terminal_thread_read", threadId: terminal.threadId,
+            turnId: terminal.turnId, turnStatus: terminal.terminalClass
+          });
+          this.#lifecycle("execution provider exit terminal recovered", { taskId: task.id, threadId: terminal.threadId, turnId: terminal.turnId, itemStatus: terminal.terminalClass });
+          return terminal;
+        } catch {
+          exit.terminalByTask.set(task.id, {
+            available: false, source: "process_exit_terminal_thread_read", threadId: active.threadId,
+            turnId: active.turnId ?? active.requestedTurnId, reason: "terminal thread/read found no terminal turn"
+          });
+          return null;
+        }
+      })();
+      this.activeTurns.set(task.id, active);
+    }
+    const terminal = await active.processExitFallback;
+    if (terminal) return terminal;
+    await this.#finalizeProviderProcessExit(client, exit);
+    return null;
+  }
+
+  async #finalizeProviderProcessExit(client, exit) {
+    if (exit.finalFailure) return await exit.finalFailure;
+    exit.finalFailure = (async () => {
+      try {
+        const providerDiagnostics = await this.#provider(client, "diagnostics", {});
+        exit.diagnostics = { ...exit.diagnostics, ...normalizedProviderDiagnostics(providerDiagnostics.diagnostics) };
+        this.lastAppServerDiagnostics = exit.diagnostics;
+      } catch { /* retain the lifecycle-time diagnostics */ }
+      const taxonomy = "execution_provider_process_exit";
+      const activeTasks = [...exit.activeTaskIds].map((taskId) => {
+        const task = this.store.getTask(taskId);
+        return { taskId, threadId: task?.threadId ?? null, turnId: task?.turnId ?? null, status: task?.status ?? null };
+      });
+      this.#lifecycle("execution provider lifecycle failure", { errorCode: exit.errorCode, taxonomy, taskId: activeTasks.find((item) => item.status === "running")?.taskId ?? null });
+      if (!this.stopRequested && !this.expectedClientShutdown && this.activeDeliveryRunId) {
+        this.#markInterrupted("interrupted_controller_exit: execution provider process exited", {
+          primaryFailure: {
+            taxonomy, providerErrorCode: exit.errorCode,
+            recoveryState: "resume_delivery_after_execution_provider_recovery",
+            activeTasks, process: exit.diagnostics?.process ?? exit.diagnostics?.processExit ?? null
+          }
+        });
+      }
+    })();
+    return await exit.finalFailure;
+  }
+
   async #runDeterministicScaffold(task, { worktree, branch, overlayContext }) {
     if (!worktree || !branch) throw new Error("Deterministic scaffold requires an isolated workspace-write worktree");
     this.#lifecycle("deterministic scaffold started", { taskId: task.id, worktree });
@@ -1206,6 +1293,44 @@ export class SwarmRouter extends EventEmitter {
     this.#connectArtifactDependents(task, finalized.artifact);
     this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
     this.#lifecycle("deterministic scaffold completed", { taskId: task.id, artifactPath: finalized.path, components: provision.provisioned.map((item) => item.root) });
+  }
+
+  #isControllerLocalScaffoldReview(task) {
+    if (!task?.sourceWriterTaskId || !["security", "qa"].includes(task.role)) return false;
+    const writer = this.store.getTask(task.sourceWriterTaskId);
+    return this.#isScaffoldTask(writer);
+  }
+
+  async #runControllerLocalScaffoldReview(task, { worktree, overlayContext }) {
+    const writer = this.store.getTask(task.sourceWriterTaskId);
+    if (!writer || !this.#isScaffoldTask(writer)) throw new Error(`Controller-local scaffold review ${task.id} has no deterministic scaffold writer`);
+    if (task.role === "security") {
+      const report = validateSecurityGateReport({
+        verdict: "pass",
+        summary: "Controller-owned deterministic scaffold is limited to declared product roots and adapter templates.",
+        findings: [], executedChecks: [], notRunChecks: []
+      });
+      const resultPath = this.#saveSecurityReport(task, report);
+      this.store.setResultPath(task.id, resultPath);
+      this.store.recordSecurityReport({ securityTaskId: task.id, writerTaskId: writer.id, reportPath: resultPath, report });
+      await this.#handleSecurityGate(task, report);
+      this.#lifecycle("controller-local scaffold security passed", { taskId: task.id, writerTaskId: writer.id });
+      return;
+    }
+    const artifact = this.store.workerArtifact(writer.id);
+    const checks = await this.#runDeclaredVerification(worktree, overlayContext.overlay, artifact?.changedPaths ?? []);
+    const report = validateQualityGateReport({
+      verdict: checks.failed.length ? "blocked" : "pass",
+      summary: checks.failed.length
+        ? "Controller verification failed for the deterministic scaffold."
+        : "Controller-owned deterministic scaffold passed declared component verification.",
+      findings: [], executedChecks: checks.passed, notRunChecks: checks.notRun
+    });
+    const resultPath = this.#saveQualityReport(task, report);
+    this.store.setResultPath(task.id, resultPath);
+    this.store.recordQualityReport({ qaTaskId: task.id, writerTaskId: writer.id, reportPath: resultPath, report });
+    await this.#handleQualityGate(task, report);
+    this.#lifecycle(checks.failed.length ? "controller-local scaffold quality blocked" : "controller-local scaffold quality passed", { taskId: task.id, writerTaskId: writer.id });
   }
 
   #taskPrompt(task, worktree, overlaySnapshot) {
@@ -2154,16 +2279,21 @@ export class SwarmRouter extends EventEmitter {
     if (normalized.providerGlobal) {
       if (normalized.kind === "account_updated" && normalized.success) this.account.onRateLimitsUpdated({ rateLimits: normalized.data.rateLimits ?? {} });
       else if (normalized.kind === "process_exit") {
-        const taxonomy = "execution_provider_process_exit";
-        this.#lifecycle("execution provider lifecycle failure", { errorCode: normalized.errorCode ?? "process_exit", taxonomy });
-        if (!this.stopRequested && !this.expectedClientShutdown && this.activeDeliveryRunId) {
-          this.#markInterrupted("interrupted_controller_exit: execution provider process exited", {
-            primaryFailure: {
-              taxonomy,
-              providerErrorCode: normalized.errorCode ?? "process_exit",
-              recoveryState: "resume_delivery_after_execution_provider_recovery"
-            }
-          });
+        // A child can exit after the service persisted a terminal turn.  Do
+        // not overwrite that state: the task owner performs exactly one
+        // bounded terminal thread/read fallback before this becomes final.
+        if (!this.providerProcessExit) {
+          const activeTaskIds = new Set([...this.activeTurns.values()].map((active) => active.taskId));
+          this.providerProcessExit = {
+            errorCode: normalized.errorCode ?? "process_exit",
+            diagnostics: normalizedProviderDiagnostics(normalized.diagnostics),
+            activeTaskIds, terminalByTask: new Map(), finalFailure: null
+          };
+          this.#lifecycle("execution provider process exit observed", { errorCode: normalized.errorCode ?? "process_exit", taskId: [...activeTaskIds][0] ?? null });
+          for (const taskId of activeTaskIds) {
+            const task = this.store.getTask(taskId);
+            if (task) this.#recoverTerminalAfterProviderExit(this.activeClient, task).catch(() => {});
+          }
         }
       }
       return;

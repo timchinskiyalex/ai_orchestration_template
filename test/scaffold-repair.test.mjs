@@ -18,14 +18,14 @@ const productRoots = [{ id: "frontend", path: "frontend", adapter: "next-node" }
 const fakeProcessRunner = async ({ executable, args }) => ({ pid: 4242, executable, args, stdout: "deterministic verification passed", stderr: "", code: 0, signal: null });
 
 class DeterministicLifecycleClient extends EventEmitter {
-  constructor() { super(); this.next = 0; this.threads = new Map(); this.scaffoldTurnStarts = 0; this.activeWriters = 0; this.maxActiveWriters = 0; this.writerBarrier = []; }
+  constructor() { super(); this.next = 0; this.threads = new Map(); this.scaffoldTurnStarts = 0; this.turnGoals = []; this.activeWriters = 0; this.maxActiveWriters = 0; this.writerBarrier = []; }
   async connect() {}
   shutdown() {}
   diagnostics() { return { protocolEvents: [], stderrTail: "", process: {} }; }
   async request(method) { return method === "account/read" ? { account: {} } : method === "account/usage/read" ? { dailyUsageBuckets: [] } : { rateLimits: null }; }
   async startThread({ cwd }) { const id = `thread-${++this.next}`; this.threads.set(id, { cwd, goal: "", turns: 0 }); return { thread: { id } }; }
   async setGoal({ threadId, objective }) { this.threads.get(threadId).goal = objective; }
-  async startTurn({ threadId }) { const thread = this.threads.get(threadId); thread.turns += 1; if (/^Scaffold product roots\n\n/.test(thread.goal)) this.scaffoldTurnStarts += 1; return { turn: { id: `${threadId}-turn-${thread.turns}` } }; }
+  async startTurn({ threadId }) { const thread = this.threads.get(threadId); thread.turns += 1; this.turnGoals.push(thread.goal); if (/^Scaffold product roots\n\n/.test(thread.goal)) this.scaffoldTurnStarts += 1; return { turn: { id: `${threadId}-turn-${thread.turns}` } }; }
   async waitForTurn(threadId, turnId) {
     const thread = this.threads.get(threadId);
     const writer = /^Build (frontend|backend) feature/.test(thread.goal);
@@ -75,6 +75,8 @@ test("deterministic scaffold creates a WorkerArtifact before two dependent write
     const scaffold = router.list().find((task) => task.title === "Scaffold product roots");
     assert.equal(router.store.deliveryRun(run.id).projectMode.mode, "greenfield");
     assert.equal(client.scaffoldTurnStarts, 0, "the App Server never receives a scaffold turn");
+    assert.equal(client.turnGoals.filter((goal) => /^Security review: Scaffold product roots|^QA: Scaffold product roots/.test(goal)).length, 0, "scaffold Security/QA are controller-local and consume no App Server turns");
+    assert.equal(client.turnGoals.filter((goal) => /^(Build frontend feature|Build backend feature|Security review: Build|QA: Build)/.test(goal)).length, 6, "fixture topology starts exactly two writer and four writer-review turns");
     assert.ok(router.store.workerArtifact(scaffold.id));
     assert.equal(existsSync(join(scaffold.worktree, "frontend", "package.json")), true);
     assert.equal(existsSync(join(scaffold.worktree, "backend", "Backend.sln")), true);
@@ -83,6 +85,12 @@ test("deterministic scaffold creates a WorkerArtifact before two dependent write
     const writers = router.list().filter((task) => ["Build frontend feature", "Build backend feature"].includes(task.title));
     assert.equal(writers.every((task) => task.dependencies.includes(scaffold.id) && task.status === "done" && router.store.workerArtifact(task.id)), true);
     assert.ok(router.lifecycleEvents().some((event) => event.type === "deterministic scaffold completed"));
+    const scaffoldSecurity = router.list().find((task) => task.title === "Security review: Scaffold product roots");
+    const scaffoldQa = router.list().find((task) => task.title === "QA: Scaffold product roots");
+    assert.equal(scaffoldSecurity.status, "done"); assert.equal(scaffoldQa.status, "done");
+    const localQa = router.lifecycleEvents().findIndex((event) => event.type === "controller-local scaffold quality passed");
+    const firstWriterTurn = router.lifecycleEvents().findIndex((event) => event.type === "turn started" && writers.some((task) => task.id === event.taskId));
+    assert.ok(localQa >= 0 && localQa < firstWriterTurn, "frontend/backend must wait for scaffold Security -> QA release");
     assert.equal((await router.integrateFinalized([scaffold.id, ...writers.map((task) => task.id)])).manifest.status, "candidate_ready");
   } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }
 });

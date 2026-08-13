@@ -15,6 +15,11 @@ test("live E2E launcher refuses to spend quota without the explicit confirmation
   assert.match(result.stderr, /--confirm-spend-quota/);
 });
 
+test("live E2E workers propagate from CLI through environment to the deterministic fixture without spending quota", () => {
+  const result = spawnSync(process.execPath, ["scripts/e2e-live.mjs", "--verify-worker-config", "--workers", "2"], { cwd: root, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test("E2E reporter creates a safe run directory, updates latest, and finalizes failure", () => {
   const reportsRoot = mkdtempSync(join(tmpdir(), "e2e-reports-"));
   try {
@@ -27,7 +32,8 @@ test("E2E reporter creates a safe run directory, updates latest, and finalizes f
     reporter.finalize({
       status: "failed", task: { id: "task-1", status: "failed", threadId: "thread-1", turnId: "turn-1", prompt: "do not retain" }, error,
       artifact: { taskId: "task-1", headSha: "abc123", path: "docs/orchestration-generated/worker-artifacts/task-1.v1.json" },
-      integration: { path: "docs/orchestration-generated/integration-manifests/blocked.json", manifest: { status: "CONFLICT_BLOCKED", blockedReason: "overlapping migration", worktree: "C:/temp/integration" } }
+      integration: { path: "docs/orchestration-generated/integration-manifests/blocked.json", manifest: { status: "CONFLICT_BLOCKED", blockedReason: "overlapping migration", worktree: "C:/temp/integration" } },
+      diagnostics: { task: { id: "security-actual", status: "interrupted", threadId: "thread-actual", turnId: "turn-actual" }, threadRead: { available: false, threadId: "thread-actual", turnId: "turn-actual", reason: "token=top-secret" }, appServer: { process: { alive: false, exited: true, code: 17, signal: "SIGTERM" }, stderrTail: `secret=top-secret ${"x".repeat(5_000)}`, protocolEvents: [{ direction: "processExit", threadId: "thread-actual", turnId: "turn-actual", errorMessage: "token=top-secret" }] }, lifecycleEvents: [{ type: "execution provider lifecycle failure", taskId: "security-actual", threadId: "thread-actual", turnId: "turn-actual", taxonomy: "execution_provider_process_exit" }], primaryFailure: { taxonomy: "execution_provider_process_exit", providerErrorCode: "process_exit", recoveryState: "resume", activeTasks: [{ taskId: "security-actual", threadId: "thread-actual", turnId: "turn-actual", status: "running" }] } }
     });
     assert.equal(existsSync(join(reportsRoot, "run-1", "events.jsonl")), true);
     assert.equal(existsSync(join(reportsRoot, "run-1", "summary.json")), true);
@@ -43,6 +49,12 @@ test("E2E reporter creates a safe run directory, updates latest, and finalizes f
     assert.equal(latest.integration.status, "CONFLICT_BLOCKED");
     assert.equal(latest.integration.blockedReason, "overlapping migration");
     assert.equal(latest.artifact.path, "docs/orchestration-generated/worker-artifacts/task-1.v1.json");
+    assert.equal(latest.diagnostics.task.id, "security-actual");
+    assert.deepEqual(latest.diagnostics.process, { alive: false, exited: true, code: 17, signal: "SIGTERM" });
+    assert.equal(latest.diagnostics.stderrTail.length <= 4_000, true);
+    assert.doesNotMatch(latest.diagnostics.stderrTail, /top-secret/);
+    assert.equal(latest.diagnostics.primaryFailure.taxonomy, "execution_provider_process_exit");
+    assert.deepEqual(latest.diagnostics.primaryFailure.activeTasks, [{ taskId: "security-actual", threadId: "thread-actual", turnId: "turn-actual", status: "running" }]);
   } finally { rmSync(reportsRoot, { recursive: true, force: true }); }
 });
 

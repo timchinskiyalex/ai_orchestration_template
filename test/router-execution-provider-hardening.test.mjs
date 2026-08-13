@@ -15,7 +15,7 @@ const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend",
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 class ControlledProvider extends EventEmitter {
-  constructor(mode = "normal") { super(); this.mode = mode; this.calls = { accountRead: 0, startThread: 0, startTurn: 0, interrupts: [], approvals: [] }; this.next = 1; this.terminal = null; this.turn = null; }
+  constructor(mode = "normal") { super(); this.mode = mode; this.calls = { accountRead: 0, startThread: 0, startTurn: 0, interrupts: [], approvals: [] }; this.next = 1; this.terminals = []; this.turn = null; }
   #ok(operation, args, data) { return envelope({ operation, correlationId: args.correlationId, success: true, data }); }
   async handshake(args) {
     if (this.mode === "unowned") queueMicrotask(() => this.emit("lifecycle", lifecycleEvent({ kind: "approval_requested", correlationId: "orphan-correlation", data: { threadId: "orphan-thread", turnId: "orphan-turn", requestId: "orphan-request", approvalKind: "command" } })));
@@ -30,28 +30,35 @@ class ControlledProvider extends EventEmitter {
     return this.#ok("start_turn", args, { providerRunId: "controlled", threadId: args.data.threadId, turnId });
   }
   async observeTerminal(args) {
-    return await new Promise((resolve) => { this.terminal = () => resolve(this.#ok("observe_terminal", args, { providerRunId: "controlled", threadId: this.turn.threadId, turnId: this.turn.turnId, terminalClass: "completed", usage: { totalTokens: 7 } })); });
+    return await new Promise((resolve, reject) => { this.terminals.push({ resolve, reject, args }); });
   }
   async readFinalResult(args) { return this.#ok("read_final_result", args, { providerRunId: "controlled", threadId: args.data.threadId, turnId: args.data.turnId, resultText: "safe result" }); }
-  async interruptTurn(args) { this.calls.interrupts.push({ threadId: args.data.threadId, turnId: args.data.turnId }); this.terminal?.(); return this.#ok("interrupt_turn", args, { providerRunId: "controlled", threadId: args.data.threadId, turnId: args.data.turnId, terminalClass: "interrupted" }); }
+  async interruptTurn(args) { this.calls.interrupts.push({ threadId: args.data.threadId, turnId: args.data.turnId }); this.#settleTerminal("interrupted"); return this.#ok("interrupt_turn", args, { providerRunId: "controlled", threadId: args.data.threadId, turnId: args.data.turnId, terminalClass: "interrupted" }); }
   async approvalResponse(args) { this.calls.approvals.push(args.data); return this.#ok("approval_response", args, { providerRunId: "controlled", requestId: args.data.requestId }); }
   async shutdown(args) { return this.#ok("shutdown", args, { providerRunId: "controlled", terminalClass: "shutdown" }); }
   async diagnostics(args) { return this.#ok("diagnostics", args, { diagnostics: "safe" }); }
+  #settleTerminal(status = "completed", error = null) {
+    for (const terminal of this.terminals.splice(0)) {
+      if (error) terminal.reject(error);
+      else terminal.resolve(this.#ok("observe_terminal", terminal.args, { providerRunId: "controlled", threadId: this.turn.threadId, turnId: this.turn.turnId, terminalClass: status, usage: { totalTokens: 7 } }));
+    }
+  }
   #event(kind, { correlationId = this.turn.correlationId, threadId = this.turn.threadId, turnId = this.turn.turnId, ...data } = {}) { this.emit("lifecycle", lifecycleEvent({ kind, correlationId, data: { threadId, turnId, ...data } })); }
   #emitScenario() {
     if (this.mode === "process-exit") {
       this.emit("lifecycle", lifecycleEvent({ kind: "process_exit", providerGlobal: true, success: false, errorCode: "process_exit", errorClass: "transport" }));
-      return this.terminal?.();
+      return this.#settleTerminal("completed", new Error("App Server exited"));
     }
     if (this.mode === "wrong-correlation") return this.#event("turn_completed", { correlationId: "wrong-correlation" });
     if (this.mode === "wrong-thread") return this.#event("turn_completed", { threadId: "wrong-thread" });
     if (this.mode === "wrong-turn") return this.#event("turn_completed", { turnId: "wrong-turn" });
-    if (this.mode === "stale") { this.#event("turn_completed", { correlationId: "stale-correlation", threadId: "stale-thread", turnId: "stale-turn" }); return this.terminal?.(); }
+    if (this.mode === "stale") { this.#event("turn_completed", { correlationId: "stale-correlation", threadId: "stale-thread", turnId: "stale-turn" }); return this.#settleTerminal(); }
     if (this.mode === "approval") return this.#event("approval_requested", { requestId: "approval-1", approvalKind: "command" });
     if (this.mode === "permissions-approval") return this.#event("approval_requested", { requestId: "approval-1", approvalKind: "permissions" });
-    if (this.mode === "alias-usage") { this.#event("turn_alias", { turnId: "canonical-turn", requestedTurnId: this.turn.turnId, resolvedTurnId: "canonical-turn" }); this.#event("usage_updated", { turnId: "canonical-turn", usage: { totalTokens: 7 } }); this.turn.turnId = "canonical-turn"; return this.terminal?.(); }
-    if (this.mode === "duplicate-terminal") { this.#event("turn_completed"); this.#event("turn_completed"); return this.terminal?.(); }
-    this.terminal?.();
+    if (this.mode === "alias-usage") { this.#event("turn_alias", { turnId: "canonical-turn", requestedTurnId: this.turn.turnId, resolvedTurnId: "canonical-turn" }); this.#event("usage_updated", { turnId: "canonical-turn", usage: { totalTokens: 7 } }); this.turn.turnId = "canonical-turn"; return this.#settleTerminal(); }
+    if (this.mode === "duplicate-terminal") { this.#event("turn_completed"); this.#event("turn_completed"); return this.#settleTerminal(); }
+    if (this.mode === "process-exit-after-terminal") { this.#settleTerminal(); return setTimeout(() => this.emit("lifecycle", lifecycleEvent({ kind: "process_exit", providerGlobal: true, success: false, errorCode: "process_exit", errorClass: "transport" })), 0); }
+    this.#settleTerminal();
   }
 }
 
@@ -184,7 +191,23 @@ test("provider process failure remains the persisted primary failure and is not 
     assert.equal(persisted.recovery.primaryFailure.taxonomy, "execution_provider_process_exit");
     assert.equal(persisted.recovery.primaryFailure.recoveryState, "resume_delivery_after_execution_provider_recovery");
     assert.equal(subject.router.store.getTask(predecessor.id).status, "interrupted");
+    const diagnostics = await subject.router.collectTaskDiagnostics(predecessor.id);
+    assert.equal(diagnostics.threadRead.source, "process_exit_terminal_thread_read");
+    assert.equal(diagnostics.threadRead.available, false);
     assert.equal(subject.router.store.db.prepare("SELECT count(*) AS count FROM dependency_deadlocks WHERE delivery_run_id = ?").get(run.id).count, 0);
+  } finally { subject.dispose(); }
+});
+
+test("provider process exit after a persisted terminal completion does not overwrite the completed task", async () => {
+  const provider = new ControlledProvider("process-exit-after-terminal"); const subject = fixture(provider);
+  try {
+    await subject.ready;
+    const run = subject.router.createDeliveryRun({ id: "provider-terminal-run", bootstrapTaskId: null });
+    const task = subject.router.enqueue({ role: "backend", title: "completed before provider exit", prompt: "no-op", deliveryRunId: run.id });
+    await subject.router.runUntilIdle({ deliveryRunId: run.id }); await tick();
+    assert.equal(subject.router.store.getTask(task.id).status, "done");
+    assert.notEqual(subject.router.store.deliveryRun(run.id).state, "interrupted");
+    assert.equal(subject.router.store.deliveryRun(run.id).recovery?.primaryFailure?.taxonomy ?? null, null);
   } finally { subject.dispose(); }
 });
 

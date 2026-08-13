@@ -46,7 +46,21 @@ export class AppServerExecutionProvider extends EventEmitter {
   async startThread(args) { return this.#raw("start_thread", args, async () => { const result = await this.client.startThread(args.data); const threadId = result?.thread?.id; if (!threadId) throw new Error("invalid thread/start response"); return { threadId, providerRunId: threadId }; }); }
   async setGoal(args) { return this.#raw("set_goal", args, async () => { await this.client.setGoal(args.data); return { threadId: args.data.threadId, providerRunId: args.data.threadId }; }); }
   async startTurn(args) { return this.#raw("start_turn", args, async () => { const result = await this.client.startTurn(args.data); const turnId = result?.turn?.id; if (!turnId) throw new Error("invalid turn/start response"); const data = { threadId: args.data.threadId, turnId, providerRunId: `${args.data.threadId}:${turnId}` }; this.#bind(data.threadId, turnId, args.correlationId); return data; }); }
-  async observeTerminal(args) { return this.#raw("observe_terminal", args, async () => { this.#bind(args.data.threadId, args.data.turnId, args.correlationId); const turn = await this.client.waitForTurn(args.data.threadId, args.data.turnId, args.data.timeoutMs); const turnId = turn?.id ?? args.data.turnId; if (!terminal.has(turn?.status)) throw new Error("turn_failed"); this.#bind(args.data.threadId, turnId, args.correlationId); return { threadId: args.data.threadId, turnId, providerRunId: `${args.data.threadId}:${turnId}`, terminalClass: turn.status, usage: usage(turn) }; }); }
+  async observeTerminal(args) { return this.#raw("observe_terminal", args, async () => {
+    this.#bind(args.data.threadId, args.data.turnId, args.correlationId);
+    const exited = this.client.diagnostics?.().process?.exited === true;
+    // After the child exits, do not trust a stale waiter or try to start
+    // work.  `readTerminalTurn` performs one bounded, read-only thread/read
+    // probe and returns only a verified terminal turn.
+    const recovered = exited && typeof this.client.readTerminalTurn === "function"
+      ? await this.client.readTerminalTurn(args.data.threadId, args.data.turnId, args.data.timeoutMs)
+      : null;
+    const turn = recovered?.terminal ?? await this.client.waitForTurn(args.data.threadId, args.data.turnId, args.data.timeoutMs);
+    const turnId = turn?.id ?? args.data.turnId;
+    if (!terminal.has(turn?.status)) throw new Error("turn_failed");
+    this.#bind(args.data.threadId, turnId, args.correlationId);
+    return { threadId: args.data.threadId, turnId, providerRunId: `${args.data.threadId}:${turnId}`, terminalClass: turn.status, usage: usage(turn) };
+  }); }
   async readFinalResult(args) { return this.#raw("read_final_result", args, async () => { const result = await this.client.readThread({ threadId: args.data.threadId, includeTurns: true }); const turns = result?.thread?.turns ?? result?.turns ?? []; const turn = turns.find((item) => item?.id === args.data.turnId); const text = (turn?.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text; if (!text?.trim()) throw new Error("result_unavailable"); return { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: `${args.data.threadId}:${args.data.turnId}`, resultText: text }; }); }
   async interruptTurn(args) { const key = `${args.data.threadId}:${args.data.turnId}`; if (this.interrupted.has(key)) return this.#ok("interrupt_turn", args, { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: key, terminalClass: "interrupted" }); this.interrupted.add(key); return this.#raw("interrupt_turn", args, async () => { await this.client.interruptTurn(args.data); return { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: key, terminalClass: "interrupted" }; }); }
   async approvalResponse(args) { return this.#raw("approval_response", args, async () => { const { requestId, response } = args.data; if (typeof requestId !== "string" || !response || typeof response !== "object") throw new Error("invalid approval response"); const rawId = this.approvalRequests.get(requestId); if (rawId === undefined) throw new Error("unknown approval request"); this.client.respond(rawId, response); this.approvalRequests.delete(requestId); return { providerRunId: "app-server", requestId }; }); }

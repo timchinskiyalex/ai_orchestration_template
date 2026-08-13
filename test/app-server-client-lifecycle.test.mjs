@@ -178,6 +178,22 @@ test("waitForTurn rejects when the App Server exits", async () => {
   assert.equal(client.diagnostics().process.code, 9);
 });
 
+test("process exit uses one bounded independent thread/read to recover a terminal turn", async () => {
+  const client = clientWithWritableStdin({ fallbackReadTimeoutMs: 30 });
+  let reads = 0;
+  client.independentThreadRead = async ({ threadId }) => {
+    reads += 1;
+    return { thread: { id: threadId, turns: [{ id: "turn-1", status: "completed", items: [{ type: "agentMessage" }] }] } };
+  };
+  client.handleProcessExit({ code: 23, signal: null });
+  const first = await client.readTerminalTurn("thread-1", "turn-1", 30);
+  const second = await client.readTerminalTurn("thread-1", "turn-1", 30);
+  assert.equal(first.terminal.status, "completed");
+  assert.equal(second.terminal.status, "completed");
+  assert.equal(reads, 1);
+  assert.deepEqual(client.diagnostics().process, { alive: false, exited: true, code: 23, signal: null });
+});
+
 test("stderr is bounded and redacted in failure diagnostics", () => {
   const client = clientWithWritableStdin();
   client.ingestStderr(`token=top-secret ${"x".repeat(5_000)}`);
