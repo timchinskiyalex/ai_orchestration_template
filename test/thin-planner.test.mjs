@@ -27,9 +27,18 @@ test("planner rejects malformed JSON turn output", async () => {
   await assert.rejects(createThinPlan({ markdown: "x", runTurn: async () => "not-json" }), /malformed JSON/);
 });
 
-test("planner rejects technical authority fields", () => {
+test("planner rejects unknown authority fields and ignores controller-only metadata", () => {
   assert.throws(() => validateThinPlanCandidate({ tasks: [{ ...frontend, blueprintId: "not-allowed" }] }), /forbidden field 'blueprintId'/);
-  assert.throws(() => validateThinPlanCandidate({ tasks: [frontend], timestamp: "tomorrow" }), /forbidden field 'timestamp'/);
+  const plan = validateThinPlanCandidate({ tasks: [frontend], timestamp: "tomorrow" });
+  assert.equal(plan.tasks.length, 1);
+});
+
+test("planner discards model-supplied controller IDs without trusting them", () => {
+  const plan = validateThinPlanCandidate({ tasks: [{
+    id: "model-chosen-id", title: "Frontend", prompt: "Implement it", allowedPaths: ["apps/web"], dependsOn: [],
+  }] });
+  assert.notEqual(plan.tasks[0].id, "model-chosen-id");
+  assert.match(plan.tasks[0].id, /^task-1-/);
 });
 
 test("planner rejects absolute, Windows and traversal paths", () => {

@@ -2,6 +2,15 @@ import { createHash } from "node:crypto";
 
 const TASK_KEYS = new Set(["title", "prompt", "allowedPaths", "dependsOn"]);
 const ROOT_KEYS = new Set(["tasks"]);
+// These fields are sometimes added by a model despite an explicit prompt not
+// to do so. They never have authority in the thin controller, so discard them
+// before validating the semantic candidate instead of rejecting an otherwise
+// usable plan. Unknown fields are still rejected below.
+const CONTROLLER_FIELDS = new Set([
+  "id", "taskId", "runId", "baseSha", "headSha", "commitSha", "candidateSha",
+  "createdAt", "updatedAt", "timestamp", "status", "metadata", "version",
+  "budget", "tokenBudget", "evidence", "sourceClaims",
+]);
 
 /**
  * Build a deliberately small, semantic-only planning prompt. The controller
@@ -52,6 +61,7 @@ export function parsePlannerJson(result) {
  * deterministic controller values, never accepted from the model.
  */
 export function validateThinPlanCandidate(candidate) {
+  candidate = discardControllerFields(candidate);
   if (!isPlainObject(candidate)) throw new TypeError("planner output must be a JSON object");
   assertExactKeys(candidate, ROOT_KEYS, "planner output");
   if (!Array.isArray(candidate.tasks) || candidate.tasks.length < 1 || candidate.tasks.length > 10) {
@@ -94,6 +104,17 @@ export function validateThinPlanCandidate(candidate) {
       dependsOn: task.dependsOnTitles.map((title) => titleToId.get(title)),
     })),
   };
+}
+
+function discardControllerFields(candidate) {
+  if (!isPlainObject(candidate)) return candidate;
+  const root = Object.fromEntries(Object.entries(candidate).filter(([key]) => !CONTROLLER_FIELDS.has(key)));
+  if (Array.isArray(root.tasks)) {
+    root.tasks = root.tasks.map((task) => isPlainObject(task)
+      ? Object.fromEntries(Object.entries(task).filter(([key]) => !CONTROLLER_FIELDS.has(key)))
+      : task);
+  }
+  return root;
 }
 
 export function normalizeRelativePath(value) {
