@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-const allowedEventKeys = new Set(["timestamp", "type", "stage", "status", "taskId", "threadId", "turnId", "requestedTurnId", "resolvedTurnId", "itemType", "itemStatus", "tokenUsage", "artifactPath", "integrationPath", "candidateBranch", "localVerification", "errorKind"]);
+const allowedEventKeys = new Set(["timestamp", "type", "stage", "status", "taskId", "threadId", "turnId", "requestedTurnId", "resolvedTurnId", "itemType", "itemStatus", "tokenUsage", "artifactPath", "integrationPath", "candidateBranch", "localVerification", "errorKind", "errorCode", "method", "direction", "reason", "lifecycleKind"]);
 const numericUsage = (usage) => Object.fromEntries(Object.entries(usage ?? {}).filter(([, value]) => Number.isFinite(Number(value))).map(([key, value]) => [key, Number(value)]));
 const bounded = (value, limit = 4_000) => String(value ?? "").slice(-limit);
 const redact = (value) => bounded(value)
@@ -49,7 +49,9 @@ function safeLifecycleEvent(event) {
   return {
     timestamp: event.timestamp ?? null, type: event.type ?? null, taskId: event.taskId ?? null,
     threadId: event.threadId ?? null, turnId: event.turnId ?? null, itemStatus: event.itemStatus ?? null,
-    errorCode: event.errorCode ?? null, taxonomy: event.taxonomy ?? null
+    errorCode: event.errorCode ?? null, taxonomy: event.taxonomy ?? null,
+    lifecycleKind: event.lifecycleKind ?? null, method: event.method ?? null,
+    direction: event.direction ?? null, reason: redact(event.reason)
   };
 }
 
@@ -69,10 +71,16 @@ function safeDiagnostics(runtime = null) {
     stderrTail: redact(appServer?.stderrTail ?? ""),
     protocolEvents: (appServer?.protocolEvents ?? []).slice(-100).map(safeProtocolEvent).filter(Boolean),
     lifecycleEvents: (runtime.lifecycleEvents ?? []).slice(-100).map(safeLifecycleEvent).filter(Boolean),
+    activeTurns: (runtime.activeTurns ?? runtime.appServer?.activeTurns ?? []).slice(-20).map((turn) => ({
+      taskId: turn?.taskId ?? null, threadId: turn?.threadId ?? null, turnId: turn?.turnId ?? null,
+      requestedTurnId: turn?.requestedTurnId ?? null, authoritativeTerminal: turn?.authoritativeTerminal === true
+    })),
     primaryFailure: runtime.primaryFailure ? {
       taxonomy: runtime.primaryFailure.taxonomy ?? null,
       providerErrorCode: runtime.primaryFailure.providerErrorCode ?? null,
       recoveryState: runtime.primaryFailure.recoveryState ?? null,
+      reason: redact(runtime.primaryFailure.reason),
+      impactedTaskIds: Array.isArray(runtime.primaryFailure.impactedTaskIds) ? runtime.primaryFailure.impactedTaskIds.slice(-20).filter((id) => typeof id === "string") : [],
       activeTasks: Array.isArray(runtime.primaryFailure.activeTasks)
         ? runtime.primaryFailure.activeTasks.slice(-10).map((task) => ({ taskId: task?.taskId ?? null, threadId: task?.threadId ?? null, turnId: task?.turnId ?? null, status: task?.status ?? null }))
         : []

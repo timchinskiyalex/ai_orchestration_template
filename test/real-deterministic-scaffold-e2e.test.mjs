@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { SwarmRouter } from "../src/router.mjs";
-import { assertObservedParallelTurns, formatE2eDiagnostics, preserveOrCleanupDisposableRoot, withE2eTimeout } from "../src/e2e-smoke.mjs";
+import { assertMaxObservedActiveTurns, assertObservedParallelTurns, formatE2eDiagnostics, preserveOrCleanupDisposableRoot, withE2eTimeout } from "../src/e2e-smoke.mjs";
 import { openE2eRunReporter } from "../src/e2e-report.mjs";
 import { ingestDocumentation } from "../src/project-intake.mjs";
 import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
@@ -30,7 +30,7 @@ test("live E2E fixture receives the CLI worker count", { skip: process.env.CODEX
 test("real App Server controlled E2E: deterministic scaffold, parallel writers, controller QA, and integration", { skip: enabled ? false : "set RUN_REAL_CODEX_E2E=1 to intentionally spend account quota" }, async () => {
   assert.equal(Number.isInteger(timeoutMs) && timeoutMs >= 1_000, true, "CODEX_E2E_TIMEOUT_MS must be an integer of at least 1000");
   const root = mkdtempSync(join(tmpdir(), "orchestration-real-greenfield-e2e-")); const source = join(root, "e2e-source");
-  let router; let integration; let succeeded = false; let currentTaskId = null; const lifecycle = [];
+  let router; let integration; let execution; let succeeded = false; let currentTaskId = null; const lifecycle = [];
   const progress = (stage, details = {}) => { console.log(`[E2E] ${stage}`); reporter?.event(stage, details); };
   const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => {
     const tokenBudget = role === "devops" ? 3_000 : ["backend", "frontend"].includes(role) ? 50_000 : 20_000;
@@ -63,7 +63,7 @@ test("real App Server controlled E2E: deterministic scaffold, parallel writers, 
     const planned = router.list(); const scaffold = planned.find((task) => task.title === "Scaffold product roots"); const frontend = planned.find((task) => task.title === "Add frontend E2E marker"); const backend = planned.find((task) => task.title === "Add backend E2E marker");
     currentTaskId = scaffold.id; progress("controller plan admitted", { deliveryRunId: admitted.deliveryRun.id, scaffold: scaffold.id, frontend: frontend.id, backend: backend.id });
     await withE2eTimeout({ timeoutMs, operation: async () => {
-      const execution = await router.runUntilIdle({ deliveryRunId: run.id });
+      execution = await router.runUntilIdle({ deliveryRunId: run.id });
       if (execution.blockedQuota) throw new Error("blocked_quota: App Server account quota refused the controlled E2E");
       if (execution.blockedBudget) throw new Error("blocked_budget: the controlled E2E reached its configured local guardrail");
       if (execution.failed || execution.interrupted) throw new Error("controlled E2E worker lifecycle did not reach a successful terminal state");
@@ -79,7 +79,9 @@ test("real App Server controlled E2E: deterministic scaffold, parallel writers, 
     assert.equal(lifecycle.some((event) => event.type === "turn started" && scaffoldReviews.some((task) => task.id === event.taskId)), false, "controller-local scaffold reviews must not spend App Server turns");
     const startedRoles = lifecycle.filter((event) => event.type === "turn started").map((event) => router.store.getTask(event.taskId)?.role).sort();
     assert.deepEqual(startedRoles, ["backend", "frontend", "qa", "qa", "security", "security"], "the live fixture must start exactly the two writer and four provider-owned review turns");
+    assertMaxObservedActiveTurns(lifecycle, workerCount);
     if (workerCount >= 2) assertObservedParallelTurns(lifecycle, 2);
+    assert.equal(execution.dependencyDeadlock, null, "provider failure must not be relabelled as dependency_deadlock");
     const artifacts = [scaffold, frontend, backend].map((task) => router.store.workerArtifact(task.id));
     assert.equal(artifacts.every((artifact) => artifact.verificationResults.every((result) => result.status === "passed")), true, "controller QA verification must pass for every artifact");
     progress("controller QA/local verification passed");

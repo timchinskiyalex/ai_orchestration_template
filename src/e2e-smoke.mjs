@@ -56,6 +56,19 @@ export function assertParallelWorkerSmoke(tasks, workerCount) {
 }
 
 export function assertObservedParallelTurns(events, minimumConcurrent = 2) {
+  const { maximumConcurrentTurns: maximum } = observedTurnConcurrency(events);
+  if (maximum < minimumConcurrent) throw new Error(`Expected at least ${minimumConcurrent} concurrent real turns; observed ${maximum}`);
+  return { maximumConcurrentTurns: maximum };
+}
+
+export function assertMaxObservedActiveTurns(events, maximumAllowed) {
+  if (!Number.isInteger(maximumAllowed) || maximumAllowed < 1) throw new Error("maximumAllowed must be a positive integer");
+  const result = observedTurnConcurrency(events);
+  if (result.maximumConcurrentTurns > maximumAllowed) throw new Error(`Observed ${result.maximumConcurrentTurns} concurrent real turns; maximum is ${maximumAllowed}`);
+  return result;
+}
+
+function observedTurnConcurrency(events) {
   const active = new Set();
   let maximum = 0;
   for (const event of events ?? []) {
@@ -65,7 +78,6 @@ export function assertObservedParallelTurns(events, minimumConcurrent = 2) {
       maximum = Math.max(maximum, active.size);
     } else if (event.type === "turn completed") active.delete(event.taskId);
   }
-  if (maximum < minimumConcurrent) throw new Error(`Expected at least ${minimumConcurrent} concurrent real turns; observed ${maximum}`);
   return { maximumConcurrentTurns: maximum };
 }
 

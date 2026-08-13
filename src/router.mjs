@@ -41,6 +41,29 @@ function normalizedProviderDiagnostics(value) {
   return current && typeof current === "object" && !Array.isArray(current) ? current : { detail: String(value ?? "").slice(0, 2_000) };
 }
 
+const ACTIVE_CAPACITY_STATUSES = new Set(["preparing", "running", "awaiting_approval"]);
+const TERMINAL_TURN_CLASSES = new Set(["completed", "failed", "interrupted", "cancelled"]);
+const safeProtocolReason = (value, limit = 320) => String(value?.message ?? value ?? "")
+  .replace(/((?:api[_-]?key|token|secret|password|authorization|cookie|private[_-]?key)\s*[:=]\s*)([^\s,;]+)/gi, "$1[redacted]")
+  .replace(/("(?:api[_-]?key|token|secret|password|authorization|cookie|private[_-]?key)"\s*:\s*")[^"]*(")/gi, "$1[redacted]$2")
+  .replace(/[\r\n]+/g, " ").slice(0, limit);
+
+function protocolViolationDetails(event, error, taskId = null) {
+  const data = event?.data && typeof event.data === "object" ? event.data : {};
+  return {
+    ...(taskId ? { taskId } : {}),
+    lifecycleKind: typeof event?.kind === "string" ? event.kind : null,
+    errorCode: error?.errorCode ?? event?.errorCode ?? "protocol_violation",
+    method: typeof event?.method === "string" ? event.method : (typeof error?.providerOperation === "string" ? error.providerOperation : null),
+    direction: typeof event?.direction === "string" ? event.direction : (error?.providerOperation ? "provider_response" : null),
+    threadId: typeof data.threadId === "string" ? data.threadId : null,
+    turnId: typeof data.turnId === "string" ? data.turnId : null,
+    requestedTurnId: typeof data.requestedTurnId === "string" ? data.requestedTurnId : null,
+    resolvedTurnId: typeof data.resolvedTurnId === "string" ? data.resolvedTurnId : null,
+    reason: safeProtocolReason(error ?? event?.diagnostics ?? "provider lifecycle validation failed")
+  };
+}
+
 export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = null, documentationAvailable = true }) {
   const lines = [
     `Task ID: ${task.id}`,
@@ -124,6 +147,8 @@ export class SwarmRouter extends EventEmitter {
     this.budgetInterruptedTasks = new Set();
     this.pendingBudgetWatchdogs = new Set();
     this.activeTurns = new Map();
+    this.lastActiveTurnSnapshot = [];
+    this.activeScheduler = null;
     this.providerProcessExit = null;
     this.closed = false;
     this.reconciliationBarrier = null;
@@ -400,12 +425,23 @@ export class SwarmRouter extends EventEmitter {
     return {
       lifecycleEvents: this.lifecycleEvents(),
       appServer: this.lastAppServerDiagnostics ?? null,
-      processExit: this.providerProcessExit?.diagnostics ?? null
+      processExit: this.providerProcessExit?.diagnostics ?? null,
+      activeTurns: this.activeTurnSnapshot()
     };
+  }
+
+  activeTurnSnapshot() {
+    const turns = [...this.activeTurns.values()].map((turn) => ({
+      taskId: turn.taskId, threadId: turn.threadId, turnId: turn.turnId ?? null,
+      requestedTurnId: turn.requestedTurnId ?? null,
+      authoritativeTerminal: turn.authoritativeTerminal === true
+    }));
+    return turns.length ? turns : [...this.lastActiveTurnSnapshot];
   }
 
   async collectTaskDiagnostics(taskId, { threadReadTimeoutMs = 1_500 } = {}) {
     const task = this.store.getTask(taskId);
+    const run = task?.deliveryRunId ? this.store.deliveryRun(task.deliveryRunId) : (this.activeDeliveryRunId ? this.store.deliveryRun(this.activeDeliveryRunId) : null);
     let threadRead = this.providerProcessExit?.terminalByTask?.get(taskId) ?? { available: false, reason: "thread/read unavailable" };
     if (!threadRead.available && task?.threadId && task.turnId && this.activeClient) {
       try {
@@ -415,7 +451,7 @@ export class SwarmRouter extends EventEmitter {
         threadRead = { available: false, threadId: task.threadId, turnId: task.turnId, error: "thread/read failed" };
       }
     }
-    return { task, threadRead, ...this.appServerDiagnostics() };
+    return { task, threadRead, ...this.appServerDiagnostics(), primaryFailure: run?.recovery?.primaryFailure ?? null };
   }
 
   enqueue({ role, title, prompt, parentTaskId = null, allowedPaths = [], acceptanceChecks = [], dependencies = [], estimatedTokens = null, humanApprovalRequired = false, riskFlags = [], supportingDomains = [], artifactBaseSha = null, artifactDependencies = [], remediationRound = 0, sourceWriterTaskId = null, blueprintId = null, requirementIds = [], baselineBehaviorIds = [], deliveryRunId = this.activeDeliveryRunId }) {
@@ -453,8 +489,8 @@ export class SwarmRouter extends EventEmitter {
       schemaVersion: 1,
       generatedAt: new Date().toISOString(),
       tasks: tasks.map((task) => ({ id: task.id, title: task.title, role: task.role, status: task.status, dependencies: task.dependencies, executionDependencies: task.executionDependencies, executionTopologyVersion: task.executionTopologyVersion, executionIsWriter: task.executionIsWriter, executionRelease: task.executionIsWriter ? { state: task.executionReleaseState, artifactTaskId: task.executionReleaseArtifactTaskId } : null, blocker: task.error ?? this.#executionBlocker(task), tokenUsed: task.tokenUsed, estimatedTokens: task.estimatedTokens, tokenBudget: task.tokenBudget, interruptThresholdTokens: task.interruptThresholdTokens, configuredBudgetCap: task.configuredBudgetCap, budgetInterrupt: task.budgetInterrupt, threadId: task.threadId, turnId: task.turnId, worktree: task.worktree, remediationRound: task.remediationRound })),
-      activeTurns: tasks.filter((task) => task.status === "running").map((task) => ({ taskId: task.id, threadId: task.threadId, turnId: task.turnId })),
-      realConcurrency: tasks.filter((task) => task.status === "running").length,
+      activeTurns: this.activeTurnSnapshot(),
+      realConcurrency: this.activeTurnSnapshot().length,
       localBudget: readiness.localBudget,
       localBudgetEnforcement: this.#enforcesLocalBudget() ? "enforced" : "tracking_only",
       localForecast: readiness.localForecast,
@@ -801,13 +837,17 @@ export class SwarmRouter extends EventEmitter {
       const snapshot = this.account.normalize({ account: account.account, usage: account.usage, rateLimits: account.rateLimits, previous: this.store.latestAccountSnapshot() });
       this.store.recordAccountSnapshot(snapshot);
       this.#lifecycle(snapshot.diagnostics?.length ? "account read failed" : "account read completed", { diagnostics: snapshot.diagnostics?.length ?? 0 });
-      const scheduler = { active: 0, blockedQuota: false, blockedBudget: false, failed: false, dependencyDeadlock: null };
+      const scheduler = {
+        active: 0, blockedQuota: false, blockedBudget: false, failed: false, dependencyDeadlock: null,
+        capacity: new Set(this.store.listTasks().filter((task) => ACTIVE_CAPACITY_STATUSES.has(task.status)).map((task) => task.id))
+      };
+      this.activeScheduler = scheduler;
       const workers = Array.from({ length: this.config.router.maxConcurrentTasks }, () => this.#worker(client, scheduler));
       await Promise.all(workers);
       // Notification handlers are intentionally non-blocking, but a terminal
       // scheduler result must not race a just-started budget interrupt.
       await Promise.allSettled([...this.pendingBudgetWatchdogs]);
-      return { blockedQuota: scheduler.blockedQuota, blockedBudget: scheduler.blockedBudget || this.budgetInterruptedTasks.size > 0, failed: scheduler.failed, interrupted: this.stopRequested, integrityBlocked: Boolean(scheduler.dependencyDeadlock), dependencyDeadlock: scheduler.dependencyDeadlock, quota: this.quotaThrottleStatus() };
+      return { blockedQuota: scheduler.blockedQuota, blockedBudget: scheduler.blockedBudget || this.budgetInterruptedTasks.size > 0, failed: scheduler.failed, interrupted: this.stopRequested, capacityBlocked: scheduler.capacity.size >= this.config.router.maxConcurrentTasks, integrityBlocked: Boolean(scheduler.dependencyDeadlock), dependencyDeadlock: scheduler.dependencyDeadlock, quota: this.quotaThrottleStatus() };
     } finally {
       if (heartbeat) clearInterval(heartbeat);
       process.removeListener("SIGINT", onSigint);
@@ -815,7 +855,9 @@ export class SwarmRouter extends EventEmitter {
       this.expectedClientShutdown = true;
       try { await this.#provider(client, "shutdown", {}); } catch {}
       if (this.activeClient === client) this.activeClient = null;
+      this.lastActiveTurnSnapshot = this.activeTurnSnapshot();
       this.activeTurns.clear();
+      this.activeScheduler = null;
       // Provider teardown between waves must not discard this controller's
       // delivery lease. A different router instance has no in-memory session
       // and will still fail the compare-and-set ownership check.
@@ -827,6 +869,14 @@ export class SwarmRouter extends EventEmitter {
     while (true) {
       if (this.stopRequested || scheduler.failed || this.budgetInterruptedTasks.size) { scheduler.blockedBudget ||= this.budgetInterruptedTasks.size > 0; return; }
       if (this.quotaThrottleStatus().throttled) { scheduler.blockedQuota = true; return; }
+      if (scheduler.capacity.size >= this.config.router.maxConcurrentTasks) {
+        // `awaiting_approval` and any unresolved provider turn retain their
+        // reservation.  A scheduler invocation must not manufacture a new
+        // App Server turn while such a reservation exists.
+        if (!scheduler.active) return;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        continue;
+      }
       this.#resumeScopedReplans();
       const barriersRan = await this.#runReadyIntegrationBarriers();
       const task = this.store.claimNext();
@@ -840,10 +890,15 @@ export class SwarmRouter extends EventEmitter {
         await new Promise((resolve) => setTimeout(resolve, 100));
         continue;
       }
+      scheduler.capacity.add(task.id);
       scheduler.active += 1;
       try { await this.#runTask(client, task); }
       catch (error) {
         const current = this.store.getTask(task.id);
+        if (this.#isExecutionProviderFailure(error)) {
+          await this.#recordExecutionProviderFailure(client, task, error);
+          return;
+        }
         if (current && !["awaiting_approval", "cancelled", "blocked_budget", "blocked_specification", "interrupted"].includes(current.status)) {
           let recovery = null;
           if (current.worktree) {
@@ -867,7 +922,12 @@ export class SwarmRouter extends EventEmitter {
             else this.#recordScopedFailure(task, detail, this.#failureKind(task, detail));
           }
         }
-      } finally { this.#forgetTaskTurn(task.id); scheduler.active -= 1; }
+      } finally {
+        this.#forgetTaskTurn(task.id);
+        const current = this.store.getTask(task.id);
+        if (!current || !ACTIVE_CAPACITY_STATUSES.has(current.status)) scheduler.capacity.delete(task.id);
+        scheduler.active -= 1;
+      }
     }
   }
 
@@ -978,12 +1038,16 @@ export class SwarmRouter extends EventEmitter {
       terminal = await this.#recoverTerminalAfterProviderExit(client, task);
       if (!terminal) throw error;
     }
-    if (terminal.threadId !== threadId) throw new ExecutionProviderError("protocol_violation", "terminal thread mismatch");
+    if (terminal.threadId !== threadId || !TERMINAL_TURN_CLASSES.has(terminal.terminalClass)) throw new ExecutionProviderError("protocol_violation", "authoritative terminal completion is invalid");
     const watched = { turn: { id: terminal.turnId, status: terminal.terminalClass, usage: terminal.usage ?? null } };
     const turn = watched.turn;
     const resolvedTurnId = turn.id ?? turnId;
     this.#adoptResolvedTurnId(task.id, threadId, resolvedTurnId);
-    this.activeTurns.delete(task.id);
+    // A provider observation is authority for the turn only.  Retain the
+    // active registration until the task's terminal persistence below has
+    // committed, so no scheduler worker can reuse this capacity early.
+    const activeTurn = this.activeTurns.get(task.id);
+    if (activeTurn) this.activeTurns.set(task.id, { ...activeTurn, authoritativeTerminal: true, terminalClass: terminal.terminalClass });
     const current = this.store.getTask(task.id);
     if (this.budgetInterruptedTasks.has(task.id) && current.status === "running") this.store.transition(task.id, "blocked_budget", { error: "budget_interrupt confirmed before result processing" });
     // Lifecycle policy may already have made this turn terminal (for example,
@@ -1205,8 +1269,45 @@ export class SwarmRouter extends EventEmitter {
     if (typeof method !== "function") throw new ExecutionProviderError("unsupported_capability", `provider does not implement ${operation}`);
     let result;
     try { result = await method.call(provider, { contractVersion: EXECUTION_PROVIDER_VERSION, correlationId, data }); }
-    catch (error) { throw new ExecutionProviderError("transport_failure", String(error?.message ?? error), { errorClass: "transport" }); }
-    return validateEnvelope(result, { operation, correlationId, requiredIds });
+    catch (error) {
+      const failure = new ExecutionProviderError("transport_failure", String(error?.message ?? error), { errorClass: "transport" });
+      failure.providerOperation = operation;
+      throw failure;
+    }
+    try { return validateEnvelope(result, { operation, correlationId, requiredIds }); }
+    catch (error) { error.providerOperation = operation; throw error; }
+  }
+
+  #isExecutionProviderFailure(error) {
+    if (!(error instanceof ExecutionProviderError)) return false;
+    // A turn timeout and a task's own goal-setup rejection remain ordinary,
+    // resumable task failures.  They do not establish that the shared
+    // provider process/protocol is unhealthy.  Correlation, envelope, and
+    // lifecycle identity failures do establish that and are delivery-primary.
+    if (["turn_failed", "result_unavailable", "timeout"].includes(error.errorCode)) return false;
+    if (error.errorCode === "transport_failure" && error.providerOperation === "set_goal") return false;
+    return true;
+  }
+
+  async #recordExecutionProviderFailure(client, task, error, context = {}) {
+    const taxonomy = `execution_provider_${String(error.errorCode ?? "protocol_violation").replace(/[^a-z0-9_]+/gi, "_").toLowerCase()}`;
+    const activeTasks = this.activeTurnSnapshot();
+    this.#lifecycle("execution provider protocol violation", {
+      ...protocolViolationDetails(context.event, error, task?.id ?? null), taxonomy
+    });
+    if (this.activeDeliveryRunId && !this.stopRequested && !this.expectedClientShutdown) {
+      this.#markInterrupted(`interrupted_controller_exit: ${taxonomy}`, {
+        primaryFailure: {
+          taxonomy, providerErrorCode: error.errorCode ?? "protocol_violation",
+          recoveryState: "resume_delivery_after_execution_provider_recovery",
+          impactedTaskIds: [...new Set([task?.id, ...activeTasks.map((item) => item.taskId)].filter(Boolean))],
+          activeTasks,
+          reason: safeProtocolReason(error),
+          process: this.lastAppServerDiagnostics?.process ?? null
+        }
+      });
+    }
+    await this.#failFastAfterTaskFailure(client, this.activeScheduler ?? { failed: false }, task?.id ?? null, error);
   }
 
   async #recoverTerminalAfterProviderExit(client, task) {
@@ -2034,8 +2135,9 @@ export class SwarmRouter extends EventEmitter {
   }
 
   async #failFastAfterTaskFailure(client, scheduler, failedTaskId, error) {
-    if (scheduler.failed) return;
+    if (scheduler.failFastHandled) return;
     scheduler.failed = true;
+    scheduler.failFastHandled = true;
     const active = [...this.activeTurns.values()].filter((item) => item.taskId !== failedTaskId);
     this.#lifecycle("delivery fail-fast", { taskId: failedTaskId, error: String(error).slice(0, 300), interruptedTasks: active.map((item) => item.taskId) });
     await Promise.allSettled(active.map((turn) => this.#interruptAndAwaitTurn(client, turn, "delivery_fail_fast", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 })));
@@ -2275,7 +2377,12 @@ export class SwarmRouter extends EventEmitter {
   #onProviderLifecycle(event) {
     let normalized;
     try { normalized = validateLifecycleEvent(event); }
-    catch (error) { this.#lifecycle("execution provider protocol violation", { errorCode: error.errorCode ?? "protocol_violation" }); return; }
+    catch (error) {
+      const active = [...this.activeTurns.values()].find((candidate) => candidate.correlationId === event?.correlationId) ?? null;
+      if (active) this.#handleActiveProtocolViolation(active, event, error);
+      else this.#lifecycle("execution provider protocol violation", protocolViolationDetails(event, error));
+      return;
+    }
     if (normalized.providerGlobal) {
       if (normalized.kind === "account_updated" && normalized.success) this.account.onRateLimitsUpdated({ rateLimits: normalized.data.rateLimits ?? {} });
       else if (normalized.kind === "process_exit") {
@@ -2314,15 +2421,15 @@ export class SwarmRouter extends EventEmitter {
       : active?.permittedTurnIds?.has(data.turnId) || active?.turnId === data.turnId;
     const validActiveEvent = Boolean(taskId && active && task?.status === "running" && active.correlationId === normalized.correlationId && active.threadId === data.threadId && permitted);
     if (!validActiveEvent) {
-      if (active && task?.status === "running") this.#handleActiveProtocolViolation(active);
+      if (active && task?.status === "running") this.#handleActiveProtocolViolation(active, normalized, new ExecutionProviderError("protocol_violation", "task lifecycle identity mismatch"));
       else {
-        this.#lifecycle("execution provider protocol violation", { errorCode: "protocol_violation" });
+        this.#lifecycle("execution provider protocol violation", protocolViolationDetails(normalized, new ExecutionProviderError("protocol_violation", "unowned or stale lifecycle event")));
         if (normalized.kind === "approval_requested" && !taskId) this.#settleUnownedApproval(data);
       }
       return;
     }
     if (normalized.kind === "turn_alias") {
-      if (!active.permittedTurnIds.has(data.requestedTurnId) || data.turnId !== data.resolvedTurnId) { this.#handleActiveProtocolViolation(active); return; }
+      if (!active.permittedTurnIds.has(data.requestedTurnId) || data.turnId !== data.resolvedTurnId) { this.#handleActiveProtocolViolation(active, normalized, new ExecutionProviderError("protocol_violation", "turn alias lineage mismatch")); return; }
       active.permittedTurnIds.add(data.resolvedTurnId);
       this.activeTurns.set(taskId, { ...active, turnId: data.resolvedTurnId, permittedTurnIds: active.permittedTurnIds });
       this.#adoptResolvedTurnId(taskId, data.threadId, data.resolvedTurnId);
@@ -2343,7 +2450,7 @@ export class SwarmRouter extends EventEmitter {
     if (["item_started", "item_completed", "turn_completed"].includes(normalized.kind)) this.#lifecycle(normalized.kind.replace("_", " "), { taskId, threadId: data.threadId, turnId: data.turnId, itemType: data.itemType ?? null, itemStatus: data.itemStatus ?? data.terminalClass ?? null });
   }
 
-  #handleActiveProtocolViolation(active) {
+  #handleActiveProtocolViolation(active, event = null, error = new ExecutionProviderError("protocol_violation", "task lifecycle identity mismatch")) {
     const task = this.store.getTask(active.taskId);
     if (!task || task.status !== "running" || active.protocolViolationHandled) return;
     // Transition before awaiting provider work so a racing completion cannot
@@ -2351,7 +2458,7 @@ export class SwarmRouter extends EventEmitter {
     active.protocolViolationHandled = true;
     this.activeTurns.set(active.taskId, active);
     this.store.transition(active.taskId, "interrupted", { error: "protocol_violation: task lifecycle identity mismatch" });
-    this.#lifecycle("execution provider protocol violation", { taskId: active.taskId, errorCode: "protocol_violation" });
+    this.#recordExecutionProviderFailure(this.activeClient, task, error, { event }).catch(() => {});
     this.#interruptAndAwaitTurn(this.activeClient, active, "protocol_violation", { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 }).catch(() => {});
   }
 

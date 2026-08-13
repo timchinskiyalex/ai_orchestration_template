@@ -11,7 +11,7 @@ const usage = (params = {}) => {
 };
 const codeFor = (error) => {
   const text = String(error?.message ?? error).toLowerCase();
-  if (text.includes("timed out")) return "timeout";
+  if (text.includes("timed out") || text.includes("timeout")) return "timeout";
   if (text.includes("exited")) return "process_exit";
   if (text.includes("closed") || text.includes("shutdown")) return "shutdown";
   if (text.includes("interrupt")) return "interrupted";

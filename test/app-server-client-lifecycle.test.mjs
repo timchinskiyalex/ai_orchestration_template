@@ -271,6 +271,33 @@ test("independent read-only probe resolves a terminal turn when the primary App 
   assert.equal(client.protocolEvents().some((event) => event.method === "turn-id-alias" && event.resolvedTurnId === "durable-turn"), true);
 });
 
+test("independent thread/read probe shutdown terminates only its own Windows process tree", async () => {
+  const terminated = []; let spawned = 0;
+  const makeChild = (pid) => {
+    const child = new EventEmitter(); child.pid = pid; child.stdout = new PassThrough(); child.stderr = new PassThrough();
+    child.stdin = { writable: true, write(line) {
+      const message = JSON.parse(line);
+      if (message.method === "initialize") queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: message.id, result: { serverInfo: { name: "fake" } } })}\n`));
+      if (message.method === "thread/read") queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: message.id, result: { thread: { id: message.params.threadId, turns: [{ id: "turn-1", status: "completed", items: [] }] } } })}\n`));
+      return true;
+    } };
+    return child;
+  };
+  const client = new AppServerClient({
+    cwd: process.cwd(), platform: "win32", independentProbeDelayMs: 1, fallbackReadTimeoutMs: 30,
+    appServerLauncher: () => ({ command: "fake-codex", args: ["app-server"] }),
+    spawnProcess: () => makeChild(++spawned === 1 ? 101 : 202),
+    terminate: async ({ pid }) => { terminated.push(pid); return { attempted: true }; }
+  });
+  await client.connect();
+  const turn = await client.waitForTurn("thread-1", "turn-1", 100);
+  assert.equal(turn.status, "completed");
+  assert.deepEqual(terminated, [202], "probe cleanup may not terminate the parent provider tree");
+  assert.deepEqual(client.diagnostics().process, { alive: true, exited: false, code: null, signal: null });
+  await client.shutdown();
+  assert.deepEqual(terminated, [202, 101]);
+});
+
 test("thread/read never aliases an unobserved terminal turn when multiple turns exist", async () => {
   const client = clientWithWritableStdin({
     fallbackReadTimeoutMs: 30,

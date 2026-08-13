@@ -18,9 +18,14 @@ function redact(text) {
 }
 
 function turnFromCompleted(params = {}) {
-  const turn = params.turn && typeof params.turn === "object" ? params.turn : (params.turnId ? { id: params.turnId, status: params.status ?? "completed" } : null);
+  // A `turn/completed` method name, an item event, or an alias is not enough
+  // to free controller capacity.  The server must explicitly report one of
+  // the terminal turn states for the exact observed turn.
+  const turn = params.turn && typeof params.turn === "object"
+    ? params.turn
+    : (params.turnId && typeof params.status === "string" ? { id: params.turnId, status: params.status } : null);
   const threadId = params.threadId ?? params.thread?.id ?? turn?.threadId ?? null;
-  return turn?.id && threadId ? { threadId, turn } : null;
+  return turn?.id && threadId && TERMINAL_TURN_STATUSES.has(turn.status) ? { threadId, turn } : null;
 }
 
 function terminalTurnFromThread(result, threadId, turnId) {
