@@ -5,12 +5,29 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
-import { parseThinAcceptArgs, runSemanticAuditTurn, runThinAccept, ThinAcceptanceAuditRuntimeError, thinAcceptUsage } from "../scripts/thin-accept.mjs";
+import { parseThinAcceptArgs, readThinProductDocuments, runSemanticAuditTurn, runThinAccept, ThinAcceptanceAuditRuntimeError, thinAcceptUsage } from "../scripts/thin-accept.mjs";
 
 test("thin acceptance CLI parses only explicit candidate and repair inputs", () => {
   const parsed = parseThinAcceptArgs(["--repo", "repo", "--docs", "docs", "--candidate", "abcdef1", "--verify", "node --test", "--repair-surface", "apps/api, apps/web", "--confirm-spend-quota"]);
-  assert.deepEqual(parsed, { repo: "repo", docs: "docs", candidate: "abcdef1", verify: "node --test", repairSurface: ["apps/api", "apps/web"], auditTimeoutMs: 180_000, confirm: true, help: false });
+  assert.deepEqual(parsed, { repo: "repo", docs: "docs", productDocs: [], candidate: "abcdef1", verify: "node --test", repairSurface: ["apps/api", "apps/web"], auditTimeoutMs: 180_000, confirm: true, help: false });
   assert.match(thinAcceptUsage(), /thin-accept/);
+});
+
+test("acceptance selects only TECH_SPEC by default and requires explicit selection when ambiguous", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "thin-product-docs-"));
+  const docs = join(root, "docs"); mkdirSync(join(docs, "nested"), { recursive: true });
+  writeFileSync(join(docs, "TECH_SPEC.md"), "# Spec\n- The application must show city guides.\n");
+  writeFileSync(join(docs, "agency_manifesto.md"), "# Process\n- Agents must commit after every task.\n");
+  const selected = readThinProductDocuments({ docs });
+  assert.deepEqual(selected.map((document) => document.documentId), ["TECH_SPEC.md"]);
+  assert.match(selected[0].markdown, /city guides/);
+  writeFileSync(join(docs, "nested", "TECH_SPEC.md"), "# Other\n- The application must provide a map.\n");
+  assert.throws(() => readThinProductDocuments({ docs }), /Multiple TECH_SPEC/);
+  const explicit = readThinProductDocuments({ docs, productDocs: ["TECH_SPEC.md"] });
+  assert.equal(explicit.length, 1);
+  writeFileSync(join(root, "outside.md"), "# Outside\n- The application must not be read.\n");
+  assert.throws(() => readThinProductDocuments({ docs, productDocs: ["../outside.md"] }), /inside --docs/);
+  t.after(() => rmSync(root, { recursive: true, force: true }));
 });
 
 test("acceptance audit uses the thin runtime receipt and resolved turn alias", async () => {
@@ -143,7 +160,7 @@ function createRepositoryFixture(t) {
   git(repository, ["config", "user.name", "Fixture"]);
   git(repository, ["config", "user.email", "fixture@example.test"]);
   writeFileSync(join(repository, "src", "seed.txt"), "seed\n");
-  writeFileSync(join(docs, "requirements.md"), "# Product\n\n- Must create repaired output.\n");
+  writeFileSync(join(docs, "TECH_SPEC.md"), "# Product\n\n- The application must create repaired output.\n");
   git(repository, ["add", "--", "src/seed.txt"]);
   git(repository, ["commit", "-m", "fixture"]);
   const sourceHead = git(repository, ["rev-parse", "HEAD"]);

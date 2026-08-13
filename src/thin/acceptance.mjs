@@ -8,13 +8,13 @@ const MAX_REASON = 500;
  * Controller-owned, deterministic acceptance units.  The model receives these
  * IDs but has no authority to create, omit, or rename them.
  */
-export function snapshotThinAcceptanceSources(markdown) {
-  if (typeof markdown !== "string" || !markdown.trim()) throw new TypeError("markdown must be non-empty");
-  const normalized = markdown.replace(/\r\n?/g, "\n");
-  return Object.freeze({ schemaVersion: 1, sourceDigest: createHash("sha256").update(normalized, "utf8").digest("hex"), lineCount: normalized.split("\n").length, normalized });
+export function snapshotThinAcceptanceSources(input) {
+  const documents = normalizeAcceptanceDocuments(input);
+  const sourceDigest = createHash("sha256").update(documents.map((document) => `${document.documentId}\0${document.sourceDigest}`).join("\n"), "utf8").digest("hex");
+  return Object.freeze({ schemaVersion: 2, sourceDigest, lineCount: documents.reduce((total, document) => total + document.lineCount, 0), documents: Object.freeze(documents) });
 }
 
-export function extractThinAcceptanceCriteria(markdown) {
+function extractThinAcceptanceCriteriaLegacy(markdown) {
   const source = snapshotThinAcceptanceSources(markdown);
   const seen = new Set();
   const criteria = [];
@@ -40,6 +40,58 @@ export function extractThinAcceptanceCriteria(markdown) {
     criteria.push(Object.freeze({ requirementId: `requirement-${digest.slice(0, 16)}`, criterionId: `criterion-${digest.slice(16, 32)}`, statement, sourceRef: Object.freeze({ startLine: first.lineNumber, endLine: first.lineNumber, fragmentDigest: digest }) }));
   }
   return Object.freeze(criteria);
+}
+
+export function extractThinAcceptanceCriteria(input) {
+  const source = snapshotThinAcceptanceSources(input);
+  const seen = new Set();
+  const criteria = [];
+  for (const document of source.documents) {
+    const lines = document.normalized.split("\n").map((line, index) => ({ line: line.trim(), lineNumber: index + 1 }));
+    for (const { line, lineNumber } of lines) {
+      if (!isProductAcceptanceStatement(line)) continue;
+      const statement = line.replace(/^[-*+]\s+|^\d+[.)]\s+|^- \[[ xX]\]\s+/, "").slice(0, 1_000);
+      const semanticKey = statement.toLocaleLowerCase();
+      if (!statement || seen.has(semanticKey)) continue;
+      seen.add(semanticKey);
+      const digest = createHash("sha256").update(`${document.sourceDigest}\n${lineNumber}\n${statement}`, "utf8").digest("hex");
+      criteria.push(Object.freeze({
+        requirementId: `requirement-${digest.slice(0, 16)}`,
+        criterionId: `criterion-${digest.slice(16, 32)}`,
+        statement,
+        sourceRef: Object.freeze({ documentId: document.documentId, sourceDigest: document.sourceDigest, startLine: lineNumber, endLine: lineNumber, fragmentDigest: digest })
+      }));
+      if (criteria.length >= MAX_CRITERIA) return Object.freeze(criteria);
+    }
+  }
+  if (!criteria.length) throw new Error("No product acceptance requirements found in selected product documents");
+  return Object.freeze(criteria);
+}
+
+/** Controller-owned classification: audit output cannot promote process text. */
+export function isProductAcceptanceStatement(value) {
+  const line = String(value ?? "").trim();
+  if (!/^([-*+]\s+|- \[[ xX]\]\s+|\d+[.)]\s+)/.test(line)) return false;
+  const statement = line.replace(/^[-*+]\s+|^\d+[.)]\s+|^- \[[ xX]\]\s+/, "");
+  const processOnly = /\b(agent|worker|orchestrator|controller|planner|reviewer|audit(?:or|ing)?|prompt|stage|task|worktree|codex|app server|shell|terminal|npm|node(?:\.js)?|git|commit|push|pull request|pr|ci\/cd|documentation|document(?:ation)?|markdown|folder|directory|file path|line number|token budget|quota|агент|воркер|оркестратор|контролер|планувальник|рев[’']юер|аудит|промпт|етап|таск|ворктрі|термінал|коміт|пуш|документац|папк|файл|шлях|рядок|токен|квот)\b/i;
+  if (!statement || /^(note|example|rationale|implementation note)\s*:/i.test(statement) || processOnly.test(statement)) return false;
+  const productSignal = /\b(users?|visitors?|customers?|travelers?|members?|admins?|application|app|website|web|api|service|system|screen|page|guides?|cities|city|trip|account|profile|favorites?|ratings?|payment|purchase|search|map|data|content|booking|route|notification|dashboard|report)\b|\b(користувач|відвідувач|клієнт|мандрівник|адмін|додаток|застосунок|сайт|сервіс|система|екран|сторінка|гід|місто|подорож|акаунт|профіль|обран|рейтинг|оплат|покупк|пошук|мапа|дані|контент|бронюван|маршрут|сповіщен|панел|звіт)/i;
+  const requirementSignal = /\b(must|shall|required|can|should|supports?|allows?|shows?|displays?|creates?|stores?|returns?|provides?)\b|\b(має|повинен|повинна|може|потрібно|дозволяє|показує|створює|зберігає|повертає|надає)/i;
+  return productSignal.test(statement) && requirementSignal.test(statement);
+}
+
+function normalizeAcceptanceDocuments(input) {
+  const supplied = typeof input === "string" ? [{ documentId: "inline-product-document", markdown: input }] : input;
+  if (!Array.isArray(supplied) || !supplied.length) throw new TypeError("at least one product document is required");
+  const seen = new Set();
+  return supplied.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item) || typeof item.markdown !== "string" || !item.markdown.trim()) throw new TypeError("product document markdown must be non-empty");
+    const documentId = typeof item.documentId === "string" && item.documentId.trim() ? item.documentId.trim() : `product-document-${index + 1}`;
+    if (seen.has(documentId)) throw new Error(`duplicate product document ID: ${documentId}`);
+    seen.add(documentId);
+    const normalized = item.markdown.replace(/\r\n?/g, "\n");
+    return Object.freeze({ documentId, sourceDigest: createHash("sha256").update(normalized, "utf8").digest("hex"), lineCount: normalized.split("\n").length, normalized });
+  }).sort((left, right) => left.documentId.localeCompare(right.documentId));
 }
 
 export function buildThinAcceptancePrompt({ criteria, candidateSha }) {
@@ -85,11 +137,12 @@ export function validateThinAcceptanceCandidate(candidate, criteria) {
  * Performs one audit, optionally one controller-authorized repair, and a
  * mandatory second audit/verification. Every incomplete result fails closed.
  */
-export async function runThinAcceptance({ markdown, candidateSha, audit, verify, repair = null, onEvent = () => {} } = {}) {
+export async function runThinAcceptance({ markdown, sources = null, candidateSha, audit, verify, repair = null, onEvent = () => {} } = {}) {
   if (typeof audit !== "function" || typeof verify !== "function") throw new TypeError("audit and verify must be functions");
   if (repair != null && typeof repair !== "function") throw new TypeError("repair must be a function when provided");
-  const sourceSnapshot = snapshotThinAcceptanceSources(markdown);
-  const criteria = extractThinAcceptanceCriteria(markdown);
+  const sourceInput = sources ?? markdown;
+  const sourceSnapshot = snapshotThinAcceptanceSources(sourceInput);
+  const criteria = extractThinAcceptanceCriteria(sourceInput);
   const events = [];
   const emit = (type, details = {}) => { const event = { type, ...details }; events.push(event); onEvent(event); };
   let currentSha = candidateSha;
@@ -155,7 +208,7 @@ function blocked(code, { candidateSha, sourceSnapshot = null, criteria, report =
   return Object.freeze({ ok: false, state: "blocked", code, candidateSha, report: boundedReport({ state: "blocked", code, candidateSha, sourceSnapshot, criteria, results: report?.results ?? [], verification, detail, auditRuntime }), events });
 }
 function boundedReport({ state, code = null, candidateSha, sourceSnapshot, criteria, results, verification, detail = null, auditRuntime = null }) {
-  return Object.freeze({ schemaVersion: 1, kind: "ThinAcceptanceReport", state, code, candidateSha, sourceSnapshot: sourceSnapshot ? { sourceDigest: sourceSnapshot.sourceDigest, lineCount: sourceSnapshot.lineCount } : null, criterionCount: criteria.length, criteria: criteria.map((criterion) => ({ requirementId: criterion.requirementId, criterionId: criterion.criterionId, sourceRef: criterion.sourceRef })), results: results.map((row) => ({ criterionId: row.criterionId, status: row.status, reason: bounded(row.reason) })), verification: verification?.ok ? { verificationId: verification.verificationId, candidateSha: verification.candidateSha, status: "pass" } : { verificationId: verification?.verificationId ?? null, candidateSha, status: "failed" }, detail: detail ? bounded(detail) : null, auditRuntime: safeAuditRuntime(auditRuntime) });
+  return Object.freeze({ schemaVersion: 2, kind: "ThinAcceptanceReport", state, code, candidateSha, sourceSnapshot: sourceSnapshot ? { sourceDigest: sourceSnapshot.sourceDigest, lineCount: sourceSnapshot.lineCount, documents: sourceSnapshot.documents.map((document) => ({ documentId: document.documentId, sourceDigest: document.sourceDigest, lineCount: document.lineCount })) } : null, criterionCount: criteria.length, criteria: criteria.map((criterion) => ({ requirementId: criterion.requirementId, criterionId: criterion.criterionId, sourceRef: criterion.sourceRef })), results: results.map((row) => ({ criterionId: row.criterionId, status: row.status, reason: bounded(row.reason) })), verification: verification?.ok ? { verificationId: verification.verificationId, candidateSha: verification.candidateSha, status: "pass" } : { verificationId: verification?.verificationId ?? null, candidateSha, status: "failed" }, detail: detail ? bounded(detail) : null, auditRuntime: safeAuditRuntime(auditRuntime) });
 }
 function repairContext(report, verification) {
   const gaps = report.results.filter((row) => row.status !== "pass").map((row) => `${row.criterionId}: ${row.status}: ${row.reason}`);

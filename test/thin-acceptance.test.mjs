@@ -13,6 +13,21 @@ test("controller derives bounded deterministic criteria and rejects unmapped sem
   assert.throws(() => validateThinAcceptanceCandidate({ results: criteria.map((item) => ({ criterionId: item.criterionId, status: "pass", reason: "ok", candidateSha: sha })) }, criteria), /unsupported fields/);
 });
 
+test("controller accepts product requirements but excludes manifesto and process instructions before audit", () => {
+  const criteria = extractThinAcceptanceCriteria([
+    { documentId: "TECH_SPEC.md", markdown: "# Product\n\n- Users must register and log in.\n- The website must display paid city guides.\n- The API must return a user's favorites.\n" },
+    { documentId: "agency_manifesto.md", markdown: "# Agency\n\n- Agents must create a worktree for each task.\n- The reviewer must run npm test.\n- Documentation must be stored in a folder.\n" },
+  ]);
+  assert.deepEqual(criteria.map((criterion) => criterion.statement), [
+    "Users must register and log in.",
+    "The website must display paid city guides.",
+    "The API must return a user's favorites.",
+  ]);
+  assert.ok(criteria.every((criterion) => criterion.sourceRef.documentId === "TECH_SPEC.md"));
+  assert.ok(criteria.every((criterion) => /^[a-f0-9]{64}$/.test(criterion.sourceRef.sourceDigest)));
+  assert.throws(() => extractThinAcceptanceCriteria([{ documentId: "agency_manifesto.md", markdown: "# Agency\n- Agents must create a worktree.\n" }]), /No product acceptance requirements/);
+});
+
 test("passing audit and controller verification accept the exact candidate without repair", async () => {
   let repairs = 0;
   const result = await runThinAcceptance({

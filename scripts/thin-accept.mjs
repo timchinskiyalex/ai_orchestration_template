@@ -1,5 +1,5 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
@@ -10,20 +10,21 @@ import { runThinRepair } from "../src/thin/repair.mjs";
 import { runThinAppServerWorker } from "../src/thin/app-server-worker.mjs";
 import { finalizeWorkerArtifact } from "../src/thin/finalizer.mjs";
 import { CodexAppServerRuntime } from "../src/codex-app-server-runtime.mjs";
-import { readMarkdownPackage, runVerification } from "./thin-deliver.mjs";
+import { runVerification } from "./thin-deliver.mjs";
 
 const exec = promisify(execFile);
 
 export function parseThinAcceptArgs(argv) {
-  const options = { repo: process.cwd(), docs: null, candidate: null, verify: null, repairSurface: null, auditTimeoutMs: 180_000, confirm: false, help: false };
+  const options = { repo: process.cwd(), docs: null, productDocs: [], candidate: null, verify: null, repairSurface: null, auditTimeoutMs: 180_000, confirm: false, help: false };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--help" || value === "-h") options.help = true;
     else if (value === "--confirm-spend-quota") options.confirm = true;
-    else if (["--repo", "--docs", "--candidate", "--verify", "--repair-surface", "--audit-timeout-ms"].includes(value)) {
+    else if (["--repo", "--docs", "--product-doc", "--candidate", "--verify", "--repair-surface", "--audit-timeout-ms"].includes(value)) {
       const argument = argv[++index]; if (!argument) throw new Error(`${value} requires a value`);
       if (value === "--repo") options.repo = argument;
       if (value === "--docs") options.docs = argument;
+      if (value === "--product-doc") options.productDocs.push(argument);
       if (value === "--candidate") options.candidate = argument;
       if (value === "--verify") options.verify = argument;
       if (value === "--repair-surface") options.repairSurface = [...new Set(argument.split(",").map((part) => part.trim()).filter(Boolean))];
@@ -33,7 +34,63 @@ export function parseThinAcceptArgs(argv) {
   return options;
 }
 
-export const thinAcceptUsage = () => "Usage: node scripts/thin-accept.mjs --repo <git-repo> --docs <Markdown file-or-directory> --candidate <SHA> --verify <command> --repair-surface <path,path> [--audit-timeout-ms 1000..240000] --confirm-spend-quota";
+export const thinAcceptUsage = () => "Usage: node scripts/thin-accept.mjs --repo <git-repo> --docs <Markdown file-or-directory> [--product-doc <Markdown file> ...] --candidate <SHA> --verify <command> --repair-surface <path,path> [--audit-timeout-ms 1000..240000] --confirm-spend-quota\nA docs directory defaults only to one TECH_SPEC.md; otherwise pass explicit --product-doc values.";
+
+/** Only selected product Markdown can create acceptance criteria. */
+export function readThinProductDocuments({ docs, productDocs = [] } = {}) {
+  const docsPath = resolve(requireText(docs, "--docs"));
+  const docsStats = statSync(docsPath);
+  const selected = productDocs.length ? productDocs.map((value) => resolveProductDocument(docsPath, docsStats, value)) : defaultProductDocuments(docsPath, docsStats);
+  const unique = [...new Set(selected.map((path) => realpathSync(path)))].sort((left, right) => left.localeCompare(right));
+  if (!unique.length) throw new Error("No product document selected; pass --product-doc");
+  return Object.freeze(unique.map((path) => Object.freeze({ documentId: productDocumentId(docsPath, docsStats, path), markdown: readFileSync(path, "utf8") })));
+}
+
+function defaultProductDocuments(docsPath, docsStats) {
+  if (docsStats.isFile()) return [assertMarkdownFile(docsPath, "--docs")];
+  if (!docsStats.isDirectory()) throw new Error("--docs must be a Markdown file or directory");
+  const matches = [];
+  const visit = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+      const path = join(directory, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile() && entry.name.toLowerCase() === "tech_spec.md") matches.push(path);
+    }
+  };
+  visit(docsPath);
+  if (matches.length !== 1) throw new Error(matches.length ? "Multiple TECH_SPEC.md files found; pass explicit --product-doc values" : "No TECH_SPEC.md found; pass explicit --product-doc values");
+  return matches;
+}
+
+function resolveProductDocument(docsPath, docsStats, input) {
+  const value = requireText(input, "--product-doc");
+  const candidate = resolve(isAbsolute(value) ? value : docsStats.isDirectory() ? join(docsPath, value) : value);
+  if (docsStats.isDirectory() && !isInside(docsPath, candidate)) throw new Error("--product-doc must be inside --docs directory");
+  if (docsStats.isFile() && realpathSync(candidate) !== realpathSync(docsPath)) throw new Error("--product-doc must match the --docs file");
+  return assertMarkdownFile(candidate, "--product-doc");
+}
+
+function assertMarkdownFile(path, label) {
+  if (extname(path).toLowerCase() !== ".md") throw new Error(`${label} must identify a Markdown file`);
+  const stats = lstatSync(path);
+  if (stats.isSymbolicLink() || !stats.isFile()) throw new Error(`${label} must identify a regular Markdown file`);
+  return path;
+}
+
+function isInside(root, child) {
+  const value = relative(realpathSync(root), realpathSync(child));
+  return value !== "" && !value.startsWith(`..${sep}`) && value !== ".." && !isAbsolute(value);
+}
+
+function productDocumentId(docsPath, docsStats, path) {
+  return docsStats.isDirectory() ? relative(realpathSync(docsPath), realpathSync(path)).replaceAll("\\", "/") : realpathSync(path).replaceAll("\\", "/");
+}
+
+function requireText(value, label) {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${label} requires a value`);
+  return value.trim();
+}
 
 /**
  * The optional dependencies are deliberately test-only seams.  They keep the
@@ -48,11 +105,12 @@ export async function runThinAccept({ argv = process.argv.slice(2), stdout = con
   if (![options.docs, options.candidate, options.verify, options.repairSurface?.length].every(Boolean)) { stderr("[failure] stage=argument code=docs_candidate_verify_and_repair_surface_required"); return 2; }
   if (!/^[0-9a-f]{7,64}$/i.test(options.candidate)) { stderr("[failure] stage=argument code=candidate_sha_invalid"); return 2; }
 
-  const repository = resolve(options.repo); const markdown = (dependencies.readMarkdownPackage ?? readMarkdownPackage)(options.docs);
+  const repository = resolve(options.repo);
   const runtimeDir = dependencies.createRuntimeDir?.() ?? mkdtempSync(join(tmpdir(), "thin-acceptance-"));
   let isolated = null; let result = null; let cleanupAllowed = false;
   const writeReport = (report) => { const path = join(runtimeDir, "acceptance-report.json"); writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`); stdout(`[acceptance] report ${path}`); return path; };
   try {
+    const sources = (dependencies.readThinProductDocuments ?? readThinProductDocuments)({ docs: options.docs, productDocs: options.productDocs });
     const sourceIdentity = await readSourceIdentity(repository);
     const createWorktree = dependencies.createIsolatedWorktree ?? createIsolatedWorktree;
     const removeWorktree = dependencies.removeIsolatedWorktree ?? removeIsolatedWorktree;
@@ -85,7 +143,7 @@ export async function runThinAccept({ argv = process.argv.slice(2), stdout = con
         return finalize({ taskId: "acceptance-repair-1", worktree: isolated.worktree, baseSha, allowedPaths: repairPlan.allowedPaths });
       },
     }).then((repairResult) => repairResult.ok ? { ok: true, candidateSha: repairResult.artifact.commitSha, attempts: repairResult.attempts } : repairResult);
-    result = await runThinAcceptance({ markdown, candidateSha: isolated.baseSha, audit, verify, repair, onEvent: (event) => { if (event.type === "audit_started") stdout(`[acceptance] audit ${event.phase} started`); if (event.type === "audit_completed") stdout(`[acceptance] audit ${event.phase} ${event.passing ? "passed" : "gaps"}`); if (event.type === "verification_completed") stdout(`[acceptance] verification ${event.phase} passed`); } });
+    result = await runThinAcceptance({ sources, candidateSha: isolated.baseSha, audit, verify, repair, onEvent: (event) => { if (event.type === "audit_started") stdout(`[acceptance] audit ${event.phase} started`); if (event.type === "audit_completed") stdout(`[acceptance] audit ${event.phase} ${event.passing ? "passed" : "gaps"}`); if (event.type === "verification_completed") stdout(`[acceptance] verification ${event.phase} passed`); } });
     let candidateBranch = null;
     if (result.ok && result.repaired) {
       candidateBranch = await assertDurableAcceptanceCandidate({ repository, isolated, candidateSha: result.candidateSha, sourceIdentity });
