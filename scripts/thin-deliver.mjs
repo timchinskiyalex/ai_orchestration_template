@@ -8,21 +8,24 @@ import { AppServerClient } from "../src/app-server-client.mjs";
 import { createThinPlan } from "../src/thin/planner.mjs";
 import { runThinOrchestrator } from "../src/thin/orchestrator.mjs";
 import { runThinAppServerWorker } from "../src/thin/app-server-worker.mjs";
+import { finalizeWorkerArtifact } from "../src/thin/finalizer.mjs";
+import { runThinRepair } from "../src/thin/repair.mjs";
 
 const exec = promisify(execFile);
 const MAX_DOC_BYTES = 1_000_000;
 const MAX_DOC_FILES = 40;
 
 export function parseThinDeliverArgs(argv) {
-  const options = { repo: process.cwd(), docs: null, verify: null, fake: false, confirm: false };
+  const options = { repo: process.cwd(), docs: null, verify: null, repairSurface: null, fake: false, confirm: false };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--fake") options.fake = true;
     else if (value === "--confirm-spend-quota") options.confirm = true;
-    else if (value === "--docs" || value === "--repo" || value === "--verify") {
+    else if (value === "--docs" || value === "--repo" || value === "--verify" || value === "--repair-surface") {
       const argument = argv[++index];
       if (!argument || argument.startsWith("--")) throw new Error(`${value} requires a value`);
-      options[value.slice(2)] = argument;
+      if (value === "--repair-surface") options.repairSurface = parseRepairSurface(argument);
+      else options[value.slice(2)] = argument;
     } else if (value === "--help" || value === "-h") options.help = true;
     else throw new Error(`unknown option: ${value}`);
   }
@@ -30,7 +33,7 @@ export function parseThinDeliverArgs(argv) {
 }
 
 export function thinDeliverUsage() {
-  return "Usage: node scripts/thin-deliver.mjs --docs <file-or-directory> --verify <command> [--repo <git-repo>] [--confirm-spend-quota | --fake]";
+  return "Usage: node scripts/thin-deliver.mjs --docs <file-or-directory> --verify <command> [--repo <git-repo>] [--repair-surface <path,path>] [--confirm-spend-quota | --fake]";
 }
 
 export function readMarkdownPackage(input) {
@@ -82,7 +85,7 @@ export async function runThinDeliver({ argv = process.argv.slice(2), stdout = co
     const markdown = readMarkdownPackage(options.docs);
     const result = options.fake
       ? await runFake({ markdown, verify: options.verify, stdout })
-      : await runLive({ markdown, repository: resolve(options.repo), verify: options.verify, stdout });
+      : await runLive({ markdown, repository: resolve(options.repo), verify: options.verify, repairSurface: options.repairSurface, stdout });
     return result.ok ? 0 : 1;
   } catch (error) {
     stderr(`[failure] stage=cli code=unexpected_error task=- recovery=- message=${safe(error.message)}`);
@@ -90,7 +93,7 @@ export async function runThinDeliver({ argv = process.argv.slice(2), stdout = co
   }
 }
 
-async function runLive({ markdown, repository, verify, stdout }) {
+async function runLive({ markdown, repository, verify, repairSurface, stdout }) {
   const runtimeDir = mkdtempSync(join(tmpdir(), "thin-orchestrator-runtime-"));
   try {
     stdout("[plan] started");
@@ -107,12 +110,63 @@ async function runLive({ markdown, repository, verify, stdout }) {
         return { worker, verification: [] };
       },
       verifyIntegration: ({ worktree }) => runVerification({ worktree, command: verify }),
+      repair: repairSurface ? createLiveRepair({ repository, repairSurface, stdout }) : null,
       onEvent: (event) => emitControllerEvent(stdout, event),
     });
     return result;
   } finally {
     rmSync(runtimeDir, { recursive: true, force: true });
   }
+}
+
+function createLiveRepair({ repository, repairSurface, stdout }) {
+  return async ({ verificationFailure, candidateSha, worktree, artifacts, attempts }) => {
+    const result = await runThinRepair({
+      verificationFailure,
+      candidateSha,
+      attempts,
+      repairSurface,
+      previousWaveTaskScopes: artifacts.map((artifact) => ({ taskId: artifact.taskKey, allowedPaths: artifact.changedPaths })),
+      planRepair: async ({ verificationFailure: failureOutput, repairSurface: surface }) => {
+        const prompt = buildThinRepairPlannerPrompt({ failureOutput, repairSurface: surface });
+        return JSON.parse(await runPlannerTurn({ cwd: repository, prompt, stdout, label: "repair" }));
+      },
+      executeRepair: async ({ candidateSha: repairBaseSha, repairPlan }) => {
+        const worker = await runThinAppServerWorker({
+          cwd: worktree,
+          taskKey: "repair-1",
+          prompt: repairPlan.prompt,
+          allowedPaths: repairPlan.allowedPaths,
+          onEvent: (event) => emitWorkerRuntimeEvent(stdout, event),
+        });
+        return finalizeWorkerArtifact({
+          taskId: "repair-1",
+          worktree,
+          baseSha: repairBaseSha,
+          allowedPaths: repairPlan.allowedPaths,
+          verification: [],
+          processRunner: worker?.processRunner,
+        });
+      },
+    });
+    if (!result.ok) return result;
+    return { ok: true, candidateSha: result.artifact.commitSha, artifact: result.artifact, attempts: result.attempts };
+  };
+}
+
+function buildThinRepairPlannerPrompt({ failureOutput, repairSurface }) {
+  return [
+    "You are the repair planner for one failed local verification.",
+    "Return exactly one JSON object and no Markdown fences or commentary.",
+    'Exact schema: {"title":"...","prompt":"...","allowedPaths":["relative/path"]}.',
+    "Use only allowedPaths inside this controller-authorized repair surface:",
+    ...repairSurface.map((path) => `- ${path}`),
+    "Do not propose Git commands, commits, pushes, PRs, or edits outside that surface.",
+    "The controller will allow exactly one repair worker turn and one verification retry.",
+    "\n--- VERIFICATION FAILURE ---\n",
+    failureOutput,
+    "\n--- END VERIFICATION FAILURE ---",
+  ].join("\n");
 }
 
 async function runFake({ markdown, verify, stdout }) {
@@ -152,7 +206,7 @@ async function runFake({ markdown, verify, stdout }) {
   }
 }
 
-async function runPlannerTurn({ cwd, prompt, stdout }) {
+async function runPlannerTurn({ cwd, prompt, stdout, label = "plan" }) {
   const client = new AppServerClient({ cwd, serviceName: "thin-orchestrator-planner" });
   const streamedMessageByItemId = new Map();
   const onNotification = (message) => {
@@ -163,7 +217,7 @@ async function runPlannerTurn({ cwd, prompt, stdout }) {
     if (message?.method === "item/completed" && params.item?.type === "agentMessage" && typeof params.item?.text === "string") {
       streamedMessageByItemId.set(params.item.id ?? "completed", params.item.text);
     }
-    if (["item/started", "item/completed", "thread/tokenUsage/updated"].includes(message?.method)) stdout("[plan] activity");
+    if (["item/started", "item/completed", "thread/tokenUsage/updated"].includes(message?.method)) stdout(`[${label}] activity`);
   };
   client.on("notification", onNotification);
   try {
@@ -228,6 +282,9 @@ function emitControllerEvent(stdout, event) {
   else if (event.type === "wave_candidate") stdout(`[wave ${event.waveNumber}] candidate ${event.candidateSha}`);
   else if (event.type === "integration_started") stdout("[integration] started");
   else if (event.type === "integration_test_passed") stdout(`[integration] test passed ${event.candidateSha}`);
+  else if (event.type === "repair_started") stdout("[repair] started");
+  else if (event.type === "repair_committed") stdout(`[repair] committed ${event.candidateSha}`);
+  else if (event.type === "repair_test_passed") stdout(`[repair] test passed ${event.candidateSha}`);
   else if (event.type === "completed") stdout(`[completed] candidate ${event.candidateSha}`);
   else if (event.type === "failure") stdout(`[failure] stage=${event.stage} code=${event.code} task=${event.taskKey ?? "-"} recovery=${event.recoveryWorktree ?? "-"}${event.message ? ` message=${safe(event.message)}` : ""}`);
 }
@@ -236,11 +293,23 @@ async function runVerification({ worktree, command }) {
   const [executable, ...args] = process.platform === "win32"
     ? [process.env.ComSpec ?? "cmd.exe", "/d", "/s", "/c", command]
     : ["/bin/sh", "-lc", command];
-  await exec(executable, args, { cwd: worktree, encoding: "utf8", timeout: 120_000 });
+  try {
+    await exec(executable, args, { cwd: worktree, encoding: "utf8", timeout: 120_000 });
+  } catch (error) {
+    const output = [error?.stdout, error?.stderr].filter((value) => typeof value === "string" && value.trim()).join("\n");
+    const wrapped = new Error(`verification command failed: ${safe(error?.message)}`);
+    wrapped.output = output;
+    throw wrapped;
+  }
   return { ok: true };
 }
 
 function git(cwd, args) { return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim(); }
+function parseRepairSurface(value) {
+  const paths = String(value).split(",").map((path) => path.trim());
+  if (!paths.length || paths.some((path) => !path)) throw new Error("--repair-surface must be a comma-separated list of relative paths");
+  return [...new Set(paths)];
+}
 function requireText(value, label) { if (typeof value !== "string" || !value.trim()) throw new Error(`${label} is required`); return value.trim(); }
 function safe(value) { return String(value ?? "").replace(/[\r\n]+/g, " ").slice(0, 240); }
 

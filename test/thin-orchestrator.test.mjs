@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { runThinOrchestrator } from "../src/thin/orchestrator.mjs";
 import { validateThinPlanCandidate } from "../src/thin/planner.mjs";
+import { finalizeWorkerArtifact } from "../src/thin/finalizer.mjs";
+import { runThinRepair } from "../src/thin/repair.mjs";
 
 function git(cwd, ...args) { return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim(); }
 function plan(tasks) { return async () => ({ tasks }); }
@@ -79,6 +81,78 @@ test("reports integration verification failure without a candidate", async (t) =
   });
   assert.equal(result.ok, false); assert.equal(result.stage, "integration"); assert.equal(result.code, "verification_failed");
   assert.equal("candidateSha" in result, false); assert.equal(existsSync(result.recoveryWorktree), true);
+});
+
+test("runs exactly one controller-bounded repair after final verification failure and returns its verified candidate", async (t) => {
+  const { root, runtime } = fixture(t); const events = []; let verificationCalls = 0; let repairWorkerCalls = 0;
+  const result = await runThinOrchestrator({
+    repository: root, runtimeDir: runtime, markdown: "x", onEvent: (event) => events.push(event),
+    planner: plan([task("A", ["src"])]),
+    workerExecutor: async ({ worktree }) => { mkdirSync(join(worktree, "src")); writeFileSync(join(worktree, "src", "a.txt"), "a"); },
+    verifyIntegration: async ({ worktree }) => {
+      verificationCalls += 1;
+      return { ok: existsSync(join(worktree, "src", "repair.txt")), output: "expected repair.txt" };
+    },
+    repair: async ({ verificationFailure, candidateSha, worktree, artifacts, attempts }) => {
+      const repair = await runThinRepair({
+        verificationFailure, candidateSha, attempts, repairSurface: ["src"],
+        previousWaveTaskScopes: artifacts.map((artifact) => ({ taskId: artifact.taskKey, allowedPaths: artifact.changedPaths })),
+        planRepair: async () => ({ title: "Repair", prompt: "add repair file", allowedPaths: ["src"] }),
+        executeRepair: async ({ candidateSha: repairBaseSha, repairPlan }) => {
+          repairWorkerCalls += 1;
+          writeFileSync(join(worktree, "src", "repair.txt"), "repaired");
+          return finalizeWorkerArtifact({ taskId: "repair-1", worktree, baseSha: repairBaseSha, allowedPaths: repairPlan.allowedPaths });
+        },
+      });
+      return repair.ok ? { ok: true, candidateSha: repair.artifact.commitSha, artifact: repair.artifact, attempts: repair.attempts } : repair;
+    },
+  });
+  assert.equal(result.ok, true); assert.equal(verificationCalls, 2); assert.equal(repairWorkerCalls, 1);
+  assert.equal(result.artifacts.filter((artifact) => artifact.repair).length, 1);
+  assert.ok(events.some((event) => event.type === "repair_started"));
+  assert.ok(events.some((event) => event.type === "repair_committed"));
+  assert.ok(events.some((event) => event.type === "repair_test_passed"));
+});
+
+test("rejects an unsafe repair plan before any repair worker starts", async (t) => {
+  const { root, runtime } = fixture(t); let repairWorkerCalls = 0;
+  const result = await runThinOrchestrator({
+    repository: root, runtimeDir: runtime, markdown: "x", planner: plan([task("A", ["src"])]),
+    workerExecutor: async ({ worktree }) => { mkdirSync(join(worktree, "src")); writeFileSync(join(worktree, "src", "a.txt"), "a"); },
+    verifyIntegration: async () => ({ ok: false, output: "test failure" }),
+    repair: ({ verificationFailure, candidateSha, artifacts, attempts }) => runThinRepair({
+      verificationFailure, candidateSha, attempts, repairSurface: ["src"],
+      previousWaveTaskScopes: artifacts.map((artifact) => ({ taskId: artifact.taskKey, allowedPaths: artifact.changedPaths })),
+      planRepair: async () => ({ title: "Unsafe", prompt: "edit package", allowedPaths: ["package.json"] }),
+      executeRepair: async () => { repairWorkerCalls += 1; },
+    }),
+  });
+  assert.equal(result.ok, false); assert.equal(result.stage, "repair"); assert.equal(result.code, "repair_plan_rejected");
+  assert.equal(repairWorkerCalls, 0); assert.ok(existsSync(result.recoveryWorktree));
+});
+
+test("does not attempt a second repair when the single repair retry still fails verification", async (t) => {
+  const { root, runtime } = fixture(t); let verificationCalls = 0; let repairCalls = 0;
+  const result = await runThinOrchestrator({
+    repository: root, runtimeDir: runtime, markdown: "x", planner: plan([task("A", ["src"])]),
+    workerExecutor: async ({ worktree }) => { mkdirSync(join(worktree, "src")); writeFileSync(join(worktree, "src", "a.txt"), "a"); },
+    verifyIntegration: async () => { verificationCalls += 1; return { ok: false, output: "still failing" }; },
+    repair: async ({ verificationFailure, candidateSha, worktree, artifacts, attempts }) => {
+      repairCalls += 1;
+      const repair = await runThinRepair({
+        verificationFailure, candidateSha, attempts, repairSurface: ["src"],
+        previousWaveTaskScopes: artifacts.map((artifact) => ({ taskId: artifact.taskKey, allowedPaths: artifact.changedPaths })),
+        planRepair: async () => ({ title: "Repair", prompt: "write repair", allowedPaths: ["src"] }),
+        executeRepair: async ({ candidateSha: repairBaseSha, repairPlan }) => {
+          writeFileSync(join(worktree, "src", "repair.txt"), "repaired");
+          return finalizeWorkerArtifact({ taskId: "repair-1", worktree, baseSha: repairBaseSha, allowedPaths: repairPlan.allowedPaths });
+        },
+      });
+      return { ok: true, candidateSha: repair.artifact.commitSha, artifact: repair.artifact, attempts: repair.attempts };
+    },
+  });
+  assert.equal(result.ok, false); assert.equal(result.code, "verification_failed_after_repair");
+  assert.equal(verificationCalls, 2); assert.equal(repairCalls, 1); assert.ok(existsSync(result.recoveryWorktree));
 });
 
 test("integrates a scaffold wave before two parallel dependent writers with exact candidate lineage", async (t) => {

@@ -150,12 +150,14 @@ export async function runThinOrchestrator({
   planner,
   workerExecutor,
   verifyIntegration = async () => ({ ok: true }),
+  repair = null,
   onEvent = () => {},
   heartbeatMs = 5_000,
 }) {
   if (typeof planner !== "function") throw new TypeError("planner must be a function");
   if (typeof workerExecutor !== "function") throw new TypeError("workerExecutor must be a function");
   if (typeof verifyIntegration !== "function") throw new TypeError("verifyIntegration must be a function");
+  if (repair != null && typeof repair !== "function") throw new TypeError("repair must be a function when provided");
   if (!Number.isInteger(heartbeatMs) || heartbeatMs < 1 || heartbeatMs > 10_000) {
     throw new RangeError("heartbeatMs must be an integer from 1 through 10000");
   }
@@ -236,15 +238,65 @@ export async function runThinOrchestrator({
   try {
     verification = await createIsolatedWorktree({ repository, runtimeDir, taskId: "final-verification", baseSha: candidateSha });
     emit({ type: "integration_started", worktree: verification.worktree, baseSha: candidateSha });
-    const result = await verifyIntegration({ worktree: verification.worktree, baseSha: initialBaseSha, candidateSha, artifacts, waves });
-    if (result === false || result?.ok === false) {
-      return fail({ emit, stage: "integration", code: "verification_failed", recoveryWorktree: verification.worktree });
-    }
-    emit({ type: "integration_test_passed", candidateSha });
-    emit({ type: "completed", candidateSha, artifactCount: artifacts.length, waveCount: waves.length });
-    await removeIsolatedWorktree(verification);
-    return { ok: true, candidateSha, artifacts, waves };
   } catch (error) {
     return fail({ emit, stage: "integration", code: "integration_failed", recoveryWorktree: verification?.worktree ?? null, error });
   }
+
+  let verificationFailure;
+  try {
+    const result = await verifyIntegration({ worktree: verification.worktree, baseSha: initialBaseSha, candidateSha, artifacts, waves });
+    if (result === false || result?.ok === false) verificationFailure = result ?? { ok: false };
+  } catch (error) {
+    verificationFailure = error;
+  }
+
+  if (verificationFailure) {
+    if (!repair) {
+      return fail({ emit, stage: "integration", code: "verification_failed", recoveryWorktree: verification.worktree, error: verificationFailure });
+    }
+    emit({ type: "repair_started", candidateSha, worktree: verification.worktree });
+    let repaired;
+    try {
+      repaired = await repair({
+        verificationFailure,
+        candidateSha,
+        baseSha: initialBaseSha,
+        worktree: verification.worktree,
+        artifacts,
+        waves,
+        attempts: 0,
+      });
+    } catch (error) {
+      return fail({ emit, stage: "repair", code: "repair_failed", recoveryWorktree: verification.worktree, error });
+    }
+    if (repaired?.ok !== true || typeof repaired.candidateSha !== "string") {
+      return fail({
+        emit,
+        stage: "repair",
+        code: repaired?.reasonCode ?? "repair_failed",
+        recoveryWorktree: verification.worktree,
+        error: repaired?.detail ? new Error(repaired.detail) : null,
+        details: { repairAttempts: repaired?.attempts ?? 0 },
+      });
+    }
+    candidateSha = repaired.candidateSha;
+    if (repaired.artifact) artifacts.push({ ...repaired.artifact, taskKey: "repair-1", waveNumber: waveNumber + 1, repair: true });
+    emit({ type: "repair_committed", candidateSha, attempts: repaired.attempts ?? 1 });
+
+    try {
+      const retry = await verifyIntegration({ worktree: verification.worktree, baseSha: initialBaseSha, candidateSha, artifacts, waves });
+      if (retry === false || retry?.ok === false) {
+        return fail({ emit, stage: "integration", code: "verification_failed_after_repair", recoveryWorktree: verification.worktree });
+      }
+    } catch (error) {
+      return fail({ emit, stage: "integration", code: "verification_failed_after_repair", recoveryWorktree: verification.worktree, error });
+    }
+    emit({ type: "repair_test_passed", candidateSha });
+  }
+
+  emit({ type: "integration_test_passed", candidateSha });
+  emit({ type: "completed", candidateSha, artifactCount: artifacts.length, waveCount: waves.length });
+  try { await removeIsolatedWorktree(verification); }
+  catch (error) { return fail({ emit, stage: "integration", code: "verification_cleanup_failed", recoveryWorktree: verification.worktree, error }); }
+  return { ok: true, candidateSha, artifacts, waves };
 }

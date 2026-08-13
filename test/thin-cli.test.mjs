@@ -32,7 +32,10 @@ test("live CLI refuses before reading docs or starting any side effect without q
 test("CLI parses source, repository and verification options", (t) => {
   const docs = docsFixture(t);
   assert.deepEqual(parseThinDeliverArgs(["--docs", docs, "--repo", "repo", "--verify", "node --test", "--confirm-spend-quota"]), {
-    repo: "repo", docs, verify: "node --test", fake: false, confirm: true,
+    repo: "repo", docs, verify: "node --test", repairSurface: null, fake: false, confirm: true,
+  });
+  assert.deepEqual(parseThinDeliverArgs(["--docs", docs, "--verify", "node --test", "--repair-surface", "src, test/unit ,src"]), {
+    repo: process.cwd(), docs, verify: "node --test", repairSurface: ["src", "test/unit"], fake: false, confirm: false,
   });
   assert.match(readMarkdownPackage(docs), /Small project/);
   assert.match(thinDeliverUsage(), /thin-deliver/);
