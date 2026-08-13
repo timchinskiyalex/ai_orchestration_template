@@ -21,6 +21,9 @@ export function loadConfig(configPath) {
   config.runtimeDir = resolve(base, config.runtimeDir ?? "./runtime");
   config.baseRef ??= "main";
   config.model ??= "gpt-5.6-terra";
+  // Phase 2 is a deliberately closed writer-only migration. This switch is
+  // not a runtime registry and is retained solely for legacy parity.
+  config.writerRuntimePath ??= "codex-app-server";
   config.router ??= {};
   config.router.maxConcurrentTasks ??= 1;
   config.router.maxChildrenPerTask ??= 20;
@@ -125,6 +128,7 @@ export function loadConfig(configPath) {
   if (config.autonomy.mode === "autonomous" && ["autoApproveWorkflowGates", "autoRemediate", "autoPush", "autoCreatePullRequest", "autoMerge"].some((key) => config.autonomy[key] !== true)) throw new Error("autonomous mode requires all autonomy automation flags to be true; use manual mode for emergency debugging");
   if (!Number.isInteger(config.autonomy.maxRemediationRounds) || config.autonomy.maxRemediationRounds < 0 || config.autonomy.maxRemediationRounds > 10) throw new Error("autonomy.maxRemediationRounds must be an integer from 0 to 10");
   if (!Number.isInteger(config.router.maxConcurrentTasks) || config.router.maxConcurrentTasks < 1) throw new Error("router.maxConcurrentTasks must be a positive integer");
+  if (!["legacy", "codex-app-server"].includes(config.writerRuntimePath)) throw new Error("writerRuntimePath must be legacy or codex-app-server");
   if (!Number.isInteger(config.router.turnTimeoutMs) || config.router.turnTimeoutMs < 1000) throw new Error("router.turnTimeoutMs must be an integer of at least 1000");
   if (!Number.isInteger(config.router.maxPlanTasks) || config.router.maxPlanTasks < 1) throw new Error("router.maxPlanTasks must be a positive integer");
   if (!Number.isInteger(config.budget.weeklyTokenLimit) || config.budget.weeklyTokenLimit < 1) throw new Error("budget.weeklyTokenLimit must be a positive integer");

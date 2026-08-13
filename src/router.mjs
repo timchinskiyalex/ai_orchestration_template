@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { execFileSync } from "node:child_process";
 import { AppServerExecutionProvider } from "./app-server-execution-provider.mjs";
+import { CodexAppServerRuntime, resolveTransitionalRuntimePath } from "./codex-app-server-runtime.mjs";
 import { EXECUTION_PROVIDER_VERSION, assertCapabilities, validateEnvelope, validateLifecycleEvent, ExecutionProviderError } from "./execution-provider-contract.mjs";
 import { BudgetGovernor } from "./budget-governor.mjs";
 import { depthOf, finalStatusForRole, assertRole, ENGINEERING_DOMAINS } from "./domain.mjs";
@@ -43,6 +44,9 @@ function normalizedProviderDiagnostics(value) {
 
 const ACTIVE_CAPACITY_STATUSES = new Set(["preparing", "running", "awaiting_approval"]);
 const TERMINAL_TURN_CLASSES = new Set(["completed", "failed", "interrupted", "cancelled"]);
+// Phase 2 is intentionally a closed migration.  A workspace-write setting on
+// any other role does not opt that role into the Codex runtime.
+const MIGRATED_WRITER_ROLES = new Set(["frontend", "backend", "database", "devops"]);
 const safeProtocolReason = (value, limit = 320) => String(value?.message ?? value ?? "")
   .replace(/((?:api[_-]?key|token|secret|password|authorization|cookie|private[_-]?key)\s*[:=]\s*)([^\s,;]+)/gi, "$1[redacted]")
   .replace(/("(?:api[_-]?key|token|secret|password|authorization|cookie|private[_-]?key)"\s*:\s*")[^"]*(")/gi, "$1[redacted]$2")
@@ -147,6 +151,10 @@ export class SwarmRouter extends EventEmitter {
     this.budgetInterruptedTasks = new Set();
     this.pendingBudgetWatchdogs = new Set();
     this.activeTurns = new Map();
+    // These are cancellation handles only.  They deliberately do not mirror
+    // App Server lifecycle/alias state; each runtime remains sole owner of
+    // its one thread/turn and the router only receives observations.
+    this.activeWriterRuntimes = new Map();
     this.terminalReconciliations = new Map();
     this.lastActiveTurnSnapshot = [];
     this.activeScheduler = null;
@@ -170,6 +178,7 @@ export class SwarmRouter extends EventEmitter {
 
   stop() {
     this.activeClient?.shutdown?.({ contractVersion: EXECUTION_PROVIDER_VERSION, correlationId: randomUUID(), data: {} })?.catch?.(() => {});
+    for (const { runtime } of this.activeWriterRuntimes.values()) runtime.shutdown?.().catch?.(() => {});
   }
 
   async requestShutdown(reason = "interrupted_controller_exit") {
@@ -177,10 +186,12 @@ export class SwarmRouter extends EventEmitter {
     this.stopRequested = true;
     const client = this.activeClient;
     const active = [...this.activeTurns.values()];
+    const migrated = [...this.activeWriterRuntimes.values()];
     this.#lifecycle("controller shutdown requested", { reason, activeTurns: active.map(({ taskId, threadId, turnId }) => ({ taskId, threadId, turnId })) });
     if (client) {
       await Promise.allSettled(active.map((turn) => this.#interruptAndAwaitTurn(client, turn, reason, { timeoutMs: this.config.delivery?.shutdownGraceMs ?? 3_000 })));
     }
+    await Promise.allSettled(migrated.map((run) => this.#cancelMigratedWriter(run, reason)));
     this.#markInterrupted(reason, { activeTurns: active.map(({ taskId, threadId, turnId }) => ({ taskId, threadId, turnId })) });
     if (client) { try { await this.#provider(client, "shutdown", {}); } catch {} }
   }
@@ -188,6 +199,10 @@ export class SwarmRouter extends EventEmitter {
   #markInterrupted(reason, recovery = {}) {
     if (!this.activeDeliveryRunId) {
       for (const active of this.activeTurns.values()) {
+        const task = this.store.getTask(active.taskId);
+        if (task?.status === "running") this.store.transition(task.id, "interrupted", { error: reason });
+      }
+      for (const active of this.activeWriterRuntimes.values()) {
         const task = this.store.getTask(active.taskId);
         if (task?.status === "running") this.store.transition(task.id, "interrupted", { error: reason });
       }
@@ -1004,6 +1019,11 @@ export class SwarmRouter extends EventEmitter {
       return;
     }
 
+    if (this.#usesMigratedWriterRuntime(task)) {
+      await this.#runMigratedWriter(task, { worktree, branch, overlayContext });
+      return;
+    }
+
     const sourceDir = fileURLToPath(new URL(".", import.meta.url));
     const developerInstructions = this.#developerInstructions(sourceDir, task.role);
     const threadResult = await this.#provider(client, "start_thread", {
@@ -1303,6 +1323,7 @@ export class SwarmRouter extends EventEmitter {
 
   #isExecutionProviderFailure(error) {
     if (!(error instanceof ExecutionProviderError)) return false;
+    if (error.migratedWriterFailure === true) return false;
     // A turn timeout and a task's own goal-setup rejection remain ordinary,
     // resumable task failures.  They do not establish that the shared
     // provider process/protocol is unhealthy.  Correlation, envelope, and
@@ -1455,6 +1476,158 @@ export class SwarmRouter extends EventEmitter {
     this.store.recordQualityReport({ qaTaskId: task.id, writerTaskId: writer.id, reportPath: resultPath, report });
     await this.#handleQualityGate(task, report);
     this.#lifecycle(checks.failed.length ? "controller-local scaffold quality blocked" : "controller-local scaffold quality passed", { taskId: task.id, writerTaskId: writer.id });
+  }
+
+  #usesMigratedWriterRuntime(task) {
+    if (!MIGRATED_WRITER_ROLES.has(task?.role)) return false;
+    if (this.config.roles[task.role]?.sandbox !== "workspace-write") return false;
+    // Raw programmatic test fixtures predate Phase 2 configuration and retain
+    // legacy behavior. loadConfig() sets the production default explicitly.
+    return resolveTransitionalRuntimePath(this.config.writerRuntimePath ?? "legacy") === "codex-app-server";
+  }
+
+  #createMigratedWriterRuntime(task, worktree) {
+    if (typeof worktree !== "string" || !worktree) throw new Error(`Migrated writer ${task.id} requires a controller-created worktree`);
+    const runtime = this.config.codexAppServerRuntimeFactory?.({ cwd: worktree, task })
+      ?? new CodexAppServerRuntime({ cwd: worktree });
+    if (!runtime || typeof runtime.connect !== "function" || typeof runtime.startThread !== "function" || typeof runtime.startGoalTurn !== "function") {
+      throw new TypeError("codexAppServerRuntimeFactory must return a Codex App Server runtime");
+    }
+    if (runtime.cwd !== worktree) throw new TypeError("Migrated writer runtime cwd must equal the controller-created worktree");
+    return runtime;
+  }
+
+  async #runMigratedWriter(task, { worktree, branch, overlayContext }) {
+    const roleConfig = this.config.roles[task.role];
+    const sourceDir = fileURLToPath(new URL(".", import.meta.url));
+    const runtime = this.#createMigratedWriterRuntime(task, worktree);
+    const run = { taskId: task.id, runtime, threadId: null, turnId: null };
+    this.activeWriterRuntimes.set(task.id, run);
+    runtime.on?.("observation", (observation) => this.#onMigratedWriterObservation(task, observation));
+    try {
+      await runtime.connect();
+      const thread = await runtime.startThread({
+        model: this.config.model,
+        sandbox: roleConfig.sandbox,
+        approvalPolicy: roleConfig.approvalPolicy,
+        developerInstructions: this.#developerInstructions(sourceDir, task.role),
+        serviceName: "codex-swarm-router"
+      });
+      run.threadId = thread.threadId;
+      this.#lifecycle("migrated writer thread started", { taskId: task.id, threadId: thread.threadId, runtime: "codex-app-server" });
+      const goal = { objective: `${task.title}\n\n${task.prompt}`, status: "active" };
+      if (this.#enforcesLocalBudget()) goal.tokenBudget = task.tokenBudget;
+      const turn = await runtime.startGoalTurn({
+        threadId: thread.threadId,
+        goal,
+        turn: { input: [{ type: "text", text: this.#taskPrompt(task, worktree, overlayContext?.snapshot) }] }
+      });
+      run.turnId = turn.turnId;
+      this.store.setThread(task.id, { threadId: thread.threadId, turnId: turn.turnId });
+      this.#lifecycle("migrated writer turn started", { taskId: task.id, threadId: thread.threadId, turnId: turn.turnId, runtime: "codex-app-server" });
+      const resultText = await this.#readMigratedWriterResult(runtime, thread.threadId, turn.turnId);
+      // Runtime text is retained solely as non-authoritative worker evidence.
+      // WorktreeFinalizer reads Git and owns the only accepted artifact.
+      this.store.setResultPath(task.id, this.#saveAgentResult(task, resultText));
+      const repaired = await this.#finalizeMigratedWriterWithRepair(runtime, task, thread.threadId, worktree, branch, overlayContext, resultText);
+      await this.config.faultHooks?.artifact_file_before_db_persistence?.({ taskId: task.id, path: repaired.finalized.path, artifact: repaired.finalized.artifact });
+      this.store.recordWorkerArtifact(task.id, repaired.finalized.path, repaired.finalized.artifact);
+      await this.config.faultHooks?.artifact_db_persisted_before_task_completion?.({ taskId: task.id, path: repaired.finalized.path, artifact: repaired.finalized.artifact });
+      this.#finalizeManagedWorker(task.id, repaired.finalized.artifact.headSha);
+      this.#connectArtifactDependents(task, repaired.finalized.artifact);
+      this.store.transition(task.id, finalStatusForRole(task.role, { autonomous: this.isAutonomous() }));
+      this.#lifecycle("migrated writer finalized", { taskId: task.id, artifactPath: repaired.finalized.path, runtime: "codex-app-server" });
+    } catch (error) {
+      // Keep the typed runtime failure a task-scoped controller failure. It
+      // cannot pass through the legacy provider fail-fast path and no artifact
+      // persistence is reachable before Git finalization succeeds.
+      if (error instanceof ExecutionProviderError) error.migratedWriterFailure = true;
+      throw error;
+    } finally {
+      this.activeWriterRuntimes.delete(task.id);
+      try { await runtime.shutdown(); } catch {}
+    }
+  }
+
+  async #readMigratedWriterResult(runtime, threadId, turnId) {
+    let candidate;
+    try { candidate = await runtime.observeTerminal({ threadId, turnId, timeoutMs: this.config.router.turnTimeoutMs }); }
+    catch (error) { throw this.#migratedRuntimeFailure(error, "observe_terminal"); }
+    let durable;
+    try { durable = await runtime.reconcileTerminal({ threadId, turnId: candidate.turnId ?? turnId, timeoutMs: Math.min(2_500, this.config.router.turnTimeoutMs ?? 2_500) }); }
+    catch (error) { throw this.#migratedRuntimeFailure(error, "reconcile_terminal"); }
+    if (durable.threadId !== threadId || !TERMINAL_TURN_CLASSES.has(durable.terminalClass)) {
+      throw new ExecutionProviderError("terminal_reconciliation_unavailable", "migrated runtime did not prove a durable terminal turn", { errorClass: "protocol" });
+    }
+    if (durable.kind !== "worker_completed" || durable.terminalClass !== "completed") {
+      const code = durable.kind === "worker_cancelled" ? "worker_cancelled" : "worker_failed";
+      throw new ExecutionProviderError(code, `migrated runtime terminal state: ${durable.terminalClass}`, { errorClass: "runtime" });
+    }
+    try {
+      const result = await runtime.readFinalResult({ threadId, turnId: durable.turnId });
+      if (typeof result.resultText !== "string" || !result.resultText.trim()) throw new Error("result_unavailable");
+      return result.resultText;
+    } catch (error) { throw this.#migratedRuntimeFailure(error, "read_final_result"); }
+  }
+
+  #migratedRuntimeFailure(error, operation) {
+    if (error instanceof ExecutionProviderError) {
+      error.migratedWriterFailure = true;
+      error.providerOperation = operation;
+      return error;
+    }
+    const failure = new ExecutionProviderError("transport_failure", String(error?.message ?? error), { errorClass: "runtime", diagnostics: error?.message });
+    failure.migratedWriterFailure = true;
+    failure.providerOperation = operation;
+    return failure;
+  }
+
+  async #finalizeMigratedWriterWithRepair(runtime, task, threadId, worktree, branch, initialOverlayContext, initialResultText) {
+    let overlayContext = initialOverlayContext;
+    let resultText = initialResultText;
+    const maxRepairTurns = 2;
+    for (let attempt = 0; attempt <= maxRepairTurns; attempt += 1) {
+      try {
+        const finalized = await this.finalizer.finalize({ task, worktree, branch, overlay: overlayContext.overlay, overlayPath: overlayContext.path });
+        return { overlayContext, resultText, finalized };
+      } catch (error) {
+        if (attempt === maxRepairTurns) throw error;
+        const reason = String(error.message).slice(0, 1600);
+        this.#lifecycle("migrated writer verification retry", { taskId: task.id, threadId, attempt: attempt + 1, reason });
+        let retry;
+        try {
+          retry = await runtime.startGoalTurn({
+            threadId,
+            goal: {},
+            turn: { input: [{ type: "text", text: `The controller could not finalize your work because deterministic validation failed: ${reason}\nFix this failure now inside the existing worktree. Keep all edits within the assigned allowed paths. Run the required checks. Do not explain or plan; make the correction and finish.` }] }
+          });
+        } catch (runtimeError) { throw this.#migratedRuntimeFailure(runtimeError, "start_turn"); }
+        const active = this.activeWriterRuntimes.get(task.id);
+        if (active) active.turnId = retry.turnId;
+        this.store.setThread(task.id, { threadId, turnId: retry.turnId });
+        this.#lifecycle("migrated writer repair turn started", { taskId: task.id, threadId, turnId: retry.turnId, attempt: attempt + 1 });
+        resultText = await this.#readMigratedWriterResult(runtime, threadId, retry.turnId);
+        this.store.setResultPath(task.id, this.#saveAgentResult(task, resultText));
+      }
+    }
+    throw new Error("Migrated writer verification retry loop terminated unexpectedly");
+  }
+
+  #onMigratedWriterObservation(task, observation) {
+    if (!observation || typeof observation.kind !== "string") return;
+    if (observation.kind === "worker_activity" && observation.activity === "usage_updated" && Number.isFinite(observation.usage?.totalTokens)) {
+      this.store.setTokenUsage(task.id, observation.usage.totalTokens, { source: "runtime_observation" });
+    }
+    this.#lifecycle("migrated writer runtime observation", { taskId: task.id, runtime: "codex-app-server", kind: observation.kind, terminalClass: observation.terminalClass ?? null });
+  }
+
+  async #cancelMigratedWriter(run, reason) {
+    try {
+      if (run.threadId && run.turnId) await run.runtime.cancel({ threadId: run.threadId, turnId: run.turnId });
+    } catch {}
+    try { await run.runtime.shutdown(); } catch {}
+    const task = this.store.getTask(run.taskId);
+    if (task?.status === "running") this.store.transition(task.id, "interrupted", { error: reason });
   }
 
   #taskPrompt(task, worktree, overlaySnapshot) {
