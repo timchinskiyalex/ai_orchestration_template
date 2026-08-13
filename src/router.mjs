@@ -331,7 +331,10 @@ export class SwarmRouter extends EventEmitter {
     } else {
       audit = run.sourceClaimInputMode === "supplied"
         ? deterministicSuppliedSourceClaimAudit(subject, resolver)
-        : await new SourceClaimAuditExecutor(this.config).audit(subject);
+        : await new SourceClaimAuditExecutor(this.config).audit(subject, {
+          recordTerminalReceipt: (receipt) => this.store.recordSourceIntakeTerminalReceipt({ deliveryRunId: run.id, role: "source_claim_audit", receipt }),
+          recordFailure: (failure) => this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, role: "source_claim_audit", ...failure })
+        });
       const directory = join(this.config.repository, this.config.project.generatedDir, "source-claim-audits"); mkdirSync(directory, { recursive: true });
       const path = join(directory, `${audit.auditId}.json`); const serialized = `${JSON.stringify(audit, null, 2)}\n`;
       if (existsSync(path) && readFileSync(path, "utf8") !== serialized) throw new Error("source_claim_audit:existing_audit_artifact_mismatch");
@@ -390,7 +393,10 @@ export class SwarmRouter extends EventEmitter {
       validateSourceClaimExtraction(existing.extraction, { sourceResolver: this.#sourceEvidenceResolver() });
       return existing;
     }
-    const extraction = await new SourceClaimExtractionExecutor(this.config).extract();
+    const extraction = await new SourceClaimExtractionExecutor(this.config).extract({
+      recordTerminalReceipt: (receipt) => this.store.recordSourceIntakeTerminalReceipt({ deliveryRunId: run.id, role: "source_claim_extraction", receipt }),
+      recordFailure: (failure) => this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, role: "source_claim_extraction", ...failure })
+    });
     const directory = join(this.config.repository, this.config.project.generatedDir, "source-claim-extractions");
     mkdirSync(directory, { recursive: true });
     const path = join(directory, `${extraction.extractionId}.json`);
@@ -404,7 +410,7 @@ export class SwarmRouter extends EventEmitter {
   blockRunForSourceExtraction(run, error) {
     const message = String(error?.message ?? error);
     const prefix = /source_claim_audit/.test(message) ? "source_claim_audit" : "source_claim_extraction";
-    const code = /malformed_json/i.test(message) ? `${prefix}:malformed_json` : /provider_unavailable|transport|unsupported_capability/i.test(message) ? `${prefix}:provider_unavailable` : /admission_blocked/.test(message) ? "source_claim_audit:blocked_specification" : /source_provenance|source_claim_contract|source_claim_audit/.test(message) ? `${prefix}:source_integrity_or_coverage_invalid` : `${prefix}:failed`;
+    const code = /malformed_json/i.test(message) ? `${prefix}:malformed_json` : /final_result_unavailable/i.test(message) ? `${prefix}:final_result_unavailable` : /terminal_(?:unavailable|correlation_invalid|not_completed)|runtime_unavailable|receipt_persistence_failed|transport|unsupported_capability/i.test(message) ? `${prefix}:runtime_unavailable` : /admission_blocked/.test(message) ? "source_claim_audit:blocked_specification" : /source_provenance|source_claim_contract|source_claim_audit/.test(message) ? `${prefix}:source_integrity_or_coverage_invalid` : `${prefix}:failed`;
     return this.store.blockDeliveryForSpecification(run.id, { reason: code, recovery: { action: "Correct the imported documentation or extraction provider, then resume this intake or start a fresh delivery." } });
   }
 
@@ -412,7 +418,9 @@ export class SwarmRouter extends EventEmitter {
     const detail = String(error?.message ?? error);
     const code = /malformed_json/i.test(detail)
       ? "source_claim_audit:malformed_json"
-      : /provider_unavailable|transport|unsupported_capability/i.test(detail)
+      : /final_result_unavailable/i.test(detail)
+        ? "source_claim_audit:final_result_unavailable"
+      : /provider_unavailable|terminal_(?:unavailable|correlation_invalid|not_completed)|runtime_unavailable|receipt_persistence_failed|transport|unsupported_capability/i.test(detail)
         ? "source_claim_audit:provider_unavailable"
         : /meaningful_source_material_unresolved|source_coverage_incomplete|admission_blocked|claim_decision_invalid|candidate_decision_incomplete/i.test(detail)
           ? "source_claim_audit:unresolved_source_material"

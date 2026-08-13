@@ -22,7 +22,8 @@ class ExtractionClient {
   async setGoal(goal) { this.threads.get(goal.threadId).goal = goal.objective; }
   async startTurn({ threadId }) { this.calls.turns += 1; return { turn: { id: `turn-${threadId}` } }; }
   async waitForTurn(_threadId, turnId) { return { id: turnId, status: "completed" }; }
-  async readThread({ threadId }) { return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text: this.result }] }] } }; }
+  async readTerminalTurn(_threadId, turnId) { return { terminal: { id: turnId, status: "completed" } }; }
+  async readThread({ threadId }) { return { thread: { turns: [{ id: `turn-${threadId}`, status: "completed", items: [{ type: "agentMessage", text: this.result }] }] } }; }
 }
 
 function fixture(resultFor) {

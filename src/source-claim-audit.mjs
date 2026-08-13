@@ -1,15 +1,13 @@
-import { createHash, randomUUID } from "node:crypto";
-import { AppServerExecutionProvider } from "./app-server-execution-provider.mjs";
-import { EXECUTION_PROVIDER_VERSION, ExecutionProviderError, assertCapabilities, validateEnvelope } from "./execution-provider-contract.mjs";
+import { createHash } from "node:crypto";
 import { policyDigest } from "./product-blueprint.mjs";
 import { createImportedSourceResolver, sourceFragmentDigest } from "./source-evidence.mjs";
+import { runSourceIntakeTurn } from "./source-intake-runtime.mjs";
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item) ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
 const decisions = new Set(["admitted", "rejected", "split-required", "contradiction", "unresolved"]);
 const classifications = new Set(["mandatory", "non_mandatory", "ambiguous"]);
 const reason = /^[a-z][a-z0-9_:-]{0,95}$/;
-const methods = { handshake: "handshake", start_thread: "startThread", set_goal: "setGoal", start_turn: "startTurn", observe_terminal: "observeTerminal", read_final_result: "readFinalResult", shutdown: "shutdown" };
 
 function fail(message) { throw new Error(`source_claim_audit:${message}`); }
 function refsEqual(left, right) { return left.length === right.length && left.map((item) => `${item.documentId}:${item.startLine}:${item.endLine}:${item.excerptDigest}`).sort().every((item, index) => item === right.map((rightItem) => `${rightItem.documentId}:${rightItem.startLine}:${rightItem.endLine}:${rightItem.excerptDigest}`).sort()[index]); }
@@ -118,30 +116,15 @@ export function admitAuditedSourceClaims({ subject, audit }) {
   return Object.freeze({ ...unsigned, manifestId: `scm-${digest.slice(0, 24)}`, digest });
 }
 
-async function call(provider, operation, data, requiredIds = []) {
-  const correlationId = randomUUID(); const method = provider?.[methods[operation]];
-  if (typeof method !== "function") throw new ExecutionProviderError("source_claim_audit_provider_unavailable", `provider does not implement ${operation}`);
-  let result; try { result = await method.call(provider, { contractVersion: EXECUTION_PROVIDER_VERSION, correlationId, data }); } catch { throw new ExecutionProviderError("source_claim_audit_provider_unavailable", "provider invocation failed"); }
-  return validateEnvelope(result, { operation, correlationId, requiredIds });
-}
 function parseResult(text) { const fenced = String(text).match(/```(?:json)?\s*([\s\S]*?)```/i); try { return JSON.parse((fenced?.[1] ?? text).trim()); } catch { fail("malformed_json"); } }
 
 export class SourceClaimAuditExecutor {
   constructor(config) { this.config = config; }
-  async audit(subject) {
+  async audit(subject, { recordTerminalReceipt = null, recordFailure = null } = {}) {
     const resolver = createImportedSourceResolver({ repository: this.config.repository, documentationDir: this.config.project.documentationDir });
-    const provider = this.config.executionProviderFactory?.({ cwd: this.config.runtimeDir }) ?? new AppServerExecutionProvider({ cwd: this.config.runtimeDir });
-    try {
-      const handshake = await call(provider, "handshake", {}, ["providerRunId"]); assertCapabilities(handshake, provider);
-      const thread = await call(provider, "start_thread", { model: this.config.model, cwd: this.config.runtimeDir, sandbox: "read-only", approvalPolicy: "never", developerInstructions: "You are the independent Specification Auditor. This is a separate operation from extraction. Audit only controller-provided source and candidate data; do not plan engineering work or authorize invented product decisions." }, ["threadId"]);
-      await call(provider, "set_goal", { threadId: thread.threadId, status: "active", tokenBudget: this.config.delivery?.sourceClaimAuditTokenBudget ?? 6000, objective: "Independently audit source claims and source coverage." }, ["threadId"]);
-      const payload = { subject, documents: resolver.controlledDocuments(), coverageUnits: normalizedSourceUnits(resolver), trustedPolicies: this.config.specificationResolution?.policyRegistry?.policies?.filter((policy) => policy.scope?.kind === "source_claim_audit") ?? [] };
-      const prompt = `Return only one fenced JSON SourceClaimAudit. Decide every candidate claim as admitted, rejected, split-required, contradiction, or unresolved. Preserve all source refs exactly. Every controller coverage unit must be present. Meaningful units require an admitted claim; structural_header and boilerplate units must be excluded with their exact reason code. Contradictions and split-required claims may only be admitted when a supplied trusted source_claim_audit policy exactly binds the claim. Payload: ${JSON.stringify(payload)}`;
-      const started = await call(provider, "start_turn", { threadId: thread.threadId, input: [{ type: "text", text: prompt }], effort: "low" }, ["threadId", "turnId"]);
-      const terminal = await call(provider, "observe_terminal", { threadId: thread.threadId, turnId: started.turnId, timeoutMs: this.config.router.turnTimeoutMs }, ["threadId", "turnId", "terminalClass"]);
-      if (terminal.terminalClass !== "completed") throw new Error("source_claim_audit_provider_unavailable");
-      const result = await call(provider, "read_final_result", { threadId: thread.threadId, turnId: terminal.turnId }, ["threadId", "turnId", "resultText"]);
-      return validateSourceClaimAudit(parseResult(result.resultText), { subject, sourceResolver: resolver, policyRegistry: this.config.specificationResolution?.policyRegistry });
-    } finally { try { await call(provider, "shutdown", {}); } catch {} }
+    const payload = { subject, documents: resolver.controlledDocuments(), coverageUnits: normalizedSourceUnits(resolver), trustedPolicies: this.config.specificationResolution?.policyRegistry?.policies?.filter((policy) => policy.scope?.kind === "source_claim_audit") ?? [] };
+    const prompt = `Return only one fenced JSON SourceClaimAudit. Decide every candidate claim as admitted, rejected, split-required, contradiction, or unresolved. Preserve all source refs exactly. Every controller coverage unit must be present. Meaningful units require an admitted claim; structural_header and boilerplate units must be excluded with their exact reason code. Contradictions and split-required claims may only be admitted when a supplied trusted source_claim_audit policy exactly binds the claim. Payload: ${JSON.stringify(payload)}`;
+    const result = await runSourceIntakeTurn({ config: this.config, role: "source_claim_audit", developerInstructions: "You are the independent Specification Auditor. This is a separate operation from extraction. Audit only controller-provided source and candidate data; do not plan engineering work or authorize invented product decisions.", objective: "Independently audit source claims and source coverage.", tokenBudget: this.config.delivery?.sourceClaimAuditTokenBudget ?? 6000, prompt, recordTerminalReceipt, recordFailure });
+    return validateSourceClaimAudit(parseResult(result.resultText), { subject, sourceResolver: resolver, policyRegistry: this.config.specificationResolution?.policyRegistry });
   }
 }

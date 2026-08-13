@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SwarmRouter } from "../src/router.mjs";
@@ -11,26 +12,40 @@ import { documentIdForPath, documentSetDigest, policyDigest } from "../src/produ
 import { createImportedSourceResolver, sourceClaimCandidateId, sourceFragmentDigest, validateSourceClaimExtraction } from "../src/source-evidence.mjs";
 import { admitAuditedSourceClaims, auditSubjectFromExtraction, normalizedSourceUnits, validateSourceClaimAudit } from "../src/source-claim-audit.mjs";
 import { provider } from "./execution-provider-test-adapter.mjs";
+import { CodexAppServerRuntime } from "../src/codex-app-server-runtime.mjs";
 
 const digest = (value) => createHash("sha256").update(value.replace(/\r\n?/g, "\n")).digest("hex");
 const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: false }]));
 
-class AuditClient {
-  constructor({ extraction, audit }) { this.extraction = extraction; this.audit = audit; this.id = 0; this.calls = []; this.threads = new Map(); }
+class AuditClient extends EventEmitter {
+  constructor(options) { super(); const { extraction, audit, aliasRoles = [], unavailableRoles = [] } = options; this.extraction = extraction; this.audit = audit; this.aliasRoles = new Set(aliasRoles); this.unavailableRoles = new Set(unavailableRoles); this.id = 0; this.calls = []; this.threads = new Map(); }
   async connect() {} async shutdown() { this.calls.push("shutdown"); }
   async startThread() { const id = `thread-${++this.id}`; this.threads.set(id, {}); this.calls.push("start_thread"); return { thread: { id } }; }
   async setGoal({ threadId, objective }) { this.threads.get(threadId).goal = objective; this.calls.push(objective); }
-  async startTurn({ threadId }) { return { turn: { id: `turn-${threadId}` } }; }
-  async waitForTurn(_threadId, turnId) { return { id: turnId, status: "completed" }; }
+  #role(threadId) { return /^Extract atomic/.test(this.threads.get(threadId).goal) ? "source_claim_extraction" : /^Independently audit/.test(this.threads.get(threadId).goal) ? "source_claim_audit" : "unknown"; }
+  async startTurn({ threadId }) { const requestedTurnId = `turn-${threadId}`; const role = this.#role(threadId); this.threads.get(threadId).turn = { requestedTurnId, resolvedTurnId: this.aliasRoles.has(role) ? `${requestedTurnId}-resolved` : requestedTurnId }; return { turn: { id: requestedTurnId } }; }
+  async waitForTurn(threadId, turnId) {
+    const state = this.threads.get(threadId); const { resolvedTurnId } = state.turn;
+    if (resolvedTurnId !== turnId) {
+      this.emit("protocol", { method: "turn-id-alias", threadId, requestedTurnId: "stale-requested", resolvedTurnId });
+      this.emit("protocol", { method: "turn-id-alias", threadId, requestedTurnId: turnId, resolvedTurnId });
+      this.emit("protocol", { method: "turn-id-alias", threadId, requestedTurnId: turnId, resolvedTurnId });
+    }
+    this.emit?.("notification", { method: "turn/completed", params: { threadId, turn: { id: resolvedTurnId, status: "completed" } } });
+    this.emit?.("notification", { method: "turn/completed", params: { threadId, turn: { id: resolvedTurnId, status: "completed" } } });
+    return { id: resolvedTurnId, status: "completed" };
+  }
+  async readTerminalTurn(threadId) { const state = this.threads.get(threadId); return { terminal: { id: state.turn.resolvedTurnId, status: "completed" } }; }
   async readThread({ threadId }) {
-    const goal = this.threads.get(threadId).goal;
+    const goal = this.threads.get(threadId).goal; const role = this.#role(threadId);
+    if (this.unavailableRoles.has(role)) throw new Error("thread/read: thread not loaded");
     const result = /^Extract atomic/.test(goal) ? this.extraction() : /^Independently audit/.test(goal) ? this.audit() : "not-json";
     this.calls.push(/^Extract atomic/.test(goal) ? "extraction_result" : /^Independently audit/.test(goal) ? "audit_result" : "other_result");
-    return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text: `\`\`\`json\n${JSON.stringify(result)}\n\`\`\`` }] }] } };
+    return { thread: { turns: [{ id: this.threads.get(threadId).turn.resolvedTurnId, status: "completed", items: [{ type: "agentMessage", text: `\`\`\`json\n${JSON.stringify(result)}\n\`\`\`` }] }] } };
   }
 }
 
-function fixture({ supplied = false, auditVariant = "admitted", policyRegistry = { schemaVersion: 1, policies: [] } } = {}) {
+function fixture({ supplied = false, auditVariant = "admitted", policyRegistry = { schemaVersion: 1, policies: [] }, aliasRoles = [], unavailableRoles = [] } = {}) {
   const root = mkdtempSync(join(tmpdir(), "source-claim-audit-")); const raw = join(root, "raw"); mkdirSync(raw);
   execFileSync("git", ["-C", root, "init", "-b", "main"]);
   execFileSync("git", ["-C", root, "commit", "--allow-empty", "-m", "base", "--no-gpg-sign", "--author", "Audit Test <audit@example.test>"]);
@@ -49,9 +64,32 @@ function fixture({ supplied = false, auditVariant = "admitted", policyRegistry =
     const refs = claims.map((item) => item.sourceQuote);
     writeFileSync(join(raw, "source-claims.json"), JSON.stringify({ schemaVersion: 1, kind: "SourceClaimsDeclaration", documentSetDigest: documentSetDigest([file]), documents: [{ ...file, coverage: refs.map((ref, index) => ({ claimId: `supplied-${index + 1}`, ...ref })) }], claims: refs.map((ref, index) => ({ claimId: `supplied-${index + 1}`, classification: index === 1 ? "mandatory" : "non_mandatory", sourceRefs: [ref] })) }));
   }
-  const client = new AuditClient({ extraction, audit });
+  const client = new AuditClient({ extraction, audit, aliasRoles, unavailableRoles });
   const config = { repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", project: { documentationDir: "docs/in", generatedDir: "docs/out", repositoryMode: "legacy" }, router: { turnTimeoutMs: 1000, maxConcurrentTasks: 1, maxChildrenPerTask: 1, maxDelegationDepth: 1, maxPlanTasks: 1, defaultParentBudget: 100, approvalMode: "deny" }, delivery: { sourceClaimExtractionTokenBudget: 100, sourceClaimAuditTokenBudget: 100 }, budget: { weeklyTokenLimit: 1000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, autonomy: { mode: "autonomous" }, roles, specificationResolution: { policyRegistry }, executionProviderFactory: () => provider(client) };
   return { root, raw, text, file, claims, extraction, audit, client, config };
+}
+
+class FailingIntakeRuntime {
+  constructor({ cwd, role, failure }) { this.cwd = cwd; this.role = role; this.failure = failure; }
+  async connect() {} async shutdown() {} async diagnostics() { return { connected: true, closed: false, reconnectRequired: false, diagnostics: "bounded test diagnostic" }; }
+  async startThread() { return { threadId: `thread-${this.role}` }; }
+  async startGoalTurn({ threadId }) { return { threadId, turnId: `turn-${this.role}` }; }
+  async observeTerminal({ threadId, turnId }) { return { kind: "worker_terminal_candidate", threadId: this.failure === "wrong_thread" ? "foreign-thread" : threadId, turnId: this.failure === "wrong_turn" ? "foreign-turn" : turnId, terminalClass: "completed" }; }
+  async reconcileTerminal({ threadId, turnId }) {
+    const terminalClass = this.failure === "missing_terminal_status" ? "running" : "completed";
+    return { kind: "worker_completed", threadId, turnId, terminalClass, terminalReceipt: { schemaVersion: 1, kind: "AppServerTerminalReceipt", source: "turn_completed", capturedAt: "2026-01-01T00:00:00.000Z", providerConnectionId: "test-connection", correlationId: "test-correlation", threadId, requestedTurnId: turnId, resolvedTurnId: turnId, terminalClass } };
+  }
+  async readFinalResult({ threadId, turnId }) {
+    if (this.failure === "final_result_unavailable") throw new Error("thread/read: thread not loaded");
+    return { threadId, turnId, resultText: "not-json", providerRunId: `${threadId}:${turnId}` };
+  }
+}
+
+function failRoleWithRuntime(fx, role, failure) {
+  const providerFactory = fx.config.executionProviderFactory;
+  fx.config.sourceIntakeRuntimeFactory = ({ cwd, role: requestedRole }) => requestedRole === role
+    ? new FailingIntakeRuntime({ cwd, role, failure })
+    : new CodexAppServerRuntime({ cwd, transport: providerFactory({ cwd }) });
 }
 
 function auditFor({ root, extraction, variant = "admitted", policyRegistry }) {
@@ -79,6 +117,45 @@ test("raw extraction is independently audited before Bootstrap and Planner admis
     assert.equal(fx.client.calls.some((item) => /^Plan /.test(item)), false);
     assert.equal(JSON.stringify({ status: router.statusSnapshot(), run: result }).includes("SUPERSECRET"), false);
   } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }
+});
+
+test("source intake persists one exact alias receipt for extraction and independent audit before admission", async () => {
+  const fx = fixture({ aliasRoles: ["source_claim_extraction", "source_claim_audit"] }); const router = new SwarmRouter(fx.config);
+  try {
+    const result = await new DeliveryCoordinator(router).begin({ source: fx.raw });
+    const extraction = router.store.sourceIntakeTerminalReceipt({ deliveryRunId: result.id, role: "source_claim_extraction" });
+    const audit = router.store.sourceIntakeTerminalReceipt({ deliveryRunId: result.id, role: "source_claim_audit" });
+    assert.deepEqual([extraction.receipt.requestedTurnId.endsWith("-resolved"), extraction.receipt.resolvedTurnId.endsWith("-resolved"), audit.receipt.requestedTurnId.endsWith("-resolved"), audit.receipt.resolvedTurnId.endsWith("-resolved")], [false, true, false, true]);
+    assert.equal(router.store.events({ limit: 500 }).filter((event) => event.type === "source-intake/terminal-receipt").length, 2);
+    assert.equal(readdirSync(join(fx.root, "docs/out/source-claim-extractions")).length, 1);
+    assert.equal(readdirSync(join(fx.root, "docs/out/source-claim-audits")).length, 1);
+    assert.ok(result.sourceClaimManifestId);
+  } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }
+});
+
+test("source executors have no direct legacy provider path", async () => {
+  const { readFileSync } = await import("node:fs");
+  for (const path of ["src/source-claim-extraction.mjs", "src/source-claim-audit.mjs"]) {
+    const source = readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /app-server-execution-provider|AppServerExecutionProvider|observeTerminal|readFinalResult/);
+    assert.match(source, /runSourceIntakeTurn/);
+  }
+});
+
+test("source intake fail-closes wrong correlation, missing terminal status, malformed JSON, and unavailable final results before Bootstrap", async () => {
+  for (const [role, failure] of [["source_claim_extraction", "wrong_thread"], ["source_claim_extraction", "wrong_turn"], ["source_claim_extraction", "missing_terminal_status"], ["source_claim_extraction", "malformed_json"], ["source_claim_extraction", "final_result_unavailable"], ["source_claim_audit", "wrong_thread"], ["source_claim_audit", "wrong_turn"], ["source_claim_audit", "missing_terminal_status"], ["source_claim_audit", "malformed_json"], ["source_claim_audit", "final_result_unavailable"]]) {
+    const fx = fixture(); const router = new SwarmRouter(fx.config);
+    try {
+      failRoleWithRuntime(fx, role, failure);
+      const result = await new DeliveryCoordinator(router).begin({ source: fx.raw });
+      assert.equal(result.state, "blocked_specification", `${role}:${failure}`);
+      assert.equal(router.list().length, 0, `${role}:${failure}`);
+      if (failure === "final_result_unavailable") {
+        assert.match(result.publish.reason, /final_result_unavailable/, `${role}:${failure}`);
+        assert.ok(router.store.sourceIntakeTerminalReceipt({ deliveryRunId: result.id, role }), `${role}:${failure}`);
+      }
+    } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }
+  }
 });
 
 test("omitted material, contradiction, and split-required source fail closed before Bootstrap", async () => {

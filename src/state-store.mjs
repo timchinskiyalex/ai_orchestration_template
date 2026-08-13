@@ -24,6 +24,7 @@ export class StateStore {
     this.hasSourceClaimManifests = this.#hasTable("source_claim_manifests");
     this.hasSourceClaimExtractions = this.#hasTable("source_claim_extractions");
     this.hasSourceClaimAudits = this.#hasTable("source_claim_audits");
+    this.hasSourceIntakeTerminalReceipts = this.#hasTable("source_intake_terminal_receipts");
     this.hasRepositoryBaselines = this.#hasTable("repository_baselines") && this.#hasColumn("delivery_runs", "repository_mode");
     this.hasManagedWorktrees = this.#hasTable("managed_worktrees");
     if (readOnly) return;
@@ -221,6 +222,12 @@ export class StateStore {
         candidate_id TEXT NOT NULL, candidate_digest TEXT NOT NULL, artifact_path TEXT NOT NULL,
         audit_json TEXT NOT NULL, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS source_intake_terminal_receipts (
+        delivery_run_id TEXT NOT NULL REFERENCES delivery_runs(id), role TEXT NOT NULL,
+        schema_version INTEGER NOT NULL, thread_id TEXT NOT NULL, requested_turn_id TEXT NOT NULL,
+        resolved_turn_id TEXT NOT NULL, receipt_json TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY (delivery_run_id, role)
+      );
       CREATE TABLE IF NOT EXISTS repository_baseline_drafts (
         delivery_run_id TEXT PRIMARY KEY REFERENCES delivery_runs(id),
         schema_version INTEGER NOT NULL, draft_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -345,6 +352,7 @@ export class StateStore {
     this.hasSourceClaimManifests = true;
     this.hasSourceClaimExtractions = true;
     this.hasSourceClaimAudits = true;
+    this.hasSourceIntakeTerminalReceipts = true;
     this.hasRepositoryBaselines = true;
     this.hasManagedWorktrees = true;
     this.#addColumnIfMissing("tasks", "dependencies_json", "TEXT NOT NULL DEFAULT '[]'");
@@ -716,6 +724,35 @@ export class StateStore {
     if (!["completed", "failed", "interrupted", "cancelled"].includes(receipt.terminalClass)) throw new Error("AppServerTerminalReceipt terminal class is not explicit");
     for (const key of ["threadId", "requestedTurnId", "resolvedTurnId", "correlationId", "providerConnectionId", "capturedAt"]) if (typeof receipt[key] !== "string" || !receipt[key]) throw new Error(`AppServerTerminalReceipt lacks ${key}`);
     this.#mutate(taskId, "app-server/terminal-receipt", receipt, () => {});
+  }
+
+  recordSourceIntakeTerminalReceipt({ deliveryRunId, role, receipt }) {
+    if (!this.hasSourceIntakeTerminalReceipts || !this.deliveryRun(deliveryRunId)) throw new Error("Source intake terminal receipt requires a delivery run");
+    if (!new Set(["source_claim_extraction", "source_claim_audit"]).has(role)) throw new Error("Source intake terminal receipt role is invalid");
+    if (!receipt || receipt.schemaVersion !== 1 || receipt.kind !== "AppServerTerminalReceipt") throw new Error("Source intake terminal receipt must be versioned");
+    if (!["turn_completed", "same_provider_thread_read", "same_provider_thread_read_result_equivalence"].includes(receipt.source) || receipt.terminalClass !== "completed") throw new Error("Source intake terminal receipt requires an explicit completed terminal status");
+    for (const key of ["threadId", "requestedTurnId", "resolvedTurnId", "correlationId", "providerConnectionId", "capturedAt"]) if (typeof receipt[key] !== "string" || !receipt[key]) throw new Error(`Source intake terminal receipt lacks ${key}`);
+    const serialized = JSON.stringify(receipt); const existing = this.db.prepare("SELECT receipt_json FROM source_intake_terminal_receipts WHERE delivery_run_id = ? AND role = ?").get(deliveryRunId, role);
+    if (existing && existing.receipt_json !== serialized) throw new Error("Source intake terminal receipt is immutable and mismatched");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (!existing) this.db.prepare("INSERT INTO source_intake_terminal_receipts(delivery_run_id,role,schema_version,thread_id,requested_turn_id,resolved_turn_id,receipt_json,created_at) VALUES (?,?,?,?,?,?,?,?)").run(deliveryRunId, role, receipt.schemaVersion, receipt.threadId, receipt.requestedTurnId, receipt.resolvedTurnId, serialized, now());
+      this.#insertEvent(null, "source-intake/terminal-receipt", { deliveryRunId, role, receipt });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.sourceIntakeTerminalReceipt({ deliveryRunId, role });
+  }
+
+  sourceIntakeTerminalReceipt({ deliveryRunId, role }) {
+    if (!this.hasSourceIntakeTerminalReceipts) return null;
+    const row = this.db.prepare("SELECT receipt_json,created_at FROM source_intake_terminal_receipts WHERE delivery_run_id = ? AND role = ?").get(deliveryRunId, role);
+    return row ? { receipt: JSON.parse(row.receipt_json), createdAt: row.created_at } : null;
+  }
+
+  recordSourceIntakeFailure({ deliveryRunId, role, errorCode, diagnostics = null }) {
+    if (!this.deliveryRun(deliveryRunId) || !["source_claim_extraction", "source_claim_audit"].includes(role) || typeof errorCode !== "string" || !errorCode) throw new Error("Source intake failure is invalid");
+    const boundedDiagnostics = typeof diagnostics === "string" ? diagnostics.slice(0, 2000) : null;
+    this.recordEvent(null, "source-intake/failure", { deliveryRunId, role, errorCode: errorCode.slice(0, 160), diagnostics: boundedDiagnostics });
   }
 
   events({ after = 0, limit = 500 } = {}) {
