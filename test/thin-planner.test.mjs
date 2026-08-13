@@ -23,6 +23,16 @@ test("planner maps title dependencies to controller IDs", () => {
   assert.deepEqual(plan.tasks[1].dependsOn, [plan.tasks[0].id]);
 });
 
+test("planner accepts up to twelve semantic tasks", () => {
+  const tasks = Array.from({ length: 12 }, (_, index) => ({
+    title: `Task ${index + 1}`,
+    prompt: "Implement the isolated task.",
+    allowedPaths: [`components/${index + 1}`],
+    dependsOn: [],
+  }));
+  assert.equal(validateThinPlanCandidate({ tasks }).tasks.length, 12);
+});
+
 test("planner rejects malformed JSON turn output", async () => {
   await assert.rejects(createThinPlan({ markdown: "x", runTurn: async () => "not-json" }), /malformed JSON/);
 });

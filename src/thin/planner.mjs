@@ -24,7 +24,7 @@ export function buildThinPlannerPrompt(markdown) {
     "Create a small implementation plan from the Markdown below.",
     "Return JSON only (no prose or Markdown fence) with exactly this shape:",
     '{"tasks":[{"title":"...","prompt":"...","allowedPaths":["relative/path"],"dependsOn":["other task title"]}]}',
-    "Return between 1 and 10 tasks. A dependency is another returned task title.",
+    "Return between 1 and 12 tasks. A dependency is another returned task title.",
     "Keep independent tasks in non-overlapping file areas. Do not include IDs,",
     "SHA values, timestamps, budgets, source claims, evidence, or any technical metadata.",
     "\n--- PROJECT MARKDOWN ---\n",
@@ -64,8 +64,8 @@ export function validateThinPlanCandidate(candidate) {
   candidate = discardControllerFields(candidate);
   if (!isPlainObject(candidate)) throw new TypeError("planner output must be a JSON object");
   assertExactKeys(candidate, ROOT_KEYS, "planner output");
-  if (!Array.isArray(candidate.tasks) || candidate.tasks.length < 1 || candidate.tasks.length > 10) {
-    throw new Error("planner output must contain 1 to 10 tasks");
+  if (!Array.isArray(candidate.tasks) || candidate.tasks.length < 1 || candidate.tasks.length > 12) {
+    throw new Error("planner output must contain 1 to 12 tasks");
   }
 
   const titles = new Set();

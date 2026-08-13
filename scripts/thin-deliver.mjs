@@ -221,9 +221,11 @@ function emitWorkerRuntimeEvent(stdout, event) {
 
 function emitControllerEvent(stdout, event) {
   if (event.type === "plan_accepted") stdout("[plan] accepted");
+  else if (event.type === "wave_started") stdout(`[wave ${event.waveNumber}] started tasks=${event.taskKeys.length}`);
   else if (event.type === "worker_started") stdout(`[worker ${event.taskKey}] started`);
   else if (event.type === "heartbeat") stdout(`[worker] activity pending=${event.pendingWorkers}`);
   else if (event.type === "commit") stdout(`[worker ${event.taskKey}] committed ${event.commitSha}`);
+  else if (event.type === "wave_candidate") stdout(`[wave ${event.waveNumber}] candidate ${event.candidateSha}`);
   else if (event.type === "integration_started") stdout("[integration] started");
   else if (event.type === "integration_test_passed") stdout(`[integration] test passed ${event.candidateSha}`);
   else if (event.type === "completed") stdout(`[completed] candidate ${event.candidateSha}`);
