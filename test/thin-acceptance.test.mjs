@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { buildThinAcceptancePrompt, extractThinAcceptanceCriteria, runThinAcceptance, validateThinAcceptanceCandidate } from "../src/thin/acceptance.mjs";
 
 const markdown = "# Product\n\n## Accounts\n- Users must register and log in.\n## Guides\n- A visitor must see city guides.\n";
@@ -27,6 +28,29 @@ test("controller accepts product requirements but excludes manifesto and process
   assert.ok(criteria.every((criterion) => /^[a-f0-9]{64}$/.test(criterion.sourceRef.sourceDigest)));
   assert.throws(() => extractThinAcceptanceCriteria([{ documentId: "agency_manifesto.md", markdown: "# Agency\n- Agents must create a worktree.\n" }]), /No product acceptance requirements/);
 });
+
+test("selected product specification retains database, content, stack, and product units with exact source ranges", () => {
+  const spec = [
+    "# European Trip Guide",
+    "", "## Database schema", "", "- UserId (FK to Users.Id)", "- Stars (1-5)",
+    "", "## Content", "- Every city guide contains 15 places and 3 routes.",
+    "", "## Stack", "| Component | Technology |", "| --- | --- |", "| Frontend | Next.js |", "| API | ASP.NET Core |",
+    "", "## Product behavior", "The application must allow a visitor to view a city guide.", "- Users can save favorites.",
+  ].join("\n");
+  const criteria = extractThinAcceptanceCriteria([{ documentId: "TECH_SPEC.md", markdown: spec }]);
+  const statements = criteria.map((criterion) => criterion.statement);
+  for (const expected of ["UserId (FK to Users.Id)", "Stars (1-5)", "Every city guide contains 15 places and 3 routes.", "| Frontend | Next.js |", "| API | ASP.NET Core |", "The application must allow a visitor to view a city guide.", "Users can save favorites."]) assert.ok(statements.includes(expected), expected);
+  const userId = criteria.find((criterion) => criterion.statement === "UserId (FK to Users.Id)");
+  assert.deepEqual({ startLine: userId.sourceRef.startLine, endLine: userId.sourceRef.endLine }, { startLine: 5, endLine: 5 });
+  assert.equal(userId.sourceRef.fragmentDigest, (awaitDigest("- UserId (FK to Users.Id)")));
+  assert.ok(criteria.length < 80);
+});
+
+function awaitDigest(value) {
+  // Keep the expected source-fragment contract visible without a fixture model
+  // or any audit-model participation.
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
 
 test("passing audit and controller verification accept the exact candidate without repair", async () => {
   let repairs = 0;

@@ -42,7 +42,7 @@ function extractThinAcceptanceCriteriaLegacy(markdown) {
   return Object.freeze(criteria);
 }
 
-export function extractThinAcceptanceCriteria(input) {
+function extractThinAcceptanceCriteriaNarrow(input) {
   const source = snapshotThinAcceptanceSources(input);
   const seen = new Set();
   const criteria = [];
@@ -66,6 +66,84 @@ export function extractThinAcceptanceCriteria(input) {
   }
   if (!criteria.length) throw new Error("No product acceptance requirements found in selected product documents");
   return Object.freeze(criteria);
+}
+
+/**
+ * A source becomes product scope only at CLI admission.  Once admitted, keep
+ * its product facts complete: database columns, bounded values, stack rows,
+ * and bullet continuations are not discarded merely because they omit words
+ * such as "user" or "must".  Only an explicitly process/meta section is
+ * excluded.  The acceptance model has no control over this boundary.
+ */
+export function extractThinAcceptanceCriteria(input) {
+  const source = snapshotThinAcceptanceSources(input);
+  const criteria = [];
+  const seen = new Set();
+  for (const document of source.documents) {
+    const lines = document.normalized.split("\n");
+    let inFence = false;
+    let excludedSection = false;
+    for (let index = 0; index < lines.length; index += 1) {
+      const raw = lines[index]; const line = raw.trim(); const lineNumber = index + 1;
+      if (line.startsWith("```")) { inFence = !inFence; continue; }
+      if (inFence || !line) continue;
+      const heading = line.match(/^(#{1,6})\s+(.+)$/);
+      if (heading) { excludedSection = isExplicitProcessMetaHeading(heading[2]); continue; }
+      if (excludedSection || !isProductUnitLine(line)) continue;
+      const group = collectProductUnit(lines, index);
+      const statement = group.lines.map((item, offset) => offset === 0 ? stripProductUnitPrefix(item.trim()) : item.trim()).join("\n").slice(0, 2_000);
+      const semanticKey = statement.toLocaleLowerCase();
+      if (!statement || seen.has(semanticKey)) { index = group.endIndex; continue; }
+      seen.add(semanticKey);
+      const fragment = lines.slice(index, group.endIndex + 1).join("\n");
+      const fragmentDigest = createHash("sha256").update(fragment, "utf8").digest("hex");
+      const identity = createHash("sha256").update(`${document.sourceDigest}\n${lineNumber}\n${group.endIndex + 1}\n${fragmentDigest}`, "utf8").digest("hex");
+      criteria.push(Object.freeze({
+        requirementId: `requirement-${identity.slice(0, 16)}`,
+        criterionId: `criterion-${identity.slice(16, 32)}`,
+        statement,
+        sourceRef: Object.freeze({ documentId: document.documentId, sourceDigest: document.sourceDigest, startLine: lineNumber, endLine: group.endIndex + 1, fragmentDigest })
+      }));
+      if (criteria.length >= MAX_CRITERIA) return Object.freeze(criteria);
+      index = group.endIndex;
+    }
+  }
+  if (!criteria.length) throw new Error("No product acceptance requirements found in selected product documents");
+  return Object.freeze(criteria);
+}
+
+function isExplicitProcessMetaHeading(value) {
+  return /\b(process|workflow|orchestration|agent instructions?|review(?:er| process)?|audit process|execution|operations?|tooling|shell commands?|git workflow|contribution|meta)\b|\b(процес|оркестрац|інструкц|рев[’']ю|аудит|виконан|інструмент|команд|мета)/i.test(String(value));
+}
+
+function isProductUnitLine(line) {
+  if (/^([-*+]\s+|- \[[ xX]\]\s+|\d+[.)]\s+)/.test(line)) return !isStandaloneProcessInstruction(line);
+  if (/^\|.*\|$/.test(line)) return !/^\|?\s*:?-{3,}/.test(line.replaceAll(" ", ""));
+  return /\b(must|shall|required|should|can|supports?|allows?|shows?|displays?|creates?|stores?|returns?|provides?)\b|\b(має|повинен|повинна|може|потрібно|дозволяє|показує|створює|зберігає|повертає|надає)/i.test(line);
+}
+
+function stripProductUnitPrefix(line) {
+  return line.replace(/^[-*+]\s+|^\d+[.)]\s+|^- \[[ xX]\]\s+/, "");
+}
+
+function isStandaloneProcessInstruction(line) {
+  return /\b(agent|worker|orchestrator|controller|planner|reviewer|prompt|worktree|codex|app server|shell|terminal|npm|node(?:\.js)?|git|commit|push|pull request|pr|ci\/cd|documentation|markdown|token budget|quota)\b|\b(агент|воркер|оркестратор|контролер|планувальник|рев[’']юер|промпт|ворктрі|термінал|коміт|пуш|документац|токен|квот)/i.test(line);
+}
+
+function collectProductUnit(lines, startIndex) {
+  const first = lines[startIndex];
+  const isBullet = /^\s*(?:[-*+]\s+|- \[[ xX]\]\s+|\d+[.)]\s+)/.test(first);
+  let endIndex = startIndex;
+  if (isBullet) {
+    for (let cursor = startIndex + 1; cursor < lines.length; cursor += 1) {
+      const value = lines[cursor]; const trimmed = value.trim();
+      if (!trimmed) break;
+      if (/^\s*#/.test(value) || /^\s*(?:[-*+]\s+|- \[[ xX]\]\s+|\d+[.)]\s+)/.test(value) || /^\|.*\|$/.test(trimmed)) break;
+      if (!/^\s+/.test(value)) break;
+      endIndex = cursor;
+    }
+  }
+  return { lines: lines.slice(startIndex, endIndex + 1), endIndex };
 }
 
 /** Controller-owned classification: audit output cannot promote process text. */
