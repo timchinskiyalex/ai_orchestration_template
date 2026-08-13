@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { SwarmRouter } from "../src/router.mjs";
 import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 import { documentIdForPath, documentSetDigest, policyDigest } from "../src/product-blueprint.mjs";
-import { createImportedSourceResolver, sourceClaimCandidateId, sourceFragmentDigest, validateSourceClaimExtraction } from "../src/source-evidence.mjs";
+import { canonicalizeSourceClaimExtractionCandidate, createImportedSourceResolver, sourceClaimCandidateId, sourceFragmentDigest, validateSourceClaimExtraction } from "../src/source-evidence.mjs";
 import { admitAuditedSourceClaims, auditSubjectFromExtraction, normalizedSourceUnits, validateSourceClaimAudit } from "../src/source-claim-audit.mjs";
 import { provider } from "./execution-provider-test-adapter.mjs";
 import { CodexAppServerRuntime } from "../src/codex-app-server-runtime.mjs";
@@ -45,7 +45,7 @@ class AuditClient extends EventEmitter {
   }
 }
 
-function fixture({ supplied = false, auditVariant = "admitted", policyRegistry = { schemaVersion: 1, policies: [] }, aliasRoles = [], unavailableRoles = [] } = {}) {
+function fixture({ supplied = false, auditVariant = "admitted", auditMutator = null, policyRegistry = { schemaVersion: 1, policies: [] }, aliasRoles = [], unavailableRoles = [] } = {}) {
   const root = mkdtempSync(join(tmpdir(), "source-claim-audit-")); const raw = join(root, "raw"); mkdirSync(raw);
   execFileSync("git", ["-C", root, "init", "-b", "main"]);
   execFileSync("git", ["-C", root, "commit", "--allow-empty", "-m", "base", "--no-gpg-sign", "--author", "Audit Test <audit@example.test>"]);
@@ -53,15 +53,12 @@ function fixture({ supplied = false, auditVariant = "admitted", policyRegistry =
   const path = "requirements.md"; const file = { documentId: documentIdForPath(path), path, sha256: digest(text) };
   writeFileSync(join(raw, path), text);
   writeFileSync(join(root, "package.json"), JSON.stringify({ name: "audit-fixture", packageManager: "npm@10", scripts: { test: "node --test" } })); writeFileSync(join(root, "package-lock.json"), "{}"); execFileSync("git", ["-C", root, "add", "package.json", "package-lock.json"]); execFileSync("git", ["-C", root, "commit", "-m", "fixture-package", "--no-gpg-sign", "--author", "Audit Test <audit@example.test>"]);
-  const claim = (line, claimType, normalizedStatement) => {
-    const value = { documentId: file.documentId, startLine: line, endLine: line, sourceDigest: file.sha256, claimType, normalizedStatement, confidence: 0.9, sourceQuote: { documentId: file.documentId, startLine: line, endLine: line, excerptDigest: sourceFragmentDigest(text, line, line) } };
-    return { ...value, claimId: sourceClaimCandidateId(value) };
-  };
+  const claim = (line, claimType, normalizedStatement) => ({ claimType, normalizedStatement, classification: "mandatory", sourceLocation: { documentId: file.documentId, startLine: line, endLine: line } });
   const claims = [claim(1, "scope", "Product requirements."), claim(2, "constraint", "Deployment needs a token."), claim(3, "functional", "Users sign in.")];
-  const extraction = () => ({ schemaVersion: 1, kind: "SourceClaimExtraction", documentSetDigest: documentSetDigest([file]), claims });
-  const audit = () => auditFor({ root, file, extraction: extraction(), variant: auditVariant, policyRegistry });
+  const extraction = () => ({ schemaVersion: 1, kind: "SourceClaimExtractionCandidate", claims });
+  const audit = () => { const value = auditFor({ root, file, extraction: extraction(), variant: auditVariant, policyRegistry }); auditMutator?.(value); return value; };
   if (supplied) {
-    const refs = claims.map((item) => item.sourceQuote);
+    const refs = [1, 2, 3].map((line) => ({ documentId: file.documentId, startLine: line, endLine: line, excerptDigest: sourceFragmentDigest(text, line, line) }));
     writeFileSync(join(raw, "source-claims.json"), JSON.stringify({ schemaVersion: 1, kind: "SourceClaimsDeclaration", documentSetDigest: documentSetDigest([file]), documents: [{ ...file, coverage: refs.map((ref, index) => ({ claimId: `supplied-${index + 1}`, ...ref })) }], claims: refs.map((ref, index) => ({ claimId: `supplied-${index + 1}`, classification: index === 1 ? "mandatory" : "non_mandatory", sourceRefs: [ref] })) }));
   }
   const client = new AuditClient({ extraction, audit, aliasRoles, unavailableRoles });
@@ -94,7 +91,7 @@ function failRoleWithRuntime(fx, role, failure) {
 
 function auditFor({ root, extraction, variant = "admitted", policyRegistry }) {
   const resolver = createImportedSourceResolver({ repository: root, documentationDir: "docs/in" });
-  const verified = validateSourceClaimExtraction(extraction, { sourceResolver: resolver }); const subject = auditSubjectFromExtraction(verified);
+  const verified = canonicalizeSourceClaimExtractionCandidate(extraction, { sourceResolver: resolver }); const subject = auditSubjectFromExtraction(verified);
   const target = subject.claims[1];
   const decisions = subject.claims.map((claim) => ({ claimId: claim.claimId, decision: claim.claimId === target.claimId && !["admitted", "omitted"].includes(variant) ? variant : "admitted", ...(claim.claimId === target.claimId && !["admitted", "omitted"].includes(variant) ? {} : { classification: "mandatory" }), reasonCodes: [claim.claimId === target.claimId && variant !== "admitted" ? variant.replace("-", "_") : "verified"], sourceRefs: claim.sourceRefs }));
   const coverage = normalizedSourceUnits(resolver).map((unit) => {
@@ -133,6 +130,19 @@ test("source intake persists one exact alias receipt for extraction and independ
   } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }
 });
 
+test("independent audit receives canonical subjects and cannot substitute controller IDs or source refs", async () => {
+  for (const [name, mutate] of [
+    ["claim-id", (audit) => { audit.decisions[0].claimId = "claim-substituted"; }],
+    ["source-ref", (audit) => { audit.decisions[0].sourceRefs = [{ ...audit.decisions[0].sourceRefs[0], excerptDigest: "0".repeat(64) }]; }]
+  ]) {
+    const fx = fixture({ auditMutator: mutate }); const router = new SwarmRouter(fx.config);
+    try {
+      const result = await new DeliveryCoordinator(router).begin({ source: fx.raw }); const failure = router.store.sourceIntakeFailureForRun({ deliveryRunId: result.id });
+      assert.equal(result.state, "blocked_specification", name); assert.equal(result.publish.reason, "source_claim_audit:validate:audit_result_invalid", name); assert.equal(router.list().length, 0, name); assert.ok(result.sourceClaimExtractionId, name); assert.equal(result.sourceClaimManifestId, null, name); assert.equal(failure.role, "audit", name); assert.equal(failure.phase, "validate", name); assert.equal(failure.code, "audit_result_invalid", name);
+    } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }
+  }
+});
+
 test("source executors have no direct legacy provider path", async () => {
   const { readFileSync } = await import("node:fs");
   for (const path of ["src/source-claim-extraction.mjs", "src/source-claim-audit.mjs"]) {
@@ -150,9 +160,13 @@ test("source intake fail-closes wrong correlation, missing terminal status, malf
       const result = await new DeliveryCoordinator(router).begin({ source: fx.raw });
       assert.equal(result.state, "blocked_specification", `${role}:${failure}`);
       assert.equal(router.list().length, 0, `${role}:${failure}`);
+      const persisted = router.store.sourceIntakeFailureForRun({ deliveryRunId: result.id, role: role === "source_claim_extraction" ? "extraction" : "audit" });
+      assert.equal(persisted.phase, failure === "malformed_json" ? "parse" : failure === "final_result_unavailable" ? "result_read" : "terminal", `${role}:${failure}`);
+      assert.equal(persisted.code, failure === "malformed_json" ? "malformed_json" : failure === "final_result_unavailable" ? "final_result_unavailable" : "terminal_correlation_invalid", `${role}:${failure}`);
       if (failure === "final_result_unavailable") {
         assert.match(result.publish.reason, /final_result_unavailable/, `${role}:${failure}`);
         assert.ok(router.store.sourceIntakeTerminalReceipt({ deliveryRunId: result.id, role }), `${role}:${failure}`);
+        assert.ok(persisted.receiptIdentity, `${role}:${failure}`);
       }
     } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }
   }
@@ -174,7 +188,7 @@ test("trusted source-audit policy is exact and an auditor cannot self-authorize 
   const fx = fixture();
   try {
     mkdirSync(join(fx.root, "docs/in"), { recursive: true }); writeFileSync(join(fx.root, "docs/in", fx.file.path), fx.text); writeFileSync(join(fx.root, "docs/in", "inventory.json"), JSON.stringify({ files: [fx.file], documentSetDigest: documentSetDigest([fx.file]) }));
-    const resolver = createImportedSourceResolver({ repository: fx.root, documentationDir: "docs/in" }); const subject = auditSubjectFromExtraction(validateSourceClaimExtraction(fx.extraction(), { sourceResolver: resolver })); const target = subject.claims[1];
+    const resolver = createImportedSourceResolver({ repository: fx.root, documentationDir: "docs/in" }); const subject = auditSubjectFromExtraction(canonicalizeSourceClaimExtractionCandidate(fx.extraction(), { sourceResolver: resolver })); const target = subject.claims[1];
     const policy = { policyId: "resolve-token", version: "1", scope: { kind: "source_claim_audit", claimIds: [target.claimId] }, affectedRequirementIds: [], resolvedValue: "Use controller-managed deployment secret." }; policy.digest = policyDigest(policy);
     const audit = auditFor({ root: fx.root, extraction: fx.extraction(), policyRegistry: { schemaVersion: 1, policies: [policy] } }); audit.decisions[1].policy = { policyId: policy.policyId, version: policy.version, digest: policy.digest, resolvedValue: policy.resolvedValue };
     const admitted = validateSourceClaimAudit(audit, { subject, sourceResolver: resolver, policyRegistry: { schemaVersion: 1, policies: [policy] } }); assert.ok(admitAuditedSourceClaims({ subject, audit: admitted }).manifestId);

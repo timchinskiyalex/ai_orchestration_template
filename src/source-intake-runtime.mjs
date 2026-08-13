@@ -1,5 +1,6 @@
 import { CodexAppServerRuntime } from "./codex-app-server-runtime.mjs";
 import { ExecutionProviderError, safeDiagnostics } from "./execution-provider-contract.mjs";
+import { sourceIntakeFailure } from "./source-intake-failure.mjs";
 
 const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled"]);
 const RECEIPT_SOURCES = new Set(["turn_completed", "same_provider_thread_read", "same_provider_thread_read_result_equivalence"]);
@@ -42,6 +43,7 @@ async function failClosed(runtime, role, code, cause) {
 // terminal lifecycle observation never substitutes for that result.
 export async function runSourceIntakeTurn({ config, role, developerInstructions, objective, tokenBudget, prompt, recordTerminalReceipt, recordFailure = null }) {
   const { runtime, cwd } = runtimeFor(config, role);
+  let terminalReceipt = null;
   try {
     await runtime.connect();
     const thread = await runtime.startThread({ model: config.model, sandbox: "read-only", approvalPolicy: "never", developerInstructions, serviceName: "codex-source-intake" });
@@ -69,7 +71,7 @@ export async function runSourceIntakeTurn({ config, role, developerInstructions,
     // The receipt is persisted before final-result read/parse/validation and
     // therefore before any candidate or manifest admission decision.
     if (typeof recordTerminalReceipt !== "function") await failClosed(runtime, role, "terminal_receipt_persistence_failed");
-    try { await recordTerminalReceipt(durable.terminalReceipt); }
+    try { await recordTerminalReceipt(durable.terminalReceipt); terminalReceipt = durable.terminalReceipt; }
     catch (error) { await failClosed(runtime, role, "terminal_receipt_persistence_failed", error); }
     if (durable.kind !== "worker_completed" || durable.terminalClass !== "completed") {
       await failClosed(runtime, role, "terminal_not_completed");
@@ -85,8 +87,11 @@ export async function runSourceIntakeTurn({ config, role, developerInstructions,
     const failure = error instanceof ExecutionProviderError && error.errorCode.startsWith(`${role}_`)
       ? error
       : new ExecutionProviderError(`${role}_runtime_unavailable`, `${role}:runtime_unavailable`, { errorClass: error?.errorClass ?? "runtime", diagnostics: await diagnosticsFor(runtime, error) });
-    try { await recordFailure?.({ errorCode: failure.errorCode, diagnostics: safeDiagnostics(failure.diagnostics) }); } catch {}
-    throw failure;
+    const phase = /final_result_unavailable$/.test(failure.errorCode) ? "result_read" : "terminal";
+    const code = failure.errorCode.replace(new RegExp(`^${role}_`), "").replace(/[^a-z0-9_]/gi, "_").slice(0, 96) || "runtime_unavailable";
+    const intakeFailure = sourceIntakeFailure({ role, phase, code, receipt: terminalReceipt, errorClass: failure.errorClass });
+    try { await recordFailure?.(intakeFailure.sourceIntakeFailure); } catch {}
+    throw intakeFailure;
   } finally {
     try { await runtime.shutdown(); } catch {}
   }

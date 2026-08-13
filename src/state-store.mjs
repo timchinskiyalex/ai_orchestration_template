@@ -25,6 +25,7 @@ export class StateStore {
     this.hasSourceClaimExtractions = this.#hasTable("source_claim_extractions");
     this.hasSourceClaimAudits = this.#hasTable("source_claim_audits");
     this.hasSourceIntakeTerminalReceipts = this.#hasTable("source_intake_terminal_receipts");
+    this.hasSourceIntakeFailures = this.#hasTable("source_intake_failures");
     this.hasRepositoryBaselines = this.#hasTable("repository_baselines") && this.#hasColumn("delivery_runs", "repository_mode");
     this.hasManagedWorktrees = this.#hasTable("managed_worktrees");
     if (readOnly) return;
@@ -228,6 +229,11 @@ export class StateStore {
         resolved_turn_id TEXT NOT NULL, receipt_json TEXT NOT NULL, created_at TEXT NOT NULL,
         PRIMARY KEY (delivery_run_id, role)
       );
+      CREATE TABLE IF NOT EXISTS source_intake_failures (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_run_id TEXT NOT NULL REFERENCES delivery_runs(id),
+        schema_version INTEGER NOT NULL, role TEXT NOT NULL, phase TEXT NOT NULL, code TEXT NOT NULL,
+        receipt_identity_json TEXT, diagnostics_json TEXT, created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS repository_baseline_drafts (
         delivery_run_id TEXT PRIMARY KEY REFERENCES delivery_runs(id),
         schema_version INTEGER NOT NULL, draft_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -353,6 +359,7 @@ export class StateStore {
     this.hasSourceClaimExtractions = true;
     this.hasSourceClaimAudits = true;
     this.hasSourceIntakeTerminalReceipts = true;
+    this.hasSourceIntakeFailures = true;
     this.hasRepositoryBaselines = true;
     this.hasManagedWorktrees = true;
     this.#addColumnIfMissing("tasks", "dependencies_json", "TEXT NOT NULL DEFAULT '[]'");
@@ -749,10 +756,30 @@ export class StateStore {
     return row ? { receipt: JSON.parse(row.receipt_json), createdAt: row.created_at } : null;
   }
 
-  recordSourceIntakeFailure({ deliveryRunId, role, errorCode, diagnostics = null }) {
-    if (!this.deliveryRun(deliveryRunId) || !["source_claim_extraction", "source_claim_audit"].includes(role) || typeof errorCode !== "string" || !errorCode) throw new Error("Source intake failure is invalid");
-    const boundedDiagnostics = typeof diagnostics === "string" ? diagnostics.slice(0, 2000) : null;
-    this.recordEvent(null, "source-intake/failure", { deliveryRunId, role, errorCode: errorCode.slice(0, 160), diagnostics: boundedDiagnostics });
+  recordSourceIntakeFailure({ deliveryRunId, schemaVersion = 1, role, phase, code, receiptIdentity = null, diagnostics = null }) {
+    if (!this.hasSourceIntakeFailures || !this.deliveryRun(deliveryRunId) || schemaVersion !== 1 || !["extraction", "audit"].includes(role) || !["terminal", "result_read", "parse", "canonicalize", "validate", "persist"].includes(phase) || !/^[a-z][a-z0-9_]{0,95}$/.test(code)) throw new Error("SourceIntakeFailure is invalid");
+    const identity = receiptIdentity && typeof receiptIdentity === "object" && ["threadId", "requestedTurnId", "resolvedTurnId"].every((key) => typeof receiptIdentity[key] === "string" && receiptIdentity[key] && receiptIdentity[key].length <= 512)
+      ? { threadId: receiptIdentity.threadId, requestedTurnId: receiptIdentity.requestedTurnId, resolvedTurnId: receiptIdentity.resolvedTurnId }
+      : null;
+    const safeDiagnostics = typeof diagnostics?.errorClass === "string" && /^[a-z][a-z0-9_-]{0,63}$/i.test(diagnostics.errorClass)
+      ? { errorClass: diagnostics.errorClass }
+      : null;
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db.prepare("INSERT INTO source_intake_failures(delivery_run_id,schema_version,role,phase,code,receipt_identity_json,diagnostics_json,created_at) VALUES (?,?,?,?,?,?,?,?)").run(deliveryRunId, schemaVersion, role, phase, code, identity ? JSON.stringify(identity) : null, safeDiagnostics ? JSON.stringify(safeDiagnostics) : null, timestamp);
+      const failure = { id: Number(result.lastInsertRowid), schemaVersion, role, phase, code, receiptIdentity: identity, diagnostics: safeDiagnostics, createdAt: timestamp };
+      this.#insertEvent(null, "source-intake/failure", { deliveryRunId, ...failure });
+      this.db.exec("COMMIT"); return failure;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  sourceIntakeFailureForRun({ deliveryRunId, role = null }) {
+    if (!this.hasSourceIntakeFailures) return null;
+    const row = role
+      ? this.db.prepare("SELECT * FROM source_intake_failures WHERE delivery_run_id = ? AND role = ? ORDER BY id DESC LIMIT 1").get(deliveryRunId, role)
+      : this.db.prepare("SELECT * FROM source_intake_failures WHERE delivery_run_id = ? ORDER BY id DESC LIMIT 1").get(deliveryRunId);
+    return row ? { id: row.id, schemaVersion: row.schema_version, role: row.role, phase: row.phase, code: row.code, receiptIdentity: parse(row.receipt_identity_json, null), diagnostics: parse(row.diagnostics_json, null), createdAt: row.created_at } : null;
   }
 
   events({ after = 0, limit = 500 } = {}) {

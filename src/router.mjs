@@ -25,6 +25,7 @@ import { documentSetDigest, sourceClaimBlockers, specificationBlockers, validate
 import { compileImportedSourceClaimManifest, createImportedSourceResolver, validateSourceClaimExtraction } from "./source-evidence.mjs";
 import { SourceClaimExtractionExecutor } from "./source-claim-extraction.mjs";
 import { SourceClaimAuditExecutor, admitAuditedSourceClaims, auditSubjectFromExtraction, auditSubjectFromManifest, deterministicSuppliedSourceClaimAudit, validateSourceClaimAudit } from "./source-claim-audit.mjs";
+import { sourceIntakeFailure } from "./source-intake-failure.mjs";
 import { PRODUCT_ACCEPTANCE_KIND, PRODUCT_ACCEPTANCE_SCHEMA_VERSION, productAcceptancePasses } from "./final-acceptance.mjs";
 import { compileWriteSurfaceTopology } from "./write-surface.mjs";
 import { assertRepositoryBaselineCurrent, captureRepositoryBaselineDraft, finalizeRepositoryBaseline, repositoryBaselineStatus, validateTaskBaselineBehaviorIds } from "./repository-baseline.mjs";
@@ -333,22 +334,38 @@ export class SwarmRouter extends EventEmitter {
         ? deterministicSuppliedSourceClaimAudit(subject, resolver)
         : await new SourceClaimAuditExecutor(this.config).audit(subject, {
           recordTerminalReceipt: (receipt) => this.store.recordSourceIntakeTerminalReceipt({ deliveryRunId: run.id, role: "source_claim_audit", receipt }),
-          recordFailure: (failure) => this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, role: "source_claim_audit", ...failure })
+          recordFailure: (failure) => this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, ...failure })
         });
-      const directory = join(this.config.repository, this.config.project.generatedDir, "source-claim-audits"); mkdirSync(directory, { recursive: true });
-      const path = join(directory, `${audit.auditId}.json`); const serialized = `${JSON.stringify(audit, null, 2)}\n`;
-      if (existsSync(path) && readFileSync(path, "utf8") !== serialized) throw new Error("source_claim_audit:existing_audit_artifact_mismatch");
-      if (!existsSync(path)) writeFileSync(path, serialized, "utf8");
-      storedAudit = this.store.recordSourceClaimAudit({ deliveryRunId: run.id, audit, artifactPath: relative(this.config.repository, path).split("\\").join("/") });
+      try {
+        const directory = join(this.config.repository, this.config.project.generatedDir, "source-claim-audits"); mkdirSync(directory, { recursive: true });
+        const path = join(directory, `${audit.auditId}.json`); const serialized = `${JSON.stringify(audit, null, 2)}\n`;
+        if (existsSync(path) && readFileSync(path, "utf8") !== serialized) throw new Error("source_claim_audit:existing_audit_artifact_mismatch");
+        if (!existsSync(path)) writeFileSync(path, serialized, "utf8");
+        storedAudit = this.store.recordSourceClaimAudit({ deliveryRunId: run.id, audit, artifactPath: relative(this.config.repository, path).split("\\").join("/") });
+      } catch {
+        const failure = sourceIntakeFailure({ role: "source_claim_audit", phase: "persist", code: "audit_persistence_failed", receipt: this.store.sourceIntakeTerminalReceipt({ deliveryRunId: run.id, role: "source_claim_audit" })?.receipt });
+        this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, ...failure.sourceIntakeFailure }); throw failure;
+      }
     }
-    const manifest = admitAuditedSourceClaims({ subject, audit });
-    const manifestDirectory = join(this.config.repository, this.config.project.generatedDir, "source-claim-manifests"); mkdirSync(manifestDirectory, { recursive: true });
-    const manifestPath = join(manifestDirectory, `${manifest.manifestId}.json`); const manifestSerialized = `${JSON.stringify(manifest, null, 2)}\n`;
-    if (existsSync(manifestPath) && readFileSync(manifestPath, "utf8") !== manifestSerialized) throw new Error("source_claim_audit:existing_manifest_artifact_mismatch");
-    if (!existsSync(manifestPath)) writeFileSync(manifestPath, manifestSerialized, "utf8");
-    this.store.recordSourceClaimManifest(manifest);
-    this.store.linkSourceClaimManifestToDelivery(run.id, manifest.manifestId);
-    this.store.recordEvent(null, "source-claim-admission/admitted", { deliveryRunId: run.id, extractionId: run.sourceClaimExtractionId ?? null, auditId: audit.auditId, manifestId: manifest.manifestId, documentSetDigest: manifest.documentSetDigest, claimCount: manifest.claims.length });
+    let manifest;
+    try {
+      manifest = admitAuditedSourceClaims({ subject, audit });
+    } catch {
+      const failure = sourceIntakeFailure({ role: "source_claim_audit", phase: "validate", code: "audit_admission_blocked", receipt: this.store.sourceIntakeTerminalReceipt({ deliveryRunId: run.id, role: "source_claim_audit" })?.receipt });
+      this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, ...failure.sourceIntakeFailure }); throw failure;
+    }
+    try {
+      const manifestDirectory = join(this.config.repository, this.config.project.generatedDir, "source-claim-manifests"); mkdirSync(manifestDirectory, { recursive: true });
+      const manifestPath = join(manifestDirectory, `${manifest.manifestId}.json`); const manifestSerialized = `${JSON.stringify(manifest, null, 2)}\n`;
+      if (existsSync(manifestPath) && readFileSync(manifestPath, "utf8") !== manifestSerialized) throw new Error("source_claim_audit:existing_manifest_artifact_mismatch");
+      if (!existsSync(manifestPath)) writeFileSync(manifestPath, manifestSerialized, "utf8");
+      this.store.recordSourceClaimManifest(manifest);
+      this.store.linkSourceClaimManifestToDelivery(run.id, manifest.manifestId);
+      this.store.recordEvent(null, "source-claim-admission/admitted", { deliveryRunId: run.id, extractionId: run.sourceClaimExtractionId ?? null, auditId: audit.auditId, manifestId: manifest.manifestId, documentSetDigest: manifest.documentSetDigest, claimCount: manifest.claims.length });
+    } catch {
+      const failure = sourceIntakeFailure({ role: "source_claim_audit", phase: "persist", code: "manifest_admission_persistence_failed", receipt: this.store.sourceIntakeTerminalReceipt({ deliveryRunId: run.id, role: "source_claim_audit" })?.receipt });
+      this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, ...failure.sourceIntakeFailure }); throw failure;
+    }
     return { subject, audit, manifest };
   }
 
@@ -395,19 +412,26 @@ export class SwarmRouter extends EventEmitter {
     }
     const extraction = await new SourceClaimExtractionExecutor(this.config).extract({
       recordTerminalReceipt: (receipt) => this.store.recordSourceIntakeTerminalReceipt({ deliveryRunId: run.id, role: "source_claim_extraction", receipt }),
-      recordFailure: (failure) => this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, role: "source_claim_extraction", ...failure })
+      recordFailure: (failure) => this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, ...failure })
     });
-    const directory = join(this.config.repository, this.config.project.generatedDir, "source-claim-extractions");
-    mkdirSync(directory, { recursive: true });
-    const path = join(directory, `${extraction.extractionId}.json`);
-    const serialized = `${JSON.stringify(extraction, null, 2)}\n`;
-    if (existsSync(path) && readFileSync(path, "utf8") !== serialized) throw new Error("source_claim_extraction:existing_candidate_artifact_mismatch");
-    if (!existsSync(path)) writeFileSync(path, serialized, "utf8");
-    await this.config.faultHooks?.source_claim_candidate_file_before_db_persistence?.({ deliveryRunId: run.id, extractionId: extraction.extractionId, path });
-    return this.store.recordSourceClaimExtraction({ deliveryRunId: run.id, extraction, artifactPath: relative(this.config.repository, path).split("\\").join("/") });
+    try {
+      const directory = join(this.config.repository, this.config.project.generatedDir, "source-claim-extractions");
+      mkdirSync(directory, { recursive: true });
+      const path = join(directory, `${extraction.extractionId}.json`);
+      const serialized = `${JSON.stringify(extraction, null, 2)}\n`;
+      if (existsSync(path) && readFileSync(path, "utf8") !== serialized) throw new Error("source_claim_extraction:existing_candidate_artifact_mismatch");
+      if (!existsSync(path)) writeFileSync(path, serialized, "utf8");
+      await this.config.faultHooks?.source_claim_candidate_file_before_db_persistence?.({ deliveryRunId: run.id, extractionId: extraction.extractionId, path });
+      return this.store.recordSourceClaimExtraction({ deliveryRunId: run.id, extraction, artifactPath: relative(this.config.repository, path).split("\\").join("/") });
+    } catch {
+      const failure = sourceIntakeFailure({ role: "source_claim_extraction", phase: "persist", code: "candidate_persistence_failed", receipt: this.store.sourceIntakeTerminalReceipt({ deliveryRunId: run.id, role: "source_claim_extraction" })?.receipt });
+      this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, ...failure.sourceIntakeFailure }); throw failure;
+    }
   }
 
   blockRunForSourceExtraction(run, error) {
+    const failure = this.store.sourceIntakeFailureForRun({ deliveryRunId: run.id, role: "extraction" });
+    if (failure) return this.store.blockDeliveryForSpecification(run.id, { reason: `source_claim_extraction:${failure.phase}:${failure.code}`, recovery: { action: "Correct the imported documentation or extraction provider, then resume this intake or start a fresh delivery." } });
     const message = String(error?.message ?? error);
     const prefix = /source_claim_audit/.test(message) ? "source_claim_audit" : "source_claim_extraction";
     const code = /malformed_json/i.test(message) ? `${prefix}:malformed_json` : /final_result_unavailable/i.test(message) ? `${prefix}:final_result_unavailable` : /terminal_(?:unavailable|correlation_invalid|not_completed)|runtime_unavailable|receipt_persistence_failed|transport|unsupported_capability/i.test(message) ? `${prefix}:runtime_unavailable` : /admission_blocked/.test(message) ? "source_claim_audit:blocked_specification" : /source_provenance|source_claim_contract|source_claim_audit/.test(message) ? `${prefix}:source_integrity_or_coverage_invalid` : `${prefix}:failed`;
@@ -415,6 +439,8 @@ export class SwarmRouter extends EventEmitter {
   }
 
   blockRunForSourceClaimAudit(run, error) {
+    const failure = this.store.sourceIntakeFailureForRun({ deliveryRunId: run.id, role: "audit" });
+    if (failure) return this.store.blockDeliveryForSpecification(run.id, { reason: `source_claim_audit:${failure.phase}:${failure.code}`, recovery: { action: "Correct the source material, controller policy, or independent audit result, then start a fresh delivery." } });
     const detail = String(error?.message ?? error);
     const code = /malformed_json/i.test(detail)
       ? "source_claim_audit:malformed_json"
@@ -529,6 +555,7 @@ export class SwarmRouter extends EventEmitter {
       qualityReports: reports.map(({ taskId, path, report }) => ({ taskId, path, verdict: report.verdict, findings: report.findings.length })),
       securityReports: securityReports.map(({ taskId, path, report }) => ({ taskId, path, verdict: report.verdict, findings: report.findings.length })),
       deliveryRun: this.store.currentDeliveryRun(),
+      sourceIntakeFailure: this.store.currentDeliveryRun() ? this.store.sourceIntakeFailureForRun({ deliveryRunId: this.store.currentDeliveryRun().id }) : null,
       projectMode: this.store.currentDeliveryRun()?.projectMode ?? this.projectMode,
       repositoryBaseline: repositoryBaselineStatus(this.store.currentDeliveryRun() ? this.store.repositoryBaselineForRun(this.store.currentDeliveryRun().id) : null),
       finalAcceptance: this.store.currentDeliveryRun() ? this.store.productAcceptanceForRun(this.store.currentDeliveryRun().id) : null,

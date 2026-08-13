@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 import { SwarmRouter } from "../src/router.mjs";
 import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
-import { createImportedSourceResolver, sourceClaimCandidateId, sourceFragmentDigest, validateSourceClaimExtraction } from "../src/source-evidence.mjs";
+import { canonicalizeSourceClaimExtractionCandidate, createImportedSourceResolver, sourceClaimCandidateId, sourceFragmentDigest, validateSourceClaimExtraction } from "../src/source-evidence.mjs";
 import { auditSubjectFromExtraction, normalizedSourceUnits } from "../src/source-claim-audit.mjs";
 import { provider } from "./execution-provider-test-adapter.mjs";
 
@@ -23,15 +23,14 @@ function rawExtraction(root) {
   const text = readFileSync(join(root, "docs", "orchestration-input", source.path), "utf8");
   const claims = [1, 2, 3, 4].map((line) => {
     const normalizedStatement = `Implement behavior ${line}.`;
-    const claim = { documentId: source.documentId, startLine: line, endLine: line, sourceDigest: source.sha256, claimType: "functional", normalizedStatement, confidence: 1, sourceQuote: { documentId: source.documentId, startLine: line, endLine: line, excerptDigest: sourceFragmentDigest(text, line, line) } };
-    return { ...claim, claimId: sourceClaimCandidateId(claim) };
+    return { claimType: "functional", normalizedStatement, classification: "mandatory", sourceLocation: { documentId: source.documentId, startLine: line, endLine: line } };
   });
-  return { schemaVersion: 1, kind: "SourceClaimExtraction", documentSetDigest: documentSetDigest([source]), claims };
+  return { schemaVersion: 1, kind: "SourceClaimExtractionCandidate", claims };
 }
 
 function rawAudit(root) {
   const resolver = createImportedSourceResolver({ repository: root, documentationDir: "docs/orchestration-input" });
-  const extraction = validateSourceClaimExtraction(rawExtraction(root), { sourceResolver: resolver });
+  const extraction = canonicalizeSourceClaimExtractionCandidate(rawExtraction(root), { sourceResolver: resolver });
   const subject = auditSubjectFromExtraction(extraction);
   return {
     schemaVersion: 1,
@@ -46,7 +45,7 @@ function rawAudit(root) {
 
 function blueprint(root) {
   const inventory = JSON.parse(readFileSync(join(root, "docs", "orchestration-input", "inventory.json"), "utf8"));
-  const claims = rawExtraction(root).claims;
+  const claims = canonicalizeSourceClaimExtractionCandidate(rawExtraction(root), { sourceResolver: createImportedSourceResolver({ repository: root, documentationDir: "docs/orchestration-input" }) }).claims;
   const source = inventory.files[0];
   const text = readFileSync(join(root, "docs", "orchestration-input", source.path), "utf8");
   const requirement = (id, line, criterionId, description) => ({

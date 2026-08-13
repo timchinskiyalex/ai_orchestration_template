@@ -8,7 +8,7 @@ import { execFileSync } from "node:child_process";
 import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 import { SwarmRouter } from "../src/router.mjs";
 import { documentIdForPath, documentSetDigest } from "../src/product-blueprint.mjs";
-import { sourceClaimCandidateId, sourceFragmentDigest } from "../src/source-evidence.mjs";
+import { sourceFragmentDigest } from "../src/source-evidence.mjs";
 import { ingestDocumentation } from "../src/project-intake.mjs";
 import { provider } from "./execution-provider-test-adapter.mjs";
 
@@ -40,37 +40,54 @@ function fixture(resultFor) {
   return { root, source, file, text, config, calls };
 }
 
-function candidate({ file, text }, mutate = (value) => value) {
-  const make = (claimType, normalizedStatement) => ({ documentId: file.documentId, startLine: 2, endLine: 2, sourceDigest: file.sha256, claimType, normalizedStatement, confidence: 0.8, sourceQuote: { documentId: file.documentId, startLine: 2, endLine: 2, excerptDigest: sourceFragmentDigest(text, 2, 2) } });
-  const claims = [make("constraint", "Deployment requires a token."), make("risk", "Deployment token handling is sensitive.")].map((item) => ({ ...item, claimId: sourceClaimCandidateId(item) }));
-  return mutate({ schemaVersion: 1, kind: "SourceClaimExtraction", documentSetDigest: documentSetDigest([file]), claims });
+function candidate({ file }, mutate = (value) => value) {
+  const make = (claimType, normalizedStatement) => ({ claimType, normalizedStatement, classification: "mandatory", sourceLocation: { documentId: file.documentId, startLine: 2, endLine: 2 } });
+  const claims = [make("constraint", "Deployment requires a token."), make("risk", "Deployment token handling is sensitive.")];
+  return mutate({ schemaVersion: 1, kind: "SourceClaimExtractionCandidate", claims });
 }
 
-test("raw Markdown persists atomic extraction candidates but never queues Bootstrap before independent audit admission", async () => {
-  const subject = fixture(candidate); const router = new SwarmRouter(subject.config); const coordinator = new DeliveryCoordinator(router);
+test("raw semantic candidates are controller-canonicalized and never queue Bootstrap before independent audit admission", async () => {
+  const subject = fixture((context) => candidate(context, (value) => {
+    Object.assign(value.claims[0], { claimId: "claim-agent-controlled", sourceDigest: "0".repeat(64), sourceQuote: { documentId: "foreign", startLine: 99, endLine: 99, excerptDigest: "f".repeat(64) }, documentSetDigest: "f".repeat(64) });
+    return value;
+  })); const router = new SwarmRouter(subject.config); const coordinator = new DeliveryCoordinator(router);
   try {
     const run = await coordinator.begin({ source: subject.source });
     assert.equal(run.state, "blocked_specification", JSON.stringify(run.publish)); assert.equal(subject.calls.turns, 2); assert.equal(router.list().length, 0);
     const stored = router.store.sourceClaimExtraction(run.sourceClaimExtractionId);
     assert.equal(stored.extraction.claims.length, 2); assert.equal(stored.extraction.claims[0].startLine, stored.extraction.claims[1].startLine);
+    assert.notEqual(stored.extraction.claims[0].claimId, "claim-agent-controlled"); assert.equal(stored.extraction.claims[0].sourceDigest, subject.file.sha256);
+    assert.equal(stored.extraction.claims[0].sourceQuote.documentId, subject.file.documentId); assert.equal("confidence" in stored.extraction.claims[0], false);
     assert.ok(readFileSync(join(subject.root, stored.artifactPath), "utf8").includes("Deployment requires a token."));
     assert.equal(JSON.stringify(router.statusSnapshot()).includes("SUPERSECRET"), false);
     assert.equal(JSON.stringify(run).includes("SUPERSECRET"), false);
   } finally { router.close(); rmSync(subject.root, { recursive: true, force: true }); }
 });
 
-test("malformed, unknown, and changed raw sources become bounded specification blocks", async () => {
+test("raw malformed and semantic failures persist an exact safe SourceIntakeFailure before Bootstrap", async () => {
   const malformed = fixture(() => "not-json"); const malformedRouter = new SwarmRouter(malformed.config);
   try {
     const coordinator = new DeliveryCoordinator(malformedRouter);
-    assert.equal((await coordinator.begin({ source: malformed.source })).state, "blocked_specification");
+    const run = await coordinator.begin({ source: malformed.source }); assert.equal(run.state, "blocked_specification");
+    assert.deepEqual(malformedRouter.store.sourceIntakeFailureForRun({ deliveryRunId: run.id }), { id: 1, schemaVersion: 1, role: "extraction", phase: "parse", code: "malformed_json", receiptIdentity: { threadId: "thread-1", requestedTurnId: "turn-thread-1", resolvedTurnId: "turn-thread-1" }, diagnostics: null, createdAt: malformedRouter.store.sourceIntakeFailureForRun({ deliveryRunId: run.id }).createdAt });
+    assert.equal(JSON.stringify({ status: malformedRouter.statusSnapshot(), run }).includes("SUPERSECRET"), false);
     malformed.config.executionProviderFactory = () => provider(new ExtractionClient(candidate({ file: malformed.file, text: malformed.text }), malformed.calls));
     assert.equal((await coordinator.resume()).state, "blocked_specification");
   }
   finally { malformedRouter.close(); rmSync(malformed.root, { recursive: true, force: true }); }
-  const unknown = fixture((context) => candidate(context, (value) => { value.claims[0].documentId = "doc-unknown"; return value; })); const unknownRouter = new SwarmRouter(unknown.config);
-  try { assert.equal((await new DeliveryCoordinator(unknownRouter).begin({ source: unknown.source })).state, "blocked_specification"); }
-  finally { unknownRouter.close(); rmSync(unknown.root, { recursive: true, force: true }); }
+  for (const [name, mutate, phase, code] of [
+    ["unknown-document", (value) => { value.claims[0].sourceLocation.documentId = "doc-unknown"; }, "canonicalize", "candidate_canonicalization_failed"],
+    ["out-of-range", (value) => { value.claims[0].sourceLocation.endLine = 99; }, "canonicalize", "candidate_canonicalization_failed"],
+    ["missing-statement", (value) => { delete value.claims[0].normalizedStatement; }, "validate", "candidate_semantics_invalid"],
+    ["missing-type", (value) => { delete value.claims[0].claimType; }, "validate", "candidate_semantics_invalid"],
+    ["missing-classification", (value) => { delete value.claims[0].classification; }, "validate", "candidate_semantics_invalid"]
+  ]) {
+    const invalid = fixture((context) => candidate(context, (value) => { mutate(value); return value; })); const invalidRouter = new SwarmRouter(invalid.config);
+    try {
+      const run = await new DeliveryCoordinator(invalidRouter).begin({ source: invalid.source }); const failure = invalidRouter.store.sourceIntakeFailureForRun({ deliveryRunId: run.id });
+      assert.equal(run.state, "blocked_specification", name); assert.equal(run.publish.reason, `source_claim_extraction:${phase}:${code}`, name); assert.equal(invalidRouter.list().length, 0, name); assert.equal(run.sourceClaimExtractionId, null, name); assert.equal(failure.phase, phase, name); assert.equal(failure.code, code, name);
+    } finally { invalidRouter.close(); rmSync(invalid.root, { recursive: true, force: true }); }
+  }
   const changed = fixture(candidate); const first = new SwarmRouter(changed.config);
   try {
     const run = await new DeliveryCoordinator(first).begin({ source: changed.source }); assert.equal(run.state, "blocked_specification"); first.close();
@@ -79,6 +96,15 @@ test("malformed, unknown, and changed raw sources become bounded specification b
     try { assert.equal((await new DeliveryCoordinator(restarted).resume()).state, "blocked_specification"); }
     finally { restarted.close(); }
   } finally { if (!first.closed) first.close(); rmSync(changed.root, { recursive: true, force: true }); }
+});
+
+test("candidate persistence failure is safe, durable, and leaves no admitted manifest", async () => {
+  const subject = fixture(candidate); subject.config.faultHooks = { async source_claim_candidate_file_before_db_persistence() { throw new Error("test persistence failure"); } };
+  const router = new SwarmRouter(subject.config);
+  try {
+    const run = await new DeliveryCoordinator(router).begin({ source: subject.source }); const failure = router.store.sourceIntakeFailureForRun({ deliveryRunId: run.id });
+    assert.equal(run.state, "blocked_specification"); assert.equal(run.publish.reason, "source_claim_extraction:persist:candidate_persistence_failed"); assert.equal(failure.phase, "persist"); assert.equal(failure.code, "candidate_persistence_failed"); assert.equal(run.sourceClaimManifestId, null); assert.equal(router.list().length, 0);
+  } finally { router.close(); rmSync(subject.root, { recursive: true, force: true }); }
 });
 
 test("supplied declarations remain a high-assurance intake route and candidate restart needs no provider", async () => {

@@ -91,6 +91,14 @@ export function createImportedSourceResolver(context) {
     return { documentId: ref.documentId, startLine: ref.startLine, endLine: ref.endLine, excerptDigest: actualDigest };
   }
 
+  function canonicalRef(documentId, startLine, endLine, label = "source reference") {
+    if (typeof documentId !== "string" || !documents.has(documentId)) provenanceError(`${label} names a document absent from the controller inventory`);
+    if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) provenanceError(`${label} has an invalid line range`);
+    const lines = sourceLines(readDocument(documentId));
+    if (endLine > lines.length) provenanceError(`${label} line range is outside imported document '${documentId}'`);
+    return Object.freeze({ documentId, startLine, endLine, excerptDigest: sha256(lines.slice(startLine - 1, endLine).join("\n")) });
+  }
+
   function lineCount(documentId) { const lines = sourceLines(readDocument(documentId)); return lines.at(-1) === "" ? lines.length - 1 : lines.length; }
   function controlledDocuments() {
     return Object.freeze(sourceDocuments.map((document) => Object.freeze({
@@ -99,12 +107,40 @@ export function createImportedSourceResolver(context) {
       text: readDocument(document.documentId)
     })));
   }
-  return Object.freeze({ sourceDocuments: Object.freeze(sourceDocuments), verify, lineCount, controlledDocuments });
+  return Object.freeze({ sourceDocuments: Object.freeze(sourceDocuments), verify, canonicalRef, lineCount, controlledDocuments });
 }
 
 export function sourceClaimCandidateId({ documentId, startLine, endLine, claimType, normalizedStatement }) {
   const identity = `${documentId}:${startLine}:${endLine}:${claimType}:${normalizedStatement}`;
   return `claim-${sha256(identity).slice(0, 24)}`;
+}
+
+// Raw extraction output is intentionally semantic only.  Every provenance
+// digest and stable identifier is derived from the controller-owned inventory.
+export function canonicalizeSourceClaimExtractionCandidate(value, { sourceResolver }) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.schemaVersion !== SOURCE_CLAIM_EXTRACTION_SCHEMA_VERSION || !["SourceClaimExtractionCandidate", "SourceClaimExtraction"].includes(value.kind) || !Array.isArray(value.claims) || !value.claims.length) claimContractError("source_claim_extraction_candidate_schema_invalid");
+  const sourceDocuments = sourceResolver.sourceDocuments;
+  const documentSetDigest = sha256(canonical([...sourceDocuments].sort((a, b) => a.path.localeCompare(b.path))));
+  const documents = new Map(sourceDocuments.map((item) => [item.documentId, item]));
+  const claims = value.claims.map((claim) => {
+    const location = claim?.sourceLocation ?? claim;
+    if (!claim || typeof claim !== "object" || Array.isArray(claim) || !claimTypes.has(claim.claimType) || !classifications.has(claim.classification) || typeof claim.normalizedStatement !== "string" || !claim.normalizedStatement.trim() || claim.normalizedStatement.length > 2000 || !location || typeof location !== "object" || typeof location.documentId !== "string" || !Number.isInteger(location.startLine) || !Number.isInteger(location.endLine)) claimContractError("source_claim_extraction_candidate_semantics_invalid");
+    const normalizedStatement = claim.normalizedStatement.trim().replace(/\s+/g, " ");
+    let sourceQuote;
+    try { sourceQuote = sourceResolver.canonicalRef(location.documentId, location.startLine, location.endLine, "extracted candidate"); }
+    catch (error) { claimContractError(`source_claim_extraction_canonicalization_failed:${error.message.replace(/^source_provenance: /, "")}`); }
+    const source = documents.get(sourceQuote.documentId);
+    const canonicalClaim = {
+      claimId: sourceClaimCandidateId({ documentId: sourceQuote.documentId, startLine: sourceQuote.startLine, endLine: sourceQuote.endLine, claimType: claim.claimType, normalizedStatement }),
+      documentId: sourceQuote.documentId, startLine: sourceQuote.startLine, endLine: sourceQuote.endLine,
+      sourceDigest: source.sha256, claimType: claim.claimType, normalizedStatement, classification: claim.classification,
+      sourceQuote
+    };
+    return Object.freeze(canonicalClaim);
+  });
+  const ids = new Set(claims.map((claim) => claim.claimId));
+  if (ids.size !== claims.length) claimContractError("source_claim_extraction_canonicalization_duplicate_claim");
+  return validateSourceClaimExtraction({ schemaVersion: SOURCE_CLAIM_EXTRACTION_SCHEMA_VERSION, kind: "SourceClaimExtraction", documentSetDigest, sourceDocuments, claims }, { sourceResolver });
 }
 
 // This deliberately validates evidence only. It does not admit claims as
@@ -117,7 +153,7 @@ export function validateSourceClaimExtraction(value, { sourceResolver }) {
   const documents = new Map(sourceDocuments.map((item) => [item.documentId, item]));
   const seen = new Set();
   const claims = value.claims.map((claim) => {
-    if (!claim || typeof claim !== "object" || Array.isArray(claim) || !claimIdPattern.test(claim.claimId ?? "") || seen.has(claim.claimId) || !documents.has(claim.documentId) || !Number.isInteger(claim.startLine) || !Number.isInteger(claim.endLine) || claim.startLine < 1 || claim.endLine < claim.startLine || !digestPattern.test(claim.sourceDigest ?? "") || !claimTypes.has(claim.claimType) || typeof claim.normalizedStatement !== "string" || !claim.normalizedStatement.trim() || claim.normalizedStatement.length > 2000 || typeof claim.confidence !== "number" || !Number.isFinite(claim.confidence) || claim.confidence < 0 || claim.confidence > 1) claimContractError("source_claim_extraction_claim_invalid");
+    if (!claim || typeof claim !== "object" || Array.isArray(claim) || !claimIdPattern.test(claim.claimId ?? "") || seen.has(claim.claimId) || !documents.has(claim.documentId) || !Number.isInteger(claim.startLine) || !Number.isInteger(claim.endLine) || claim.startLine < 1 || claim.endLine < claim.startLine || !digestPattern.test(claim.sourceDigest ?? "") || !claimTypes.has(claim.claimType) || !classifications.has(claim.classification) || typeof claim.normalizedStatement !== "string" || !claim.normalizedStatement.trim() || claim.normalizedStatement.length > 2000) claimContractError("source_claim_extraction_claim_invalid");
     const expected = documents.get(claim.documentId);
     if (claim.sourceDigest !== expected.sha256) claimContractError(`source_claim_extraction_source_digest_mismatch:${claim.claimId}`);
     let ref;
@@ -128,7 +164,7 @@ export function validateSourceClaimExtraction(value, { sourceResolver }) {
     const stableId = sourceClaimCandidateId({ ...claim, normalizedStatement });
     if (claim.claimId !== stableId) claimContractError(`source_claim_extraction_claim_id_unstable:${claim.claimId}`);
     seen.add(claim.claimId);
-    return Object.freeze({ claimId: claim.claimId, documentId: claim.documentId, startLine: claim.startLine, endLine: claim.endLine, sourceDigest: claim.sourceDigest, claimType: claim.claimType, normalizedStatement, confidence: claim.confidence, sourceQuote: ref });
+    return Object.freeze({ claimId: claim.claimId, documentId: claim.documentId, startLine: claim.startLine, endLine: claim.endLine, sourceDigest: claim.sourceDigest, claimType: claim.claimType, normalizedStatement, classification: claim.classification, sourceQuote: ref });
   });
   const unsigned = { schemaVersion: SOURCE_CLAIM_EXTRACTION_SCHEMA_VERSION, kind: "SourceClaimExtraction", documentSetDigest, sourceDocuments, claims: [...claims].sort((a, b) => a.claimId.localeCompare(b.claimId)) };
   const digest = sha256(canonical(unsigned));

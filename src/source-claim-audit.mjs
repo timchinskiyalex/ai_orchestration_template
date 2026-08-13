@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { policyDigest } from "./product-blueprint.mjs";
 import { createImportedSourceResolver, sourceFragmentDigest } from "./source-evidence.mjs";
 import { runSourceIntakeTurn } from "./source-intake-runtime.mjs";
+import { sourceIntakeFailure } from "./source-intake-failure.mjs";
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item) ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
@@ -13,7 +14,7 @@ function fail(message) { throw new Error(`source_claim_audit:${message}`); }
 function refsEqual(left, right) { return left.length === right.length && left.map((item) => `${item.documentId}:${item.startLine}:${item.endLine}:${item.excerptDigest}`).sort().every((item, index) => item === right.map((rightItem) => `${rightItem.documentId}:${rightItem.startLine}:${rightItem.endLine}:${rightItem.excerptDigest}`).sort()[index]); }
 
 export function auditSubjectFromExtraction(extraction) {
-  const claims = extraction.claims.map((claim) => ({ claimId: claim.claimId, sourceRefs: [claim.sourceQuote], fixedClassification: null, claimType: claim.claimType, normalizedStatement: claim.normalizedStatement }));
+  const claims = extraction.claims.map((claim) => ({ claimId: claim.claimId, sourceRefs: [claim.sourceQuote], fixedClassification: null, candidateClassification: claim.classification, claimType: claim.claimType, normalizedStatement: claim.normalizedStatement }));
   return Object.freeze({ kind: "SourceClaimExtraction", candidateId: extraction.extractionId, candidateDigest: extraction.digest, documentSetDigest: extraction.documentSetDigest, sourceDocuments: extraction.sourceDocuments, claims });
 }
 
@@ -116,15 +117,25 @@ export function admitAuditedSourceClaims({ subject, audit }) {
   return Object.freeze({ ...unsigned, manifestId: `scm-${digest.slice(0, 24)}`, digest });
 }
 
-function parseResult(text) { const fenced = String(text).match(/```(?:json)?\s*([\s\S]*?)```/i); try { return JSON.parse((fenced?.[1] ?? text).trim()); } catch { fail("malformed_json"); } }
+function parseResult(text) { const fenced = String(text).match(/```(?:json)?\s*([\s\S]*?)```/i); try { return JSON.parse((fenced?.[1] ?? text).trim()); } catch { throw sourceIntakeFailure({ role: "source_claim_audit", phase: "parse", code: "malformed_json" }); } }
 
 export class SourceClaimAuditExecutor {
   constructor(config) { this.config = config; }
   async audit(subject, { recordTerminalReceipt = null, recordFailure = null } = {}) {
     const resolver = createImportedSourceResolver({ repository: this.config.repository, documentationDir: this.config.project.documentationDir });
-    const payload = { subject, documents: resolver.controlledDocuments(), coverageUnits: normalizedSourceUnits(resolver), trustedPolicies: this.config.specificationResolution?.policyRegistry?.policies?.filter((policy) => policy.scope?.kind === "source_claim_audit") ?? [] };
-    const prompt = `Return only one fenced JSON SourceClaimAudit. Decide every candidate claim as admitted, rejected, split-required, contradiction, or unresolved. Preserve all source refs exactly. Every controller coverage unit must be present. Meaningful units require an admitted claim; structural_header and boilerplate units must be excluded with their exact reason code. Contradictions and split-required claims may only be admitted when a supplied trusted source_claim_audit policy exactly binds the claim. Payload: ${JSON.stringify(payload)}`;
+    const payload = { subject, coverageUnits: normalizedSourceUnits(resolver), trustedPolicies: this.config.specificationResolution?.policyRegistry?.policies?.filter((policy) => policy.scope?.kind === "source_claim_audit") ?? [] };
+    const prompt = `Return only one fenced JSON SourceClaimAudit. The payload contains controller-canonical candidate claims and controller coverage units only; do not create or alter claim IDs or source refs. Decide every candidate claim as admitted, rejected, split-required, contradiction, or unresolved. Preserve all source refs exactly. Every controller coverage unit must be present. Meaningful units require an admitted claim; structural_header and boilerplate units must be excluded with their exact reason code. Contradictions and split-required claims may only be admitted when a supplied trusted source_claim_audit policy exactly binds the claim. Payload: ${JSON.stringify(payload)}`;
     const result = await runSourceIntakeTurn({ config: this.config, role: "source_claim_audit", developerInstructions: "You are the independent Specification Auditor. This is a separate operation from extraction. Audit only controller-provided source and candidate data; do not plan engineering work or authorize invented product decisions.", objective: "Independently audit source claims and source coverage.", tokenBudget: this.config.delivery?.sourceClaimAuditTokenBudget ?? 6000, prompt, recordTerminalReceipt, recordFailure });
-    return validateSourceClaimAudit(parseResult(result.resultText), { subject, sourceResolver: resolver, policyRegistry: this.config.specificationResolution?.policyRegistry });
+    let candidate;
+    try { candidate = parseResult(result.resultText); }
+    catch (error) {
+      const failure = sourceIntakeFailure({ role: "source_claim_audit", phase: "parse", code: "malformed_json", receipt: result.terminalReceipt });
+      await recordFailure?.(failure.sourceIntakeFailure); throw failure;
+    }
+    try { return validateSourceClaimAudit(candidate, { subject, sourceResolver: resolver, policyRegistry: this.config.specificationResolution?.policyRegistry }); }
+    catch {
+      const failure = sourceIntakeFailure({ role: "source_claim_audit", phase: "validate", code: "audit_result_invalid", receipt: result.terminalReceipt });
+      await recordFailure?.(failure.sourceIntakeFailure); throw failure;
+    }
   }
 }
