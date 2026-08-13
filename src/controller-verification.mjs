@@ -23,6 +23,8 @@ export function validateControllerExecutionReference(value, capabilities = CONTR
 }
 
 function eventTime(event) { const value = event?.payload?.timestamp ?? event?.createdAt; const time = Date.parse(value); return Number.isNaN(time) ? null : time; }
+function eventTimestamp(event) { return event?.payload?.timestamp ?? event?.createdAt ?? null; }
+function sameMembers(left, right) { return Array.isArray(left) && Array.isArray(right) && left.length === right.length && [...left].sort().every((item, index) => item === [...right].sort()[index]); }
 function hasPath(byId, from, target, seen = new Set()) {
   if (from === target) return true;
   if (seen.has(from)) return false;
@@ -38,7 +40,7 @@ export function deriveParallelReadinessEvidence({ store, deliveryRunId, blueprin
   try {
     const ref = validateControllerExecutionReference(reference);
     if (ref.capabilityId !== "parallel-readiness" || ref.capabilityVersion !== 1 || !SHA.test(candidateSha)) return base;
-    const run = store.deliveryRun(deliveryRunId); const blueprint = store.productBlueprint(blueprintId);
+    const run = store.deliveryRun(deliveryRunId); const blueprintRecord = store.productBlueprint(blueprintId); const blueprint = blueprintRecord?.blueprint ?? blueprintRecord;
     if (!run || run.blueprintId !== blueprintId || !blueprint || blueprint.blueprintId !== blueprintId) return base;
     const all = store.listTasks().filter((task) => task.deliveryRunId === deliveryRunId && task.executionIsWriter);
     const writers = ref.writerRequirementIds.map((required) => {
@@ -50,20 +52,26 @@ export function deriveParallelReadinessEvidence({ store, deliveryRunId, blueprin
     if (!stable(batchId) || !Number.isInteger(wave) || writers.some((task) => task.planBatchId !== batchId || task.wave !== wave)) return base;
     const batch = store.planBatch(batchId);
     if (!batch || batch.deliveryRunId !== deliveryRunId || batch.blueprintId !== blueprintId || batch.wave !== wave) return base;
+    const planned = writers.map((writer) => {
+      const matches = (batch.tasks ?? []).filter((task) => task?.primaryDomain === writer.role && sameMembers(task.requirementIds, writer.requirementIds) && sameMembers(task.allowedPaths, writer.allowedPaths));
+      return matches.length === 1 ? matches[0] : null;
+    });
+    if (planned.some((task) => !task) || new Set(planned.map((task) => task.id)).size !== planned.length) return base;
     const byId = new Map(store.listTasks().filter((task) => task.deliveryRunId === deliveryRunId).map((task) => [task.id, task]));
     const noPredecessor = writers.every((left, index) => writers.every((right, rightIndex) => index === rightIndex || (!hasPath(byId, left.id, right.id) && !hasPath(byId, right.id, left.id))));
-    if (ref.requirements.includes("no_writer_predecessor") && !noPredecessor) return base;
+    // Same-wave eligibility is a controller-owned DAG fact.  A missing direct
+    // edge is insufficient: neither the logical nor execution DAG may contain
+    // any dependency path between the exact referenced writers.
+    if ((ref.requirements.includes("no_writer_predecessor") || ref.requirements.includes("same_wave_eligibility")) && !noPredecessor) return base;
     const events = store.events({ limit: 100000 });
     const interval = (taskId) => {
-      const starts = events.filter((event) => event.taskId === taskId && ["lifecycle/turn started", "lifecycle/migrated writer turn started"].includes(event.type)).map(eventTime).filter((item) => item !== null);
-      const ends = events.filter((event) => event.taskId === taskId && ["lifecycle/turn terminal candidate", "lifecycle/migrated writer finalized"].includes(event.type)).map(eventTime).filter((item) => item !== null);
-      return starts.length === 1 && ends.length >= 1 ? { start: starts[0], end: ends.find((item) => item >= starts[0]) ?? null } : null;
+      const starts = events.filter((event) => event.taskId === taskId && ["lifecycle/turn started", "lifecycle/migrated writer turn started"].includes(event.type)).map((event) => ({ time: eventTime(event), timestamp: eventTimestamp(event) })).filter((item) => item.time !== null);
+      const ends = events.filter((event) => event.taskId === taskId && ["lifecycle/turn terminal candidate", "lifecycle/migrated writer finalized"].includes(event.type)).map((event) => ({ time: eventTime(event), timestamp: eventTimestamp(event) })).filter((item) => item.time !== null);
+      return starts.length === 1 && ends.length === 1 && ends[0].time >= starts[0].time ? { taskId, start: starts[0].time, end: ends[0].time, startedAt: starts[0].timestamp, terminalAt: ends[0].timestamp } : null;
     };
     const intervals = writers.map((task) => interval(task.id));
-    const peerDependency = writers.some((task) => task.dependencies.some((dependency) => writers.some((other) => other.id === dependency)) || task.executionDependencies.some((dependency) => writers.some((other) => other.id === dependency)));
-    if (ref.requirements.includes("same_wave_eligibility") && peerDependency) return base;
+    if (intervals.some((item) => !item?.end)) return base;
     if (ref.requirements.includes("overlapping_active_turns")) {
-      if (intervals.some((item) => !item?.end)) return base;
       const points = intervals.flatMap((item) => [[item.start, 1], [item.end, -1]]).sort((left, right) => left[0] - right[0] || right[1] - left[1]);
       let active = 0; let maximum = 0;
       for (const [, delta] of points) { active += delta; maximum = Math.max(maximum, active); }
@@ -71,7 +79,7 @@ export function deriveParallelReadinessEvidence({ store, deliveryRunId, blueprin
     }
     const checkpoint = store.globalWaveCheckpoint(deliveryRunId, wave);
     if (ref.requirements.includes("checkpoint_lineage") && (!checkpoint || checkpoint.blueprintId !== blueprintId || checkpoint.outputSha?.toLowerCase() !== candidateSha.toLowerCase())) return base;
-    const binding = { schemaVersion: 1, kind: "ControllerExecutionEvidence", capabilityId: ref.capabilityId, capabilityVersion: ref.capabilityVersion, blueprintId, deliveryRunId, planBatchId: batch.id, wave, taskIds: writers.map((task) => task.id).sort(), minimumConcurrentActiveTurns: ref.minimumConcurrentActiveTurns, checkpointId: checkpoint?.id ?? null, checkpointSha: checkpoint?.outputSha ?? null, candidateSha, requirements: [...ref.requirements].sort() };
+    const binding = { schemaVersion: 1, kind: "ControllerExecutionEvidence", capabilityId: ref.capabilityId, capabilityVersion: ref.capabilityVersion, blueprintId, deliveryRunId, planBatchId: batch.id, wave, taskIds: writers.map((task) => task.id).sort(), planTaskIds: planned.map((task) => task.id).sort(), writerRequirementIds: [...ref.writerRequirementIds].sort(), lifecycleIntervals: intervals.map(({ taskId, startedAt, terminalAt }) => ({ taskId, startedAt, terminalAt })).sort((left, right) => left.taskId.localeCompare(right.taskId)), minimumConcurrentActiveTurns: ref.minimumConcurrentActiveTurns, checkpointId: checkpoint?.id ?? null, checkpointSha: checkpoint?.outputSha ?? null, candidateSha, requirements: [...ref.requirements].sort() };
     return { ...base, status: "pass", reference: `controller-execution:${binding.capabilityId}/v${binding.capabilityVersion}:${binding.planBatchId}:${binding.taskIds.join(",")}:${binding.checkpointId ?? "none"}`, controllerExecution: binding };
   } catch { return base; }
 }

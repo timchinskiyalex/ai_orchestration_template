@@ -9,18 +9,10 @@ import { SwarmRouter } from "../src/router.mjs";
 import { EXECUTION_PROVIDER_VERSION, REQUIRED_EXECUTION_CAPABILITIES, envelope, lifecycleEvent } from "../src/execution-provider-contract.mjs";
 
 const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
-const delay = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
-const eventually = async (predicate, label) => {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (predicate()) return;
-    await delay(5);
-  }
-  throw new Error(`Timed out waiting for ${label}`);
-};
 const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: false }]));
 
 class DeferredProvider extends EventEmitter {
-  constructor({ badStart = false } = {}) { super(); this.badStart = badStart; this.next = 0; this.turns = new Map(); this.durable = new Map(); this.aliases = new Map(); this.starts = []; this.maximumActive = 0; this.reconciliationGate = null; }
+  constructor({ badStart = false } = {}) { super(); this.badStart = badStart; this.next = 0; this.turns = new Map(); this.durable = new Map(); this.aliases = new Map(); this.starts = []; this.maximumActive = 0; this.reconciliationGate = null; this.observedWaiters = []; this.reconciliationWaiters = []; }
   #ok(operation, args, data) { return envelope({ operation, correlationId: args.correlationId, success: true, data }); }
   async handshake(args) { return this.#ok("handshake", args, { providerRunId: "deferred", capabilities: [...REQUIRED_EXECUTION_CAPABILITIES] }); }
   async accountRead(args) { return this.#ok("account_read", args, { account: {}, usage: {}, rateLimits: {} }); }
@@ -33,8 +25,9 @@ class DeferredProvider extends EventEmitter {
     this.maximumActive = Math.max(this.maximumActive, this.turns.size + 1);
     return this.#ok("start_turn", args, { providerRunId: "deferred", threadId: args.data.threadId, turnId });
   }
-  async observeTerminal(args) { return await new Promise((resolve) => this.turns.set(args.data.turnId, { args, resolve })); }
+  async observeTerminal(args) { return await new Promise((resolve) => { this.turns.set(args.data.turnId, { args, resolve }); this.#flush(this.observedWaiters, () => this.turns.size); }); }
   async reconcileTerminal(args) {
+    for (const resolve of this.reconciliationWaiters.splice(0)) resolve(args.data.turnId);
     if (this.reconciliationGate) await this.reconciliationGate;
     const terminal = this.durable.get(args.data.turnId);
     if (!terminal) return envelope({ operation: "reconcile_terminal", correlationId: args.correlationId, success: false, errorCode: "terminal_reconciliation_unavailable", errorClass: "transport", diagnostics: "no durable terminal" });
@@ -57,6 +50,20 @@ class DeferredProvider extends EventEmitter {
     this.durable.set(resolvedTurnId, { turnId: resolvedTurnId, status: terminalClass });
     turn.resolve(this.#ok("observe_terminal", turn.args, { providerRunId: "deferred", threadId: turn.args.data.threadId, turnId, terminalClass }));
   }
+  waitForObservedTurns(count) {
+    if (this.turns.size >= count) return Promise.resolve([...this.turns.keys()]);
+    return new Promise((resolve) => this.observedWaiters.push({ count, resolve }));
+  }
+  waitForReconciliation() {
+    if (this.reconciliationGate === null) throw new Error("install a reconciliation gate before waiting for it");
+    return new Promise((resolve) => this.reconciliationWaiters.push(resolve));
+  }
+  #flush(waiters, value) {
+    for (let index = waiters.length - 1; index >= 0; index -= 1) {
+      const waiter = waiters[index];
+      if (value() >= waiter.count) { waiters.splice(index, 1); waiter.resolve(value()); }
+    }
+  }
 }
 
 function fixture(provider, workers) {
@@ -73,13 +80,12 @@ test("workers=1 retains capacity through an alias until authoritative terminal p
     const frontend = subject.router.enqueue({ role: "frontend", title: "frontend QA", prompt: "safe" });
     const backend = subject.router.enqueue({ role: "backend", title: "backend writer", prompt: "safe" });
     const running = subject.router.runUntilIdle();
-    await eventually(() => provider.starts.length === 1, "first provider turn");
+    await provider.waitForObservedTurns(1);
     const first = provider.starts[0]; provider.alias(first.turnId);
-    await delay(25);
     assert.equal(provider.starts.length, 1, "an alias is not terminal completion and cannot free the only slot");
     assert.equal(subject.router.activeTurnSnapshot().length, 1);
     provider.complete(first.turnId);
-    await eventually(() => provider.starts.length === 2, "second provider turn after persisted terminal");
+    await provider.waitForObservedTurns(1);
     assert.equal(subject.router.store.getTask(frontend.id).status, "done");
     provider.complete(provider.starts[1].turnId);
     await running;
@@ -93,12 +99,11 @@ test("workers=2 never starts more than two unresolved provider turns", async () 
     await subject.router.ensureProjectOverlay();
     for (const title of ["one", "two", "three"]) subject.router.enqueue({ role: "backend", title, prompt: "safe" });
     const running = subject.router.runUntilIdle();
-    await eventually(() => provider.starts.length === 2, "two provider turns");
-    await delay(25);
+    await provider.waitForObservedTurns(2);
     assert.equal(provider.starts.length, 2);
     assert.equal(provider.maximumActive <= 2, true);
     provider.complete(provider.starts[0].turnId);
-    await eventually(() => provider.starts.length === 3, "third provider turn after one terminal completion");
+    await provider.waitForObservedTurns(2);
     assert.equal(provider.maximumActive <= 2, true);
     for (const turnId of [...provider.turns.keys()]) provider.complete(turnId);
     await running;
@@ -112,13 +117,13 @@ test("workers=1 retains capacity while controller-owned durable reconciliation i
     subject.router.enqueue({ role: "frontend", title: "first", prompt: "safe" });
     subject.router.enqueue({ role: "backend", title: "second", prompt: "safe" });
     const running = subject.router.runUntilIdle();
-    await eventually(() => provider.starts.length === 1, "first provider turn");
+    await provider.waitForObservedTurns(1);
     let release; provider.reconciliationGate = new Promise((resolve) => { release = resolve; });
     provider.complete(provider.starts[0].turnId);
-    await delay(25);
+    await provider.waitForReconciliation();
     assert.equal(provider.starts.length, 1, "durable reconciliation retains the only scheduler slot");
     release();
-    await eventually(() => provider.starts.length === 2, "second provider turn after reconciliation persistence");
+    await provider.waitForObservedTurns(1);
     provider.complete(provider.starts[1].turnId);
     await running;
   } finally { subject.dispose(); }

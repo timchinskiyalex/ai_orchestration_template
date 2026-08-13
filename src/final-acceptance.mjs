@@ -22,7 +22,7 @@ function validateResult(result, knownRequirements, knownCriteria, candidateSha) 
   for (const evidence of result.evidence) validateEvidence(evidence, candidateSha, "result evidence");
 }
 
-function validateCriterionResult(result, candidateSha, criterion = null) {
+function validateCriterionResult(result, candidateSha, criterion = null, blueprintId = null, deliveryRunId = null) {
   const expectedKind = criterion?.controllerExecution ? "controller-execution" : "product-e2e";
   const productEvidence = result.evidence.filter((evidence) => evidence.kind === expectedKind);
   if (productEvidence.length !== 1) fail(`criterion '${result.criterionId}' requires exactly one ${expectedKind} evidence item`);
@@ -32,7 +32,12 @@ function validateCriterionResult(result, candidateSha, criterion = null) {
   if (criterion?.controllerExecution) {
     const binding = evidence.controllerExecution;
     const ref = criterion.controllerExecution;
-    if (evidence.verificationKind !== "controller_execution" || !binding || binding.schemaVersion !== 1 || binding.capabilityId !== ref.capabilityId || binding.capabilityVersion !== ref.capabilityVersion || binding.blueprintId === undefined || !stable(binding.deliveryRunId) || !stable(binding.planBatchId) || !Number.isInteger(binding.wave) || !Array.isArray(binding.taskIds) || !binding.taskIds.length || new Set(binding.taskIds).size !== binding.taskIds.length || binding.minimumConcurrentActiveTurns !== ref.minimumConcurrentActiveTurns || !stable(binding.checkpointId) || !sha(binding.checkpointSha) || binding.candidateSha?.toLowerCase() !== candidateSha.toLowerCase() || binding.checkpointSha.toLowerCase() !== candidateSha.toLowerCase() || JSON.stringify([...binding.requirements ?? []].sort()) !== JSON.stringify([...ref.requirements].sort())) fail(`criterion '${result.criterionId}' controller evidence identity is invalid or stale`);
+    const exactIds = (value) => Array.isArray(value) && value.length > 0 && value.every(stable) && new Set(value).size === value.length;
+    const exactSet = (left, right) => JSON.stringify([...left ?? []].sort()) === JSON.stringify([...right ?? []].sort());
+    const boundedIntervals = Array.isArray(binding?.lifecycleIntervals) && binding.lifecycleIntervals.length === binding.taskIds?.length && binding.lifecycleIntervals.every((interval) => stable(interval?.taskId) && stable(interval?.startedAt) && stable(interval?.terminalAt) && Date.parse(interval.startedAt) <= Date.parse(interval.terminalAt)) && exactSet(binding.lifecycleIntervals.map((interval) => interval.taskId), binding.taskIds);
+    const requiresCheckpoint = ref.requirements.includes("checkpoint_lineage");
+    const checkpointValid = !requiresCheckpoint || (stable(binding?.checkpointId) && sha(binding?.checkpointSha) && binding.checkpointSha.toLowerCase() === candidateSha.toLowerCase());
+    if (evidence.verificationKind !== "controller_execution" || !binding || binding.schemaVersion !== 1 || binding.capabilityId !== ref.capabilityId || binding.capabilityVersion !== ref.capabilityVersion || binding.blueprintId !== blueprintId || binding.deliveryRunId !== deliveryRunId || !stable(binding.planBatchId) || !Number.isInteger(binding.wave) || !exactIds(binding.taskIds) || !exactIds(binding.planTaskIds) || binding.planTaskIds.length !== binding.taskIds.length || !exactSet(binding.writerRequirementIds, ref.writerRequirementIds) || !boundedIntervals || binding.minimumConcurrentActiveTurns !== ref.minimumConcurrentActiveTurns || !checkpointValid || binding.candidateSha?.toLowerCase() !== candidateSha.toLowerCase() || JSON.stringify([...binding.requirements ?? []].sort()) !== JSON.stringify([...ref.requirements].sort())) fail(`criterion '${result.criterionId}' controller evidence identity is invalid or stale`);
   } else if (criterion?.repositoryVerification && evidence.verificationKind !== undefined && evidence.verificationKind !== "repository_command") fail(`criterion '${result.criterionId}' repository verification evidence kind is invalid`);
   if (result.status === "pass" && evidence.status !== "pass") fail(`criterion '${result.criterionId}' cannot pass without passed product evidence`);
   validateEvidence(evidence, candidateSha, `criterion '${result.criterionId}' product evidence`);
@@ -70,7 +75,7 @@ export function validateProductAcceptanceReport(report, { blueprint, blueprintDi
     const key = `${result.requirementId}:${result.criterionId ?? "@requirement"}`;
     if (resultKeys.has(key)) fail(`duplicate result mapping '${key}'`);
     resultKeys.add(key);
-    if (result.criterionId !== null && result.criterionId !== undefined) validateCriterionResult(result, report.candidateSha, criteriaByKey.get(`${result.requirementId}:${result.criterionId}`));
+    if (result.criterionId !== null && result.criterionId !== undefined) validateCriterionResult(result, report.candidateSha, criteriaByKey.get(`${result.requirementId}:${result.criterionId}`), blueprint.blueprintId, report.deliveryRunId);
   }
   for (const requirement of blueprint.requirements) {
     const requirementResult = report.results.find((item) => item.requirementId === requirement.requirementId && (item.criterionId === null || item.criterionId === undefined));
