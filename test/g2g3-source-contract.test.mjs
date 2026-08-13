@@ -36,17 +36,17 @@ function sourceRef(file, text, line) {
 
 function explicitBlueprint(file, claims, overlayBaseSha) {
   const claimId = (claim) => sourceClaimCandidateId({ documentId: file.documentId, startLine: claim.sourceLocation.startLine, endLine: claim.sourceLocation.endLine, claimType: claim.claimType, normalizedStatement: claim.normalizedStatement });
-  const requirement = (requirementId, description, indexes, criterionId) => ({
+  const requirement = (requirementId, description, indexes, criterionId, verification = { repositoryVerification: { schemaVersion: 1, source: "project_overlay", commandId: "package-script:test", overlayBaseSha } }) => ({
     requirementId, type: "functional", priority: "must", mandatory: true, description,
     sourceClaimIds: indexes.map((index) => claimId(claims[index])), sourceRefs: indexes.map((index) => sourceRef(file, explicitSource, claims[index].sourceLocation.startLine)),
-    acceptanceCriteria: [{ criterionId, description, repositoryVerification: { schemaVersion: 1, source: "project_overlay", commandId: "package-script:test", overlayBaseSha } }], constraints: []
+    acceptanceCriteria: [{ criterionId, description, ...verification }], constraints: []
   });
   return {
     schemaVersion: 1, kind: "ProductBlueprint", blueprintId: "pb-g2g3-explicit", createdAt: "2026-01-01T00:00:00.000Z", documentSetDigest: documentSetDigest([file]), sourceDocuments: [file],
     requirements: [
       requirement("alpha-implementation", "Implement alpha in its owned file.", [0, 2], "alpha-module"),
       requirement("beta-implementation", "Implement beta in its owned file.", [1, 3], "beta-module"),
-      requirement("independent-delivery", "Keep the alpha and beta delivery paths dependency-free, concurrent, and separately verified.", [4, 5, 6], "independent-delivery")
+      requirement("independent-delivery", "Keep the alpha and beta delivery paths dependency-free, concurrent, and separately verified.", [4, 5, 6], "independent-delivery", { controllerExecution: { schemaVersion: 1, source: "controller", kind: "controller_execution", capabilityId: "parallel-readiness", capabilityVersion: 1, requirements: ["no_writer_predecessor", "same_wave_eligibility", "overlapping_active_turns", "checkpoint_lineage"], writerRequirementIds: ["alpha-implementation", "beta-implementation"], minimumConcurrentActiveTurns: 2 } })
     ],
     nfrs: [], modules: [], integrations: [], dataModel: {}, constraints: [], assumptions: [], decisions: [], unresolvedQuestions: [], contradictions: []
   };
@@ -109,7 +109,8 @@ test("G2/G3 explicit source fixture admits canonical intake and plans two parall
     assert.deepEqual(manifest.claims.map((claim) => claim.sourceRefs[0].startLine).sort((a, b) => a - b), [2, 3, 4, 5, 6, 7, 8]);
     assert.deepEqual(audit.decisions.map((decision) => [decision.decision, decision.classification, decision.reasonCodes]).sort((left, right) => left[2][0].localeCompare(right[2][0])), Array.from({ length: 7 }, () => ["admitted", "mandatory", ["explicit_fixture_constraint"]]));
     const persistedBlueprint = fx.router.store.productBlueprint(fx.router.store.deliveryRun(run.id).blueprintId).blueprint;
-    assert.deepEqual(persistedBlueprint.requirements.flatMap((requirement) => requirement.acceptanceCriteria.map((criterion) => criterion.repositoryVerification)), Array.from({ length: 3 }, () => ({ schemaVersion: 1, source: "project_overlay", commandId: "package-script:test", overlayBaseSha: fx.overlayBaseSha })));
+    assert.deepEqual(persistedBlueprint.requirements.slice(0, 2).flatMap((requirement) => requirement.acceptanceCriteria.map((criterion) => criterion.repositoryVerification)), Array.from({ length: 2 }, () => ({ schemaVersion: 1, source: "project_overlay", commandId: "package-script:test", overlayBaseSha: fx.overlayBaseSha })));
+    assert.equal(persistedBlueprint.requirements[2].acceptanceCriteria[0].controllerExecution.capabilityId, "parallel-readiness");
     const planner = fx.router.list().find((task) => task.role === "planner"); const writers = fx.router.list().filter((task) => task.role === "backend" && ["Implement alpha", "Implement beta"].includes(task.title)).sort((left, right) => left.title.localeCompare(right.title));
     assert.equal(writers.length, 2, JSON.stringify({ run: fx.router.store.deliveryRun(run.id), tasks: fx.router.list().map((task) => ({ role: task.role, title: task.title, status: task.status, error: task.error })) })); assert.deepEqual(writers.map((task) => [task.title, task.allowedPaths, task.requirementIds]), [["Implement alpha", ["src/alpha.mjs"], ["alpha-implementation", "independent-delivery"]], ["Implement beta", ["src/beta.mjs"], ["beta-implementation"]]]);
     assert.ok(writers.every((task) => task.status === "queued" && task.executionReleaseState === "pending"));

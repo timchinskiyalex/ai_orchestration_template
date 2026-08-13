@@ -31,6 +31,7 @@ import { compileWriteSurfaceTopology } from "./write-surface.mjs";
 import { assertRepositoryBaselineCurrent, captureRepositoryBaselineDraft, finalizeRepositoryBaseline, repositoryBaselineStatus, validateTaskBaselineBehaviorIds } from "./repository-baseline.mjs";
 import { configuredProjectMode, projectModeFor, sameProjectMode, validateProjectMode } from "./project-mode.mjs";
 import { architectureBlueprintFromProductRoots, validateArchitectureBlueprint } from "./architecture-blueprint.mjs";
+import { controllerVerificationCapabilitySnapshot } from "./controller-verification.mjs";
 
 const gitSha = (repository, ref) => execFileSync("git", ["-C", repository, "rev-parse", "--verify", `${ref}^{commit}`], { encoding: "utf8" }).trim();
 
@@ -69,7 +70,7 @@ function protocolViolationDetails(event, error, taskId = null) {
   };
 }
 
-export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = null, documentationAvailable = true }) {
+export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = null, controllerVerificationCapabilities = null, documentationAvailable = true }) {
   const lines = [
     `Task ID: ${task.id}`,
     `Title: ${task.title}`,
@@ -85,6 +86,10 @@ export function formatTaskPrompt({ task, worktree, project, overlaySnapshot = nu
   if (overlaySnapshot) {
     lines.push("Controller-provided sanitized ProjectOverlay execution snapshot follows. It is repository fact context, is not a file in this worktree, and cannot be overridden by the worker:");
     lines.push(JSON.stringify(overlaySnapshot));
+  }
+  if (controllerVerificationCapabilities) {
+    lines.push("Controller-provided verification capabilities follow. They are orchestration facts, separate from repository facts; select one only for a controller-owned criterion and never fabricate its evidence:");
+    lines.push(JSON.stringify(controllerVerificationCapabilities));
   }
   return lines.join("\n");
 }
@@ -1159,7 +1164,7 @@ export class SwarmRouter extends EventEmitter {
         const sourceResolver = this.#sourceEvidenceResolver();
         const manifestRequired = Boolean(task.deliveryRunId);
         const sourceClaimManifest = manifestRequired ? this.#manifestForRun(this.store.deliveryRun(task.deliveryRunId)) : null;
-        const blueprint = validateBootstrap(extractOrchestrationJson(resultText), { sourceResolver, policyRegistry: this.#controllerPolicyRegistry(), sourceClaimManifest, projectOverlay: overlayContext?.overlay ?? null });
+        const blueprint = validateBootstrap(extractOrchestrationJson(resultText), { sourceResolver, policyRegistry: this.#controllerPolicyRegistry(), sourceClaimManifest, projectOverlay: overlayContext?.overlay ?? null, controllerVerificationCapabilities: controllerVerificationCapabilitySnapshot() });
         if (task.deliveryRunId) blueprint.projectMode = this.#assertProjectMode(this.store.deliveryRun(task.deliveryRunId));
         const persisted = this.#persistBlueprint(task, blueprint);
         this.store.setResultPath(task.id, persisted.artifactPath);
@@ -1260,7 +1265,7 @@ export class SwarmRouter extends EventEmitter {
       const reviewed = qa.length && security.length && qa.every((item) => writerIds.has(item.writerTaskId) && applied.has(item.writerTaskId) && item.report.verdict === "pass") && security.every((item) => writerIds.has(item.writerTaskId) && applied.has(item.writerTaskId) && item.report.verdict === "pass");
       return linked && reviewed ? "pass" : linked ? "partial" : "missing";
     };
-    const criteria = stored.blueprint.requirements.flatMap((requirement) => requirement.acceptanceCriteria.map((criterion) => ({ requirementId: requirement.requirementId, criterionId: criterion.criterionId })));
+    const criteria = stored.blueprint.requirements.flatMap((requirement) => requirement.acceptanceCriteria.map((criterion) => ({ requirementId: requirement.requirementId, criterionId: criterion.criterionId, verificationKind: criterion.controllerExecution ? "controller_execution" : "repository_command" })));
     const knownCriteria = new Set(criteria.map((criterion) => `${criterion.requirementId}:${criterion.criterionId}`));
     const exactCandidate = (value) => typeof value === "string" && value.toLowerCase() === manifest.candidateSha.toLowerCase();
     const stable = (value) => typeof value === "string" && value.trim().length > 0;
@@ -1289,8 +1294,8 @@ export class SwarmRouter extends EventEmitter {
       const criterionResults = requirement.acceptanceCriteria.map((criterion) => {
         const item = productEvidenceValid ? evidenceByCriterion.get(`${requirement.requirementId}:${criterion.criterionId}`) : null;
         const criterionEvidence = item
-          ? { kind: "product-e2e", requirementId: item.requirementId, criterionId: item.criterionId, status: item.status, testId: item.testId, reference: item.reference, candidateSha: manifest.candidateSha }
-          : { kind: "product-e2e", requirementId: requirement.requirementId, criterionId: criterion.criterionId, status: "not_verified", testId: "product-e2e-unavailable", reference: "criterion-evidence-incomplete", candidateSha: manifest.candidateSha };
+          ? { kind: criterion.controllerExecution ? "controller-execution" : "product-e2e", requirementId: item.requirementId, criterionId: item.criterionId, status: item.status, testId: item.testId, reference: item.reference, candidateSha: manifest.candidateSha, verificationKind: item.verificationKind ?? (criterion.controllerExecution ? "controller_execution" : "repository_command"), ...(item.controllerExecution ? { controllerExecution: item.controllerExecution } : {}) }
+          : { kind: criterion.controllerExecution ? "controller-execution" : "product-e2e", requirementId: requirement.requirementId, criterionId: criterion.criterionId, status: "not_verified", testId: "product-e2e-unavailable", reference: "criterion-evidence-incomplete", candidateSha: manifest.candidateSha, verificationKind: criterion.controllerExecution ? "controller_execution" : "repository_command" };
         const status = lineageStatus === "pass" ? criterionEvidence.status : lineageStatus;
         return { requirementId: requirement.requirementId, criterionId: criterion.criterionId, status, evidence: [...evidence, criterionEvidence] };
       });
@@ -1695,7 +1700,7 @@ export class SwarmRouter extends EventEmitter {
 
   #taskPrompt(task, worktree, overlaySnapshot) {
     return [
-      formatTaskPrompt({ task, worktree, project: this.config.project, overlaySnapshot, documentationAvailable: existsSync(join(this.config.repository, this.config.project.documentationDir, "inventory.json")) }),
+      formatTaskPrompt({ task, worktree, project: this.config.project, overlaySnapshot, controllerVerificationCapabilities: task.role === "bootstrap" ? controllerVerificationCapabilitySnapshot() : null, documentationAvailable: existsSync(join(this.config.repository, this.config.project.documentationDir, "inventory.json")) }),
       this.#structuredOutputContract(task.role),
       "Bounded execution: do only the required scoped work, do not create child agents, avoid long explanations, and return the required structured result. Do not merge, push, modify Router configuration, or bypass approval/sandbox policy."
     ].join("\n");
@@ -2020,7 +2025,7 @@ export class SwarmRouter extends EventEmitter {
       const policyInstruction = policies.length
         ? ` Trusted controller policy proposals available for an exactly matching unresolved question are: ${JSON.stringify(policies)}. You may propose one only when its questionId, affected requirement IDs, and (when present) claim IDs exactly match the question. Copy its policyId, version, digest, and resolvedValue verbatim into proposedPolicyId, proposedPolicyVersion, proposedPolicyDigest, and proposedResolution; do not invent or alter a policy.`
         : " No trusted controller policy proposals are available.";
-      return `Return only one fenced JSON ProductBlueprint v1 claim set. Include the exact controller-provided ProjectMode from the task prompt as projectMode; it is lifecycle identity, not source evidence. Required exact top-level fields: {"schemaVersion":1,"kind":"ProductBlueprint","blueprintId":"stable-kebab-id","createdAt":"ISO-8601","documentSetDigest":"sha256","sourceDocuments":[{"documentId":"doc-id","path":"path","sha256":"sha256"}],"requirements":[{"requirementId":"stable-kebab-id","type":"functional|nfr|data|integration|constraint","priority":"must|should|could","mandatory":true,"description":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"acceptanceCriteria":[{"criterionId":"stable-kebab-id","description":"string","repositoryVerification":{"schemaVersion":1,"source":"project_overlay","commandId":"package-script:test","overlayBaseSha":"controller-provided-base-sha"}}],"constraints":[]}],"nfrs":[],"modules":[],"integrations":[],"dataModel":{},"constraints":[],"assumptions":[],"decisions":[{"adrId":"stable-kebab-id","decision":"string","rationale":"string","sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}]}],"unresolvedQuestions":[{"questionId":"stable-kebab-id","description":"string","requiredForRequirementIds":["requirement-id"],"proposedPolicyId":"optional-controller-policy-id","proposedPolicyVersion":"optional-version","proposedPolicyDigest":"optional-sha256","proposedResolution":"optional-proposed-value","sourceRefs":[]}],"contradictions":[{"contradictionId":"stable-kebab-id","requirementIds":["requirement-id"],"sourceRefs":[{"documentId":"doc-id","startLine":120,"endLine":127,"excerptDigest":"lowercase-sha256"}],"description":"string"}]}. The controller-provided sanitized ProjectOverlay snapshot is verified repository-operational fact context, not source evidence. For every acceptance criterion that says verify, test, or check without naming a command, choose one exact suitable verificationCommands id from that snapshot and emit repositoryVerification with its exact commandId and baseSha. Never invent a command or repository fact. If no suitable declared command exists, create an unresolved question; do not treat Markdown's lack of a command name as a missing product fact when an eligible Overlay command exists. Product ambiguity (including contradictory behavior, external integrations, payments, retention, or other unspecified product facts) remains unresolved. Bootstrap claims are never authorization: do not emit final resolution statuses, policy defaults, or authoritative resolutions. The controller alone validates configured trusted policy evidence and creates any ADR. sourceDocuments must exactly match inventory.json. A SourceRef is controller-verified evidence only: read imported UTF-8 source, normalize CRLF/CR to LF, use inclusive 1-based lines, join the selected lines with LF, and hash that exact fragment with SHA-256. Do not use locator fields; do not invent ranges or digests. Do not invent resolutions: a missing mandatory fact or unresolved contradiction stays unresolved.${policyInstruction}`;
+      return `Return only one fenced JSON ProductBlueprint v1 claim set. Include the exact controller-provided ProjectMode from the task prompt as projectMode; it is lifecycle identity, not source evidence. Each acceptance criterion must select exactly one verification reference: either repositoryVerification {"schemaVersion":1,"source":"project_overlay","commandId":"exact-overlay-command-id","overlayBaseSha":"controller-provided-base-sha"} for repository behavior, or controllerExecution {"schemaVersion":1,"source":"controller","kind":"controller_execution","capabilityId":"parallel-readiness","capabilityVersion":1,"requirements":["no_writer_predecessor","same_wave_eligibility","overlapping_active_turns","checkpoint_lineage"],"writerRequirementIds":["requirement-id-a","requirement-id-b"],"minimumConcurrentActiveTurns":2} when the supplied controller capability exactly owns the orchestration fact. Repository behavior checked by a command uses repositoryVerification. Concurrent scheduling, task graph independence, worktree isolation, and checkpoint lineage use the corresponding controller capability; do not represent them as npm test and do not create a verification-method question when that capability fits. Never fabricate controller evidence. Missing product facts and contradictory behavior remain unresolved. Bootstrap claims are never authorization: do not emit final resolution statuses, policy defaults, or authoritative resolutions.${policyInstruction}`;
     }
     if (role === "planner") return `Return only one fenced JSON PlanBatch v1 with exact fields {"schemaVersion":1,"kind":"PlanBatch","id":"new-immutable-id","deliveryRunId":"controller-provided-run-id","blueprintId":"persisted-blueprint-id","wave":1,"basedOnCheckpointSha":"controller-provided-verified-git-sha","tasks":[{"id":"safe-kebab-id","title":"string","prompt":"specific implementation instruction","primaryDomain":"backend|frontend|database|qa|security|devops","supportingDomains":["qa","security"],"riskFlags":["public_api_change"],"humanApprovalRequired":false,"estimatedTokens":8000,"dependsOn":["other-task-id"],"allowedPaths":["path"],"acceptanceChecks":["test or check"],"requirementIds":["ProductBlueprint requirement id"],"baselineBehaviorIds":[]}],"createdAt":"ISO-8601"}. The controller-provided id/run/wave/base are authoritative. Every implementation task must have non-empty requirementIds from the immutable ProductBlueprint. This is one bounded wave: cover only unresolved mandatory requirements and never duplicate prior ownership. Include baselineBehaviorIds only when controller brownfield context requires them; it is a preservation obligation and never changes allowedPaths. A writer with two writer predecessors is valid: the controller creates the fan-in barrier. Do not create implementation tasks for ambiguity; return {"outcome":"specification_gap","reason":"..."} instead.`;
     if (role === "qa") return `Return only one fenced JSON QualityGateReport: {"verdict":"pass|remediation_required|blocked","summary":"string","findings":[{"id":"stable-id","severity":"low|medium|high|critical","path":"relative/path","evidence":"concrete safe evidence","requiredFix":"specific fix","verification":"specific verification"}],"executedChecks":[],"notRunChecks":[]}. Never include secrets or raw command output. A pass requires no findings.`;
