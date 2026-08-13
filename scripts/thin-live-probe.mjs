@@ -41,8 +41,8 @@ export function createThinLiveProbeFixture(root) {
     "import { readFileSync } from 'node:fs';",
     "",
     "test('frontend and backend workers produced the exact fixture files', () => {",
-    `  assert.equal(readFileSync('frontend/message.txt', 'utf8'), ${JSON.stringify(FRONTEND_MESSAGE)});`,
-    `  assert.equal(readFileSync('backend/message.txt', 'utf8'), ${JSON.stringify(BACKEND_MESSAGE)});`,
+    `  assert.equal(readFileSync('frontend/message.txt', 'utf8').replace(/\\r\\n/g, '\\n'), ${JSON.stringify(FRONTEND_MESSAGE)});`,
+    `  assert.equal(readFileSync('backend/message.txt', 'utf8').replace(/\\r\\n/g, '\\n'), ${JSON.stringify(BACKEND_MESSAGE)});`,
     "});",
     ""
   ].join("\n"));
