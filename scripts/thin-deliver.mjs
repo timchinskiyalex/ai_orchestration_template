@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -10,18 +10,19 @@ import { runThinOrchestrator } from "../src/thin/orchestrator.mjs";
 import { runThinAppServerWorker } from "../src/thin/app-server-worker.mjs";
 import { finalizeWorkerArtifact } from "../src/thin/finalizer.mjs";
 import { runThinRepair } from "../src/thin/repair.mjs";
+import { createIsolatedWorktree, removeIsolatedWorktree } from "../src/thin/git-worktree.mjs";
 
 const exec = promisify(execFile);
 const MAX_DOC_BYTES = 1_000_000;
 const MAX_DOC_FILES = 40;
 
 export function parseThinDeliverArgs(argv) {
-  const options = { repo: process.cwd(), docs: null, verify: null, repairSurface: null, fake: false, confirm: false };
+  const options = { repo: process.cwd(), docs: null, candidate: null, verify: null, repairSurface: null, fake: false, confirm: false };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--fake") options.fake = true;
     else if (value === "--confirm-spend-quota") options.confirm = true;
-    else if (value === "--docs" || value === "--repo" || value === "--verify" || value === "--repair-surface") {
+    else if (value === "--docs" || value === "--repo" || value === "--candidate" || value === "--verify" || value === "--repair-surface") {
       const argument = argv[++index];
       if (!argument || argument.startsWith("--")) throw new Error(`${value} requires a value`);
       if (value === "--repair-surface") options.repairSurface = parseRepairSurface(argument);
@@ -33,7 +34,7 @@ export function parseThinDeliverArgs(argv) {
 }
 
 export function thinDeliverUsage() {
-  return "Usage: node scripts/thin-deliver.mjs --docs <file-or-directory> --verify <command> [--repo <git-repo>] [--repair-surface <path,path>] [--confirm-spend-quota | --fake]";
+  return "Usage: node scripts/thin-deliver.mjs --docs <file-or-directory> --verify <command> [--repo <git-repo>] [--repair-surface <path,path>] [--confirm-spend-quota | --fake]\n       node scripts/thin-deliver.mjs --candidate <sha> --verify <command> --repair-surface <path,path> --confirm-spend-quota";
 }
 
 export function readMarkdownPackage(input) {
@@ -69,7 +70,8 @@ export async function runThinDeliver({ argv = process.argv.slice(2), stdout = co
   try { options = parseThinDeliverArgs(argv); }
   catch (error) { stderr(`[failure] stage=argument code=invalid_arguments task=- recovery=- message=${safe(error.message)}`); return 2; }
   if (options.help) { stdout(thinDeliverUsage()); return 0; }
-  if (!options.docs) { stderr(`[failure] stage=argument code=docs_required task=- recovery=-`); return 2; }
+  if (!options.docs && !options.candidate) { stderr(`[failure] stage=argument code=docs_or_candidate_required task=- recovery=-`); return 2; }
+  if (options.docs && options.candidate) { stderr(`[failure] stage=argument code=docs_and_candidate_conflict task=- recovery=-`); return 2; }
   // This check is intentionally before opening docs, Git, worktrees, or the
   // App Server. A live invocation has no side effect until explicitly opted in.
   if (!options.fake && !options.confirm) {
@@ -82,10 +84,11 @@ export async function runThinDeliver({ argv = process.argv.slice(2), stdout = co
   }
 
   try {
-    const markdown = readMarkdownPackage(options.docs);
-    const result = options.fake
-      ? await runFake({ markdown, verify: options.verify, stdout })
-      : await runLive({ markdown, repository: resolve(options.repo), verify: options.verify, repairSurface: options.repairSurface, stdout });
+    const result = options.candidate
+      ? await runCandidateRepair({ repository: resolve(options.repo), candidateSha: options.candidate, verify: options.verify, repairSurface: options.repairSurface, stdout })
+      : options.fake
+        ? await runFake({ markdown: readMarkdownPackage(options.docs), verify: options.verify, stdout })
+        : await runLive({ markdown: readMarkdownPackage(options.docs), repository: resolve(options.repo), verify: options.verify, repairSurface: options.repairSurface, stdout });
     return result.ok ? 0 : 1;
   } catch (error) {
     stderr(`[failure] stage=cli code=unexpected_error task=- recovery=- message=${safe(error.message)}`);
@@ -121,6 +124,38 @@ async function runLive({ markdown, repository, verify, repairSurface, stdout }) 
     return result;
   } finally {
     if (result?.ok) rmSync(runtimeDir, { recursive: true, force: true });
+    else stdout(`[recovery] runtime preserved ${runtimeDir}`);
+  }
+}
+
+async function runCandidateRepair({ repository, candidateSha, verify, repairSurface, stdout }) {
+  if (!/^[0-9a-f]{7,64}$/i.test(candidateSha)) throw new Error("--candidate must be a Git SHA");
+  if (!repairSurface) throw new Error("--candidate requires --repair-surface");
+  const runtimeDir = mkdtempSync(join(tmpdir(), "thin-orchestrator-recovery-"));
+  let worktree;
+  let ok = false;
+  try {
+    worktree = await createIsolatedWorktree({ repository, runtimeDir, taskId: "candidate-repair", baseSha: candidateSha });
+    stdout(`[recovery] candidate ${worktree.baseSha}`);
+    try {
+      await runVerification({ worktree: worktree.worktree, command: verify });
+      ok = true;
+      stdout(`[completed] candidate ${worktree.baseSha}`);
+      return { ok: true, candidateSha: worktree.baseSha };
+    } catch (failure) {
+      stdout("[repair] started");
+      const repair = createLiveRepair({ repository, repairSurface, stdout });
+      const repaired = await repair({ verificationFailure: failure, candidateSha: worktree.baseSha, worktree: worktree.worktree, artifacts: [], attempts: 0 });
+      if (!repaired.ok) return { ok: false, code: repaired.reasonCode ?? "repair_failed", recoveryWorktree: worktree.worktree };
+      await runVerification({ worktree: worktree.worktree, command: verify });
+      ok = true;
+      stdout(`[repair] test passed ${repaired.candidateSha}`);
+      stdout(`[completed] candidate ${repaired.candidateSha}`);
+      return { ok: true, candidateSha: repaired.candidateSha };
+    }
+  } finally {
+    if (ok && worktree) await removeIsolatedWorktree(worktree);
+    if (ok) rmSync(runtimeDir, { recursive: true, force: true });
     else stdout(`[recovery] runtime preserved ${runtimeDir}`);
   }
 }
@@ -307,12 +342,38 @@ function emitControllerEvent(stdout, event) {
   else if (event.type === "failure") stdout(`[failure] stage=${event.stage} code=${event.code} task=${event.taskKey ?? "-"} recovery=${event.recoveryWorktree ?? "-"}${event.message ? ` message=${safe(event.message)}` : ""}`);
 }
 
-async function runVerification({ worktree, command }) {
+export function npmPrefixesRequiredBy(command) {
+  const prefixes = [];
+  const npmExpression = /npm\s+--prefix\s+["']?([^\s"']+)/g;
+  let match;
+  while ((match = npmExpression.exec(command))) prefixes.push(match[1]);
+  return [...new Set(prefixes)];
+}
+
+export async function runVerification({ worktree, command, processRunner = null }) {
+  const runner = processRunner ?? (async ({ executable, args, cwd, timeout }) => exec(executable, args, { cwd, encoding: "utf8", timeout }));
+  for (const prefix of npmPrefixesRequiredBy(command)) {
+    const lockfile = join(worktree, prefix, "package-lock.json");
+    if (!existsSync(lockfile)) throw new Error(`verification requires package-lock.json for npm prefix '${prefix}'`);
+    try {
+      await runner({ executable: process.platform === "win32" ? "npm.cmd" : "npm", args: ["ci", "--prefix", prefix], cwd: worktree, timeout: 180_000 });
+    } catch (error) {
+      const wrapped = new Error(`verification dependency install failed for '${prefix}': ${safe(error?.message)}`);
+      wrapped.output = [error?.stdout, error?.stderr].filter((value) => typeof value === "string" && value.trim()).join("\n");
+      throw wrapped;
+    }
+  }
   const [executable, ...args] = process.platform === "win32"
     ? [process.env.ComSpec ?? "cmd.exe", "/d", "/s", "/c", command]
     : ["/bin/sh", "-lc", command];
   try {
-    await exec(executable, args, { cwd: worktree, encoding: "utf8", timeout: 120_000 });
+    const result = await runner({ executable, args, cwd: worktree, timeout: 120_000 });
+    const output = [result?.stdout, result?.stderr].filter((value) => typeof value === "string").join("\n");
+    if (/\bdotnet\s+test\b/i.test(command) && /No test is available/i.test(output)) {
+      const wrapped = new Error("verification found no discovered .NET tests");
+      wrapped.output = output;
+      throw wrapped;
+    }
   } catch (error) {
     const output = [error?.stdout, error?.stderr].filter((value) => typeof value === "string" && value.trim()).join("\n");
     const wrapped = new Error(`verification command failed: ${safe(error?.message)}`);

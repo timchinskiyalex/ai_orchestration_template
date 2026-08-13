@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { finalAgentText, parseThinDeliverArgs, readMarkdownPackage, runThinDeliver, thinDeliverUsage } from "../scripts/thin-deliver.mjs";
+import { finalAgentText, npmPrefixesRequiredBy, parseThinDeliverArgs, readMarkdownPackage, runThinDeliver, runVerification, thinDeliverUsage } from "../scripts/thin-deliver.mjs";
 
 function docsFixture(t) {
   const root = mkdtempSync(join(tmpdir(), "thin-cli-docs-"));
@@ -32,10 +32,10 @@ test("live CLI refuses before reading docs or starting any side effect without q
 test("CLI parses source, repository and verification options", (t) => {
   const docs = docsFixture(t);
   assert.deepEqual(parseThinDeliverArgs(["--docs", docs, "--repo", "repo", "--verify", "node --test", "--confirm-spend-quota"]), {
-    repo: "repo", docs, verify: "node --test", repairSurface: null, fake: false, confirm: true,
+    repo: "repo", docs, candidate: null, verify: "node --test", repairSurface: null, fake: false, confirm: true,
   });
   assert.deepEqual(parseThinDeliverArgs(["--docs", docs, "--verify", "node --test", "--repair-surface", "src, test/unit ,src"]), {
-    repo: process.cwd(), docs, verify: "node --test", repairSurface: ["src", "test/unit"], fake: false, confirm: false,
+    repo: process.cwd(), docs, candidate: null, verify: "node --test", repairSurface: ["src", "test/unit"], fake: false, confirm: false,
   });
   assert.match(readMarkdownPackage(docs), /Small project/);
   assert.match(thinDeliverUsage(), /thin-deliver/);
@@ -47,4 +47,25 @@ test("planner result reader chooses the exact resolved turn rather than an unrel
     { id: "other-turn", items: [{ type: "agentMessage", text: "not the planner result" }] },
   ] } };
   assert.equal(finalAgentText(result, "planner-turn"), "{\"tasks\":[]}");
+});
+
+test("verification installs lockfile-pinned npm dependencies before the declared build", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "thin-verification-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, "apps", "web"), { recursive: true });
+  writeFileSync(join(root, "apps", "web", "package-lock.json"), "{}");
+  const calls = [];
+  await runVerification({ worktree: root, command: "npm --prefix apps/web run build", processRunner: async (call) => { calls.push(call); } });
+  assert.deepEqual(calls[0].args, ["ci", "--prefix", "apps/web"]);
+  assert.equal(calls[1].args.at(-1), "npm --prefix apps/web run build");
+  assert.deepEqual(npmPrefixesRequiredBy("dotnet test x && npm --prefix apps/web run build"), ["apps/web"]);
+});
+
+test("verification rejects a dotnet success exit that discovered no tests", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "thin-verification-empty-tests-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  await assert.rejects(
+    runVerification({ worktree: root, command: "dotnet test api/tests.csproj", processRunner: async () => ({ stdout: "No test is available in output" }) }),
+    /no discovered .NET tests/,
+  );
 });
