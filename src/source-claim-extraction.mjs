@@ -22,7 +22,7 @@ function parseResult(text) {
 export class SourceClaimExtractionExecutor {
   constructor(config) { this.config = config; }
 
-  async extract({ recordTerminalReceipt = null, recordFailure = null } = {}) {
+  async extract({ recordTerminalReceipt = null, recordAttempt = null, recordFailure = null } = {}) {
     const resolver = createImportedSourceResolver({ repository: this.config.repository, documentationDir: this.config.project.documentationDir });
     const controlledInput = { documents: resolver.controlledDocuments() };
     const prompt = [
@@ -30,7 +30,7 @@ export class SourceClaimExtractionExecutor {
         `Contract: ${JSON.stringify(candidateContract())}`,
         `Controlled source payload: ${JSON.stringify(controlledInput)}`
       ].join("\n\n");
-    const result = await runSourceIntakeTurn({ config: this.config, role: "source_claim_extraction", developerInstructions: "You are a source-claim extraction role. Use only controller-provided source payload; do not read files, plan engineering work, authorize facts, or expose source text outside the required JSON artifact.", objective: "Extract atomic candidate source claims only.", tokenBudget: this.config.delivery?.sourceClaimExtractionTokenBudget ?? 6000, prompt, recordTerminalReceipt, recordFailure });
+    const result = await runSourceIntakeTurn({ config: this.config, role: "source_claim_extraction", developerInstructions: "You are a source-claim extraction role. Use only controller-provided source payload; do not read files, plan engineering work, authorize facts, or expose source text outside the required JSON artifact.", objective: "Extract atomic candidate source claims only.", tokenBudget: this.config.delivery?.sourceClaimExtractionTokenBudget ?? 6000, prompt, recordTerminalReceipt, recordAttempt, recordFailure });
     let candidate;
     try { candidate = parseResult(result.resultText); }
     catch (error) {

@@ -121,11 +121,11 @@ function parseResult(text) { const fenced = String(text).match(/```(?:json)?\s*(
 
 export class SourceClaimAuditExecutor {
   constructor(config) { this.config = config; }
-  async audit(subject, { recordTerminalReceipt = null, recordFailure = null } = {}) {
+  async audit(subject, { recordTerminalReceipt = null, recordAttempt = null, recordFailure = null } = {}) {
     const resolver = createImportedSourceResolver({ repository: this.config.repository, documentationDir: this.config.project.documentationDir });
     const payload = { subject, coverageUnits: normalizedSourceUnits(resolver), trustedPolicies: this.config.specificationResolution?.policyRegistry?.policies?.filter((policy) => policy.scope?.kind === "source_claim_audit") ?? [] };
     const prompt = `Return only one fenced JSON SourceClaimAudit. The payload contains controller-canonical candidate claims and controller coverage units only; do not create or alter claim IDs or source refs. Decide every candidate claim as admitted, rejected, split-required, contradiction, or unresolved. Preserve all source refs exactly. Every controller coverage unit must be present. Meaningful units require an admitted claim; structural_header and boilerplate units must be excluded with their exact reason code. Contradictions and split-required claims may only be admitted when a supplied trusted source_claim_audit policy exactly binds the claim. Payload: ${JSON.stringify(payload)}`;
-    const result = await runSourceIntakeTurn({ config: this.config, role: "source_claim_audit", developerInstructions: "You are the independent Specification Auditor. This is a separate operation from extraction. Audit only controller-provided source and candidate data; do not plan engineering work or authorize invented product decisions.", objective: "Independently audit source claims and source coverage.", tokenBudget: this.config.delivery?.sourceClaimAuditTokenBudget ?? 6000, prompt, recordTerminalReceipt, recordFailure });
+    const result = await runSourceIntakeTurn({ config: this.config, role: "source_claim_audit", developerInstructions: "You are the independent Specification Auditor. This is a separate operation from extraction. Audit only controller-provided source and candidate data; do not plan engineering work or authorize invented product decisions.", objective: "Independently audit source claims and source coverage.", tokenBudget: this.config.delivery?.sourceClaimAuditTokenBudget ?? 6000, prompt, recordTerminalReceipt, recordAttempt, recordFailure });
     let candidate;
     try { candidate = parseResult(result.resultText); }
     catch (error) {

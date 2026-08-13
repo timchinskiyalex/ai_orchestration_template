@@ -23,6 +23,7 @@ class FakeAppServerClient extends EventEmitter {
   async readTerminalTurn(threadId, turnId, timeoutMs) {
     this.calls.push(["thread/read-terminal", { threadId, turnId, timeoutMs }]);
     if (this.threadReadError) throw new Error(this.threadReadError);
+    if (this.alias) this.emit("protocol", { method: "turn-id-alias", threadId, requestedTurnId: turnId, resolvedTurnId: this.resolvedTurnId });
     return { terminal: { id: this.resolvedTurnId, status: "completed", items: [{ type: "agentMessage", text: "final result" }] } };
   }
   async readThread({ threadId }) { this.calls.push(["thread/read", { threadId }]); return { thread: { turns: [{ id: this.resolvedTurnId, status: "completed", items: [{ type: "agentMessage", text: "final result" }] }] } }; }
@@ -126,7 +127,21 @@ test("missing status, foreign identities, and untrusted aliases cannot create a 
     const client = new FakeAppServerClient({ threadReadError: "thread/read: thread not loaded" }); const runtime = new CodexAppServerRuntime({ cwd: "D:/controller-authorized/worktree", client });
     await runtime.connect(); const thread = await runtime.startThread(); const turn = await runtime.startGoalTurn({ threadId: thread.threadId, goal: {}, turn: {} });
     client.emit("notification", { method: "turn/completed", params });
-    await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "execution_provider_terminal_unavailable");
+    await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "transport_failure");
+  }
+});
+
+test("reconciliation preserves typed same-provider terminal failure reasons", async () => {
+  for (const [name, configure, expected] of [
+    ["receipt missing", (client) => { client.readTerminalTurn = async () => ({ terminal: null, summary: { turnStatus: null } }); }, "terminal_receipt_missing"],
+    ["status missing", (client) => { client.readTerminalTurn = async (_threadId, turnId) => ({ terminal: { id: turnId, status: "in_progress" }, summary: { turnStatus: "in_progress" } }); }, "terminal_status_missing"],
+    ["alias unresolved", (client) => { client.readTerminalTurn = async () => ({ terminal: { id: "unresolved-turn", status: "completed" }, summary: { turnStatus: "completed" } }); }, "terminal_alias_unresolved"],
+    ["process exit", (client) => { client.disconnect = true; }, "process_exit"]
+  ]) {
+    const client = new FakeAppServerClient(); const runtime = new CodexAppServerRuntime({ cwd: "D:/controller-authorized/worktree", client });
+    await runtime.connect(); const thread = await runtime.startThread(); const turn = await runtime.startGoalTurn({ threadId: thread.threadId, goal: {}, turn: {} });
+    configure(client);
+    await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === expected, name);
   }
 });
 
@@ -149,7 +164,7 @@ test("pending terminal candidates require an exact confirmed thread and resolved
     const { client, runtime, thread, turn } = await aliasRuntime();
     client.emit("notification", { method: "turn/completed", params: { threadId: candidate.threadId, turn: { id: candidate.resolvedTurnId, status: "completed" } } });
     client.emit("protocol", { method: "turn-id-alias", threadId: thread.threadId, requestedTurnId: turn.turnId, resolvedTurnId: "turn-resolved" });
-    await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "execution_provider_terminal_unavailable");
+    await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "transport_failure");
   }
 });
 
@@ -157,7 +172,7 @@ test("missing terminal status never enters pending state", async () => {
   const { client, runtime, thread, turn } = await aliasRuntime();
   client.emit("notification", { method: "turn/completed", params: { threadId: thread.threadId, turn: { id: "turn-resolved" } } });
   client.emit("protocol", { method: "turn-id-alias", threadId: thread.threadId, requestedTurnId: turn.turnId, resolvedTurnId: "turn-resolved" });
-  await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "execution_provider_terminal_unavailable");
+  await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "transport_failure");
 });
 
 test("stale or duplicate aliases and duplicate completion cannot create a second receipt", async () => {
@@ -178,7 +193,7 @@ test("shutdown or process exit clears pending terminal candidates", async () => 
     client.emit("notification", { method: "turn/completed", params: { threadId: thread.threadId, turn: { id: "turn-resolved", status: "completed" } } });
     if (action === "shutdown") await runtime.shutdown(); else client.emit("exit", { code: 17, signal: "SIGTERM" });
     client.emit("protocol", { method: "turn-id-alias", threadId: thread.threadId, requestedTurnId: turn.turnId, resolvedTurnId: "turn-resolved" });
-    await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "execution_provider_terminal_unavailable");
+    await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "transport_failure");
   }
 });
 

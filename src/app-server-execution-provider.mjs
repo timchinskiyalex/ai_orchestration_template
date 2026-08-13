@@ -15,7 +15,7 @@ const usage = (params = {}) => {
 const codeFor = (error) => {
   const text = String(error?.message ?? error).toLowerCase();
   if (error?.errorCode) return error.errorCode;
-  if (text.includes("thread not loaded") || text.includes("terminal_reconciliation_unavailable")) return "execution_provider_terminal_unavailable";
+  if (text.includes("thread not loaded") || text.includes("same-provider thread/read unavailable")) return "transport_failure";
   if (text.includes("timed out") || text.includes("timeout")) return "timeout";
   if (text.includes("exited")) return "process_exit";
   if (text.includes("closed") || text.includes("shutdown")) return "shutdown";
@@ -63,7 +63,7 @@ export class AppServerExecutionProvider extends EventEmitter {
       : null;
     const turn = recovered?.terminal ?? await this.client.waitForTurn(args.data.threadId, args.data.turnId, args.data.timeoutMs);
     const turnId = turn?.id ?? args.data.turnId;
-    if (!terminal.has(turn?.status)) throw new Error("turn_failed");
+    if (!terminal.has(turn?.status)) throw Object.assign(new Error("terminal status is missing or non-terminal"), { errorCode: "terminal_status_missing", errorClass: "protocol" });
     this.#bind(args.data.threadId, turnId, args.correlationId);
     return { threadId: args.data.threadId, turnId, providerRunId: `${args.data.threadId}:${turnId}`, terminalClass: turn.status, usage: usage(turn) };
   }); }
@@ -86,12 +86,14 @@ export class AppServerExecutionProvider extends EventEmitter {
     }
     const corroborated = await this.#readTerminalTurn(threadId, requestedTurnId, timeoutMs);
     if (!corroborated.turn || !terminal.has(corroborated.turn.status)) {
-      throw Object.assign(new Error("no correlated terminal receipt or admissible thread/read corroboration"), { errorCode: "execution_provider_terminal_unavailable", errorClass: "protocol" });
+      const errorCode = corroborated.status == null ? "terminal_receipt_missing" : "terminal_status_missing";
+      throw Object.assign(new Error("no correlated terminal receipt or admissible same-provider thread/read corroboration"), { errorCode, errorClass: "protocol" });
     }
     const resolvedTurnId = corroborated.turn.id ?? requestedTurnId;
-    const active = this.#active(threadId, resolvedTurnId) ?? this.#active(threadId, requestedTurnId);
-    if (!active || (resolvedTurnId !== requestedTurnId && active.requestedTurnId !== requestedTurnId)) {
-      throw Object.assign(new Error("thread/read terminal is not correlated to the requested turn"), { errorCode: "execution_provider_terminal_unavailable", errorClass: "protocol" });
+    const resolvedActive = this.#active(threadId, resolvedTurnId);
+    const active = resolvedActive ?? this.#active(threadId, requestedTurnId);
+    if (!active || (resolvedTurnId !== requestedTurnId && (!resolvedActive || resolvedActive.requestedTurnId !== requestedTurnId))) {
+      throw Object.assign(new Error("thread/read terminal is not correlated to the requested turn"), { errorCode: "terminal_alias_unresolved", errorClass: "protocol" });
     }
     const resultText = (corroborated.turn.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text;
     const terminalReceipt = this.#receipt({ threadId, requestedTurnId, resolvedTurnId, terminalClass: corroborated.turn.status, correlationId: active.correlationId, source: corroborated.source, corroboration: { available: true, source: corroborated.source, terminalClass: corroborated.turn.status } });
@@ -196,16 +198,19 @@ export class AppServerExecutionProvider extends EventEmitter {
   }
   async #readTerminalTurn(threadId, turnId, timeoutMs) {
     if (this.client.diagnostics?.().process?.exited === true) {
-      throw Object.assign(new Error("same-provider thread/read unavailable after provider exit"), { errorCode: "execution_provider_terminal_unavailable", errorClass: "transport" });
+      throw Object.assign(new Error("same-provider thread/read unavailable after provider exit"), { errorCode: "process_exit", errorClass: "transport" });
     }
-    if (typeof this.client.readTerminalTurn === "function") return { turn: (await this.client.readTerminalTurn(threadId, turnId, timeoutMs))?.terminal ?? null, source: "same_provider_thread_read" };
+    if (typeof this.client.readTerminalTurn === "function") {
+      const read = await this.client.readTerminalTurn(threadId, turnId, timeoutMs);
+      return { turn: read?.terminal ?? null, status: read?.summary?.turnStatus ?? read?.terminal?.status ?? null, source: "same_provider_thread_read" };
+    }
     const result = await this.client.readThread({ threadId, includeTurns: true }); const exact = (result?.thread?.turns ?? result?.turns ?? []).find((item) => item?.id === turnId);
     const finalMessage = (exact?.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text;
     // Legacy fixtures may expose only an exact final message through the same
     // live provider.  This remains bounded corroboration, never an accepted
     // lifecycle receipt and never a cross-process authority.
-    if (finalMessage?.trim() && !terminal.has(exact?.status)) return { turn: { ...exact, status: "completed" }, source: "same_provider_thread_read_result_equivalence" };
-    return { turn: terminal.has(exact?.status) ? exact : null, source: "same_provider_thread_read" };
+    if (finalMessage?.trim() && !terminal.has(exact?.status)) return { turn: { ...exact, status: "completed" }, status: exact?.status ?? null, source: "same_provider_thread_read_result_equivalence" };
+    return { turn: terminal.has(exact?.status) ? exact : null, status: exact?.status ?? null, source: "same_provider_thread_read" };
   }
   async #corroborateTerminal(threadId, requestedTurnId, timeoutMs, resolvedTurnId) {
     try {
@@ -215,5 +220,5 @@ export class AppServerExecutionProvider extends EventEmitter {
       return { available: false, source: corroborated.source, reason: "terminal_not_found_or_identity_mismatch" };
     } catch (error) { return { available: false, source: "same_provider_thread_read", reason: "unavailable", diagnostics: safeDiagnostics(error?.message ?? error) }; }
   }
-  #caught(operation, args, error) { const errorCode = String(error?.message) === "result_unavailable" ? "result_unavailable" : String(error?.message) === "turn_failed" ? "turn_failed" : codeFor(error); return envelope({ operation, correlationId: args.correlationId, success: false, errorCode, errorClass: error?.errorClass ?? "transport", diagnostics: error?.diagnostics ?? error?.message }); }
+  #caught(operation, args, error) { const errorCode = String(error?.message) === "result_unavailable" ? "final_result_unavailable" : String(error?.message) === "turn_failed" ? "terminal_status_missing" : codeFor(error); return envelope({ operation, correlationId: args.correlationId, success: false, errorCode, errorClass: error?.errorClass ?? "transport", diagnostics: error?.diagnostics ?? error?.message }); }
 }

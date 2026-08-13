@@ -104,7 +104,7 @@ test("Phase 2: malformed, foreign, alias, or stale terminal events fail closed w
     { when: "wait", mode: "missing_status" }, { when: "wait", mode: "wrong_thread" }, { when: "wait", mode: "wrong_turn" }, { when: "wait", mode: "untrusted_alias" }, { when: "before_start_result", mode: "valid" }
   ]) {
     const { root } = repository(); const fx = subject(root, { clientOptions: { terminalNotification, readUnavailable: true, onStart: ({ cwd }) => writeFileSync(join(cwd, "src", "value.mjs"), "export const value = 2;\n") } });
-    try { const task = await writer(fx); await fx.router.runUntilIdle(); const stored = fx.router.store.getTask(task.id); assert.equal(stored.status, "failed"); assert.match(stored.error, /execution_provider_terminal_unavailable/); assert.equal(fx.router.store.workerArtifact(task.id), null); }
+    try { const task = await writer(fx); await fx.router.runUntilIdle(); const stored = fx.router.store.getTask(task.id); assert.equal(stored.status, "failed"); assert.match(stored.error, /transport_failure/); assert.equal(fx.router.store.workerArtifact(task.id), null); }
     finally { fx.router.close(); rmSync(root, { recursive: true, force: true }); }
   }
 });

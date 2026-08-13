@@ -13,6 +13,7 @@ import { canonicalizeSourceClaimExtractionCandidate, createImportedSourceResolve
 import { admitAuditedSourceClaims, auditSubjectFromExtraction, normalizedSourceUnits, validateSourceClaimAudit } from "../src/source-claim-audit.mjs";
 import { provider } from "./execution-provider-test-adapter.mjs";
 import { CodexAppServerRuntime } from "../src/codex-app-server-runtime.mjs";
+import { ExecutionProviderError } from "../src/execution-provider-contract.mjs";
 
 const digest = (value) => createHash("sha256").update(value.replace(/\r\n?/g, "\n")).digest("hex");
 const roles = Object.fromEntries(["bootstrap", "planner", "backend", "frontend", "database", "qa", "security", "devops"].map((role) => [role, { sandbox: "read-only", approvalPolicy: "never", tokenBudget: 100, usesWorktree: false }]));
@@ -68,10 +69,14 @@ function fixture({ supplied = false, auditVariant = "admitted", auditMutator = n
 
 class FailingIntakeRuntime {
   constructor({ cwd, role, failure }) { this.cwd = cwd; this.role = role; this.failure = failure; }
-  async connect() {} async shutdown() {} async diagnostics() { return { connected: true, closed: false, reconnectRequired: false, diagnostics: "bounded test diagnostic" }; }
+  async connect() {} async shutdown() {} async diagnostics() { return { connected: true, closed: false, reconnectRequired: false, diagnostics: JSON.stringify({ process: { alive: false, exited: this.failure === "process_exit", code: this.failure === "process_exit" ? 17 : null, signal: null }, stderrTail: "source Markdown SUPERSECRET must never persist", protocolEvents: [{ direction: "stderr", method: "turn/completed", threadId: `thread-${this.role}`, turnId: `turn-${this.role}`, errorMessage: "prompt and SUPERSECRET must never persist" }] }) }; }
   async startThread() { return { threadId: `thread-${this.role}` }; }
   async startGoalTurn({ threadId }) { return { threadId, turnId: `turn-${this.role}` }; }
-  async observeTerminal({ threadId, turnId }) { return { kind: "worker_terminal_candidate", threadId: this.failure === "wrong_thread" ? "foreign-thread" : threadId, turnId: this.failure === "wrong_turn" ? "foreign-turn" : turnId, terminalClass: "completed" }; }
+  async observeTerminal({ threadId, turnId }) {
+    if (this.failure === "process_exit") throw new ExecutionProviderError("process_exit", "process exited", { errorClass: "transport" });
+    if (this.failure === "timeout") throw new ExecutionProviderError("timeout", "timed out", { errorClass: "transport" });
+    return { kind: "worker_terminal_candidate", threadId: this.failure === "wrong_thread" ? "foreign-thread" : threadId, turnId: this.failure === "wrong_turn" ? "foreign-turn" : this.failure === "unresolved_alias" ? `${turnId}-candidate` : turnId, terminalClass: "completed" };
+  }
   async reconcileTerminal({ threadId, turnId }) {
     const terminalClass = this.failure === "missing_terminal_status" ? "running" : "completed";
     return { kind: "worker_completed", threadId, turnId, terminalClass, terminalReceipt: { schemaVersion: 1, kind: "AppServerTerminalReceipt", source: "turn_completed", capturedAt: "2026-01-01T00:00:00.000Z", providerConnectionId: "test-connection", correlationId: "test-correlation", threadId, requestedTurnId: turnId, resolvedTurnId: turnId, terminalClass } };
@@ -108,6 +113,7 @@ test("raw extraction is independently audited before Bootstrap and Planner admis
     const result = await new DeliveryCoordinator(router).begin({ source: fx.raw });
     assert.equal(router.store.deliveryRun(result.id).sourceClaimInputMode, "raw");
     assert.ok(result.sourceClaimExtractionId); assert.ok(result.sourceClaimAuditId); assert.ok(result.sourceClaimManifestId);
+    assert.ok(router.store.deliveryRun(result.id).bootstrapTaskId, "admitted manifest is required before Bootstrap is created");
     assert.equal(fx.client.calls.filter((item) => item === "Extract atomic candidate source claims only.").length, 1);
     assert.equal(fx.client.calls.filter((item) => item === "Independently audit source claims and source coverage.").length, 1);
     assert.ok(fx.client.calls.indexOf("extraction_result") < fx.client.calls.indexOf("Independently audit source claims and source coverage."));
@@ -152,8 +158,9 @@ test("source executors have no direct legacy provider path", async () => {
   }
 });
 
-test("source intake fail-closes wrong correlation, missing terminal status, malformed JSON, and unavailable final results before Bootstrap", async () => {
-  for (const [role, failure] of [["source_claim_extraction", "wrong_thread"], ["source_claim_extraction", "wrong_turn"], ["source_claim_extraction", "missing_terminal_status"], ["source_claim_extraction", "malformed_json"], ["source_claim_extraction", "final_result_unavailable"], ["source_claim_audit", "wrong_thread"], ["source_claim_audit", "wrong_turn"], ["source_claim_audit", "missing_terminal_status"], ["source_claim_audit", "malformed_json"], ["source_claim_audit", "final_result_unavailable"]]) {
+test("source intake preserves exact bounded terminal diagnostics and fails closed before Bootstrap", async () => {
+  const expected = { wrong_thread: ["terminal", "terminal_identity_mismatch", "observe_terminal", false], wrong_turn: ["terminal", "terminal_alias_unresolved", "reconcile_terminal", false], process_exit: ["terminal", "process_exit", "observe_terminal", false], timeout: ["terminal", "timeout", "observe_terminal", false], missing_terminal_status: ["terminal", "terminal_status_missing", "reconcile_terminal", false], unresolved_alias: ["terminal", "terminal_alias_unresolved", "reconcile_terminal", false], malformed_json: ["parse", "malformed_json", null, true], final_result_unavailable: ["result_read", "final_result_unavailable", "result_read", true] };
+  for (const [role, failure] of [["source_claim_extraction", "wrong_thread"], ["source_claim_extraction", "wrong_turn"], ["source_claim_extraction", "missing_terminal_status"], ["source_claim_extraction", "malformed_json"], ["source_claim_extraction", "final_result_unavailable"], ["source_claim_audit", "wrong_thread"], ["source_claim_audit", "wrong_turn"], ["source_claim_audit", "process_exit"], ["source_claim_audit", "timeout"], ["source_claim_audit", "missing_terminal_status"], ["source_claim_audit", "unresolved_alias"], ["source_claim_audit", "malformed_json"], ["source_claim_audit", "final_result_unavailable"]]) {
     const fx = fixture(); const router = new SwarmRouter(fx.config);
     try {
       failRoleWithRuntime(fx, role, failure);
@@ -161,11 +168,24 @@ test("source intake fail-closes wrong correlation, missing terminal status, malf
       assert.equal(result.state, "blocked_specification", `${role}:${failure}`);
       assert.equal(router.list().length, 0, `${role}:${failure}`);
       const persisted = router.store.sourceIntakeFailureForRun({ deliveryRunId: result.id, role: role === "source_claim_extraction" ? "extraction" : "audit" });
-      assert.equal(persisted.phase, failure === "malformed_json" ? "parse" : failure === "final_result_unavailable" ? "result_read" : "terminal", `${role}:${failure}`);
-      assert.equal(persisted.code, failure === "malformed_json" ? "malformed_json" : failure === "final_result_unavailable" ? "final_result_unavailable" : "terminal_correlation_invalid", `${role}:${failure}`);
+      const [phase, code, runtimeStage, hasReceipt] = expected[failure];
+      assert.equal(persisted.phase, phase, `${role}:${failure}`);
+      assert.equal(persisted.code, code, `${role}:${failure}`);
+      const receipt = router.store.sourceIntakeTerminalReceipt({ deliveryRunId: result.id, role });
+      assert.equal(Boolean(receipt), hasReceipt, `${role}:${failure}:receipt`);
+      const attempt = router.store.sourceIntakeAttemptForRun({ deliveryRunId: result.id, role: role === "source_claim_extraction" ? "extraction" : "audit" });
+      assert.ok(attempt, `${role}:${failure}:attempt`);
+      assert.equal(attempt.attemptedThreadId, `thread-${role}`, `${role}:${failure}:attempt thread`);
+      if (runtimeStage) {
+        assert.equal(persisted.diagnostics.runtimeStage, runtimeStage, `${role}:${failure}:stage`);
+        assert.equal(persisted.diagnostics.primaryReason, code, `${role}:${failure}:reason`);
+        assert.equal(persisted.diagnostics.attemptedThreadId, attempt.attemptedThreadId, `${role}:${failure}:correlation`);
+        assert.equal(JSON.stringify(persisted.diagnostics).includes("SUPERSECRET"), false, `${role}:${failure}:no source leakage`);
+        assert.equal(persisted.diagnostics.stderrTail, "[redacted:stderr_present]", `${role}:${failure}:stderr redacted`);
+        assert.equal(JSON.stringify(persisted.diagnostics.protocolTail).includes("prompt and"), false, `${role}:${failure}:protocol redacted`);
+      }
       if (failure === "final_result_unavailable") {
         assert.match(result.publish.reason, /final_result_unavailable/, `${role}:${failure}`);
-        assert.ok(router.store.sourceIntakeTerminalReceipt({ deliveryRunId: result.id, role }), `${role}:${failure}`);
         assert.ok(persisted.receiptIdentity, `${role}:${failure}`);
       }
     } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }

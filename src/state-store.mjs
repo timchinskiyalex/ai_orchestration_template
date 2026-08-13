@@ -9,6 +9,38 @@ import { validateProjectMode } from "./project-mode.mjs";
 const now = () => new Date().toISOString();
 const json = (value) => JSON.stringify(value ?? []);
 const parse = (value, fallback) => (value ? JSON.parse(value) : fallback);
+const sourceIntakeDiagnostics = (diagnostics) => {
+  if (!diagnostics || typeof diagnostics !== "object"
+    || !["connect", "start_thread", "start_turn", "observe_terminal", "reconcile_terminal", "result_read"].includes(diagnostics.runtimeStage)
+    || !["timeout", "process_exit", "transport_failure", "terminal_receipt_missing", "terminal_alias_unresolved", "terminal_status_missing", "terminal_identity_mismatch", "final_result_unavailable"].includes(diagnostics.primaryReason)
+    || !["attemptedThreadId", "requestedTurnId"].every((key) => typeof diagnostics[key] === "string" && diagnostics[key].length <= 512)
+    || (diagnostics.resolvedTurnId != null && (typeof diagnostics.resolvedTurnId !== "string" || diagnostics.resolvedTurnId.length > 512))
+    || (diagnostics.errorClass != null && (typeof diagnostics.errorClass !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/i.test(diagnostics.errorClass)))
+    || !diagnostics.processState || typeof diagnostics.processState !== "object"
+    || typeof diagnostics.processState.alive !== "boolean" || typeof diagnostics.processState.exited !== "boolean"
+    || (diagnostics.processState.code != null && !Number.isInteger(diagnostics.processState.code))
+    || (diagnostics.processState.signal != null && (typeof diagnostics.processState.signal !== "string" || diagnostics.processState.signal.length > 64))
+    || typeof diagnostics.stderrTail !== "string" || diagnostics.stderrTail.length > 512
+    || !Array.isArray(diagnostics.protocolTail) || diagnostics.protocolTail.length > 20) return null;
+  const protocolTail = diagnostics.protocolTail.map((event) => {
+    if (!event || typeof event !== "object") return null;
+    const copy = {};
+    for (const key of ["direction", "method", "threadId", "turnId", "requestedTurnId", "resolvedTurnId", "itemType", "itemStatus", "errorCode"]) {
+      const value = event[key];
+      if (value != null && (typeof value !== "string" || value.length > 512)) return null;
+      if (value != null) copy[key] = value;
+    }
+    return copy;
+  });
+  if (protocolTail.some((event) => event === null)) return null;
+  return {
+    attemptedThreadId: diagnostics.attemptedThreadId, requestedTurnId: diagnostics.requestedTurnId,
+    resolvedTurnId: diagnostics.resolvedTurnId ?? null, runtimeStage: diagnostics.runtimeStage,
+    primaryReason: diagnostics.primaryReason, ...(diagnostics.errorClass ? { errorClass: diagnostics.errorClass } : {}),
+    processState: { alive: diagnostics.processState.alive, exited: diagnostics.processState.exited, code: diagnostics.processState.code ?? null, signal: diagnostics.processState.signal ?? null },
+    stderrTail: diagnostics.stderrTail, protocolTail
+  };
+};
 
 export class StateStore {
   constructor(filePath, { readOnly = false, faultHooks = {} } = {}) {
@@ -26,6 +58,7 @@ export class StateStore {
     this.hasSourceClaimAudits = this.#hasTable("source_claim_audits");
     this.hasSourceIntakeTerminalReceipts = this.#hasTable("source_intake_terminal_receipts");
     this.hasSourceIntakeFailures = this.#hasTable("source_intake_failures");
+    this.hasSourceIntakeAttempts = this.#hasTable("source_intake_attempts");
     this.hasRepositoryBaselines = this.#hasTable("repository_baselines") && this.#hasColumn("delivery_runs", "repository_mode");
     this.hasManagedWorktrees = this.#hasTable("managed_worktrees");
     if (readOnly) return;
@@ -234,6 +267,13 @@ export class StateStore {
         schema_version INTEGER NOT NULL, role TEXT NOT NULL, phase TEXT NOT NULL, code TEXT NOT NULL,
         receipt_identity_json TEXT, diagnostics_json TEXT, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS source_intake_attempts (
+        delivery_run_id TEXT NOT NULL REFERENCES delivery_runs(id), role TEXT NOT NULL,
+        schema_version INTEGER NOT NULL, attempted_thread_id TEXT NOT NULL,
+        requested_turn_id TEXT NOT NULL, resolved_turn_id TEXT,
+        runtime_stage TEXT NOT NULL, lifecycle_state TEXT NOT NULL, created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL, PRIMARY KEY (delivery_run_id, role)
+      );
       CREATE TABLE IF NOT EXISTS repository_baseline_drafts (
         delivery_run_id TEXT PRIMARY KEY REFERENCES delivery_runs(id),
         schema_version INTEGER NOT NULL, draft_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -360,6 +400,7 @@ export class StateStore {
     this.hasSourceClaimAudits = true;
     this.hasSourceIntakeTerminalReceipts = true;
     this.hasSourceIntakeFailures = true;
+    this.hasSourceIntakeAttempts = true;
     this.hasRepositoryBaselines = true;
     this.hasManagedWorktrees = true;
     this.#addColumnIfMissing("tasks", "dependencies_json", "TEXT NOT NULL DEFAULT '[]'");
@@ -756,14 +797,38 @@ export class StateStore {
     return row ? { receipt: JSON.parse(row.receipt_json), createdAt: row.created_at } : null;
   }
 
+  recordSourceIntakeAttempt({ deliveryRunId, schemaVersion = 1, role, attemptedThreadId, requestedTurnId, resolvedTurnId = null, runtimeStage, lifecycleState }) {
+    if (!this.hasSourceIntakeAttempts || !this.deliveryRun(deliveryRunId) || schemaVersion !== 1 || !["extraction", "audit"].includes(role)
+      || !["connect", "start_thread", "start_turn", "observe_terminal", "reconcile_terminal", "result_read"].includes(runtimeStage)
+      || !/^[a-z][a-z0-9_]{0,63}$/.test(lifecycleState)
+      || ![attemptedThreadId, requestedTurnId].every((value) => typeof value === "string" && value && value.length <= 512)
+      || (resolvedTurnId != null && (typeof resolvedTurnId !== "string" || !resolvedTurnId || resolvedTurnId.length > 512))) throw new Error("SourceIntakeAttempt is invalid");
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.db.prepare("SELECT attempted_thread_id,requested_turn_id,created_at FROM source_intake_attempts WHERE delivery_run_id = ? AND role = ?").get(deliveryRunId, role);
+      if (existing && (existing.attempted_thread_id !== attemptedThreadId || existing.requested_turn_id !== requestedTurnId)) throw new Error("SourceIntakeAttempt correlation is immutable and mismatched");
+      if (existing) this.db.prepare("UPDATE source_intake_attempts SET resolved_turn_id = ?,runtime_stage = ?,lifecycle_state = ?,updated_at = ? WHERE delivery_run_id = ? AND role = ?").run(resolvedTurnId, runtimeStage, lifecycleState, timestamp, deliveryRunId, role);
+      else this.db.prepare("INSERT INTO source_intake_attempts(delivery_run_id,role,schema_version,attempted_thread_id,requested_turn_id,resolved_turn_id,runtime_stage,lifecycle_state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(deliveryRunId, role, schemaVersion, attemptedThreadId, requestedTurnId, resolvedTurnId, runtimeStage, lifecycleState, timestamp, timestamp);
+      const attempt = this.sourceIntakeAttemptForRun({ deliveryRunId, role });
+      this.#insertEvent(null, "source-intake/attempt", { deliveryRunId, ...attempt });
+      this.db.exec("COMMIT"); return attempt;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  sourceIntakeAttemptForRun({ deliveryRunId, role }) {
+    if (!this.hasSourceIntakeAttempts) return null;
+    const row = this.db.prepare("SELECT * FROM source_intake_attempts WHERE delivery_run_id = ? AND role = ?").get(deliveryRunId, role);
+    return row ? { schemaVersion: row.schema_version, role: row.role, attemptedThreadId: row.attempted_thread_id, requestedTurnId: row.requested_turn_id, resolvedTurnId: row.resolved_turn_id, runtimeStage: row.runtime_stage, lifecycleState: row.lifecycle_state, createdAt: row.created_at, updatedAt: row.updated_at } : null;
+  }
+
   recordSourceIntakeFailure({ deliveryRunId, schemaVersion = 1, role, phase, code, receiptIdentity = null, diagnostics = null }) {
     if (!this.hasSourceIntakeFailures || !this.deliveryRun(deliveryRunId) || schemaVersion !== 1 || !["extraction", "audit"].includes(role) || !["terminal", "result_read", "parse", "canonicalize", "validate", "persist"].includes(phase) || !/^[a-z][a-z0-9_]{0,95}$/.test(code)) throw new Error("SourceIntakeFailure is invalid");
     const identity = receiptIdentity && typeof receiptIdentity === "object" && ["threadId", "requestedTurnId", "resolvedTurnId"].every((key) => typeof receiptIdentity[key] === "string" && receiptIdentity[key] && receiptIdentity[key].length <= 512)
       ? { threadId: receiptIdentity.threadId, requestedTurnId: receiptIdentity.requestedTurnId, resolvedTurnId: receiptIdentity.resolvedTurnId }
       : null;
-    const safeDiagnostics = typeof diagnostics?.errorClass === "string" && /^[a-z][a-z0-9_-]{0,63}$/i.test(diagnostics.errorClass)
-      ? { errorClass: diagnostics.errorClass }
-      : null;
+    const safeDiagnostics = sourceIntakeDiagnostics(diagnostics)
+      ?? (typeof diagnostics?.errorClass === "string" && /^[a-z][a-z0-9_-]{0,63}$/i.test(diagnostics.errorClass) ? { errorClass: diagnostics.errorClass } : null);
     const timestamp = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {

@@ -334,6 +334,7 @@ export class SwarmRouter extends EventEmitter {
         ? deterministicSuppliedSourceClaimAudit(subject, resolver)
         : await new SourceClaimAuditExecutor(this.config).audit(subject, {
           recordTerminalReceipt: (receipt) => this.store.recordSourceIntakeTerminalReceipt({ deliveryRunId: run.id, role: "source_claim_audit", receipt }),
+          recordAttempt: (attempt) => this.store.recordSourceIntakeAttempt({ deliveryRunId: run.id, ...attempt }),
           recordFailure: (failure) => this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, ...failure })
         });
       try {
@@ -412,6 +413,7 @@ export class SwarmRouter extends EventEmitter {
     }
     const extraction = await new SourceClaimExtractionExecutor(this.config).extract({
       recordTerminalReceipt: (receipt) => this.store.recordSourceIntakeTerminalReceipt({ deliveryRunId: run.id, role: "source_claim_extraction", receipt }),
+      recordAttempt: (attempt) => this.store.recordSourceIntakeAttempt({ deliveryRunId: run.id, ...attempt }),
       recordFailure: (failure) => this.store.recordSourceIntakeFailure({ deliveryRunId: run.id, ...failure })
     });
     try {
@@ -1620,7 +1622,7 @@ export class SwarmRouter extends EventEmitter {
       // Worker prose is not finalization authority.  Once a verified receipt
       // exists, a process-local thread/read loss cannot discard the real Git
       // diff; its bounded diagnostics remain in the persisted receipt.
-      if (error instanceof ExecutionProviderError && error.errorCode === "execution_provider_terminal_unavailable") {
+      if (error instanceof ExecutionProviderError && ["execution_provider_terminal_unavailable", "transport_failure", "final_result_unavailable"].includes(error.errorCode)) {
         return `Codex App Server completed turn ${durable.turnId}; final prose was unavailable after terminal receipt.`;
       }
       throw this.#migratedRuntimeFailure(error, "read_final_result");

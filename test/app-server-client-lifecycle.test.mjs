@@ -178,19 +178,10 @@ test("waitForTurn rejects when the App Server exits", async () => {
   assert.equal(client.diagnostics().process.code, 9);
 });
 
-test("process exit uses one bounded independent thread/read to recover a terminal turn", async () => {
+test("process exit rejects same-provider terminal reads without a cross-process recovery", async () => {
   const client = clientWithWritableStdin({ fallbackReadTimeoutMs: 30 });
-  let reads = 0;
-  client.independentThreadRead = async ({ threadId }) => {
-    reads += 1;
-    return { thread: { id: threadId, turns: [{ id: "turn-1", status: "completed", items: [{ type: "agentMessage" }] }] } };
-  };
   client.handleProcessExit({ code: 23, signal: null });
-  const first = await client.readTerminalTurn("thread-1", "turn-1", 30);
-  const second = await client.readTerminalTurn("thread-1", "turn-1", 30);
-  assert.equal(first.terminal.status, "completed");
-  assert.equal(second.terminal.status, "completed");
-  assert.equal(reads, 1);
+  await assert.rejects(client.readTerminalTurn("thread-1", "turn-1", 30), (error) => error?.errorCode === "process_exit");
   assert.deepEqual(client.diagnostics().process, { alive: false, exited: true, code: 23, signal: null });
 });
 
@@ -256,46 +247,11 @@ test("terminal polling resolves one unobserved replacement turn in an otherwise 
   assert.equal(client.protocolEvents().some((event) => event.method === "turn-id-alias" && event.resolvedTurnId === "server-turn"), true);
 });
 
-test("independent read-only probe resolves a terminal turn when the primary App Server view stays stale", async () => {
-  let probes = 0;
+test("a stale primary App Server view does not start an independent thread/read probe", async () => {
   const client = clientWithWritableStdin({ fallbackReadTimeoutMs: 30 });
   client.terminalPollIntervalMs = 1_000;
-  client.independentProbeDelayMs = 1;
-  client.independentThreadRead = async ({ threadId }) => {
-    probes += 1;
-    return { thread: { id: threadId, turns: [{ id: "durable-turn", status: "interrupted", items: [] }] } };
-  };
-  const turn = await client.waitForTurn("thread-1", "requested-turn", 100);
-  assert.deepEqual({ id: turn.id, status: turn.status }, { id: "durable-turn", status: "interrupted" });
-  assert.equal(probes, 1);
-  assert.equal(client.protocolEvents().some((event) => event.method === "turn-id-alias" && event.resolvedTurnId === "durable-turn"), true);
-});
-
-test("independent thread/read probe shutdown terminates only its own Windows process tree", async () => {
-  const terminated = []; let spawned = 0;
-  const makeChild = (pid) => {
-    const child = new EventEmitter(); child.pid = pid; child.stdout = new PassThrough(); child.stderr = new PassThrough();
-    child.stdin = { writable: true, write(line) {
-      const message = JSON.parse(line);
-      if (message.method === "initialize") queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: message.id, result: { serverInfo: { name: "fake" } } })}\n`));
-      if (message.method === "thread/read") queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: message.id, result: { thread: { id: message.params.threadId, turns: [{ id: "turn-1", status: "completed", items: [] }] } } })}\n`));
-      return true;
-    } };
-    return child;
-  };
-  const client = new AppServerClient({
-    cwd: process.cwd(), platform: "win32", independentProbeDelayMs: 1, fallbackReadTimeoutMs: 30,
-    appServerLauncher: () => ({ command: "fake-codex", args: ["app-server"] }),
-    spawnProcess: () => makeChild(++spawned === 1 ? 101 : 202),
-    terminate: async ({ pid }) => { terminated.push(pid); return { attempted: true }; }
-  });
-  await client.connect();
-  const turn = await client.waitForTurn("thread-1", "turn-1", 100);
-  assert.equal(turn.status, "completed");
-  assert.deepEqual(terminated, [202], "probe cleanup may not terminate the parent provider tree");
-  assert.deepEqual(client.diagnostics().process, { alive: true, exited: false, code: null, signal: null });
-  await client.shutdown();
-  assert.deepEqual(terminated, [202, 101]);
+  await assert.rejects(client.waitForTurn("thread-1", "requested-turn", 35), /thread\/read fallback failed/);
+  assert.equal(client.protocolEvents().some((event) => event.method === "thread/read-independent"), false);
 });
 
 test("thread/read never aliases an unobserved terminal turn when multiple turns exist", async () => {
