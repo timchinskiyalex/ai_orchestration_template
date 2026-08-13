@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -24,8 +24,9 @@ class RuntimeClient extends EventEmitter {
   async startTurn(data) { const thread = this.threads.get(data.threadId); const id = `turn-${data.threadId}-${++this.sequence}`; thread.turnId = id; this.calls.push(["turn", data]); await this.onStart?.({ cwd: thread.cwd, threadId: data.threadId, turnId: id, goal: thread.goal }); if (this.terminalNotification?.when === "before_start_result") this.#terminalNotification(data.threadId, id); return { turn: { id } }; }
   async waitForTurn(threadId, turnId) { this.calls.push("wait"); if (this.timeout) throw new Error("bounded timeout"); if (this.exitBeforeTerminal) { this.emit("exit", { code: 17, signal: "SIGTERM" }); throw new Error("App Server exited during turn"); } await this.wait?.promise; if (this.terminalNotification?.when === "wait") this.#terminalNotification(threadId, turnId); return { id: turnId, status: this.terminal }; }
   #terminalNotification(threadId, turnId) { const mode = this.terminalNotification?.mode ?? "valid"; const params = mode === "missing_status" ? { threadId, turn: { id: turnId } } : mode === "wrong_thread" ? { threadId: "other-thread", turn: { id: turnId, status: this.terminal } } : mode === "wrong_turn" || mode === "untrusted_alias" ? { threadId, turn: { id: "other-turn", status: this.terminal } } : { threadId, turn: { id: turnId, status: this.terminal } }; this.emit("notification", { method: "turn/completed", params }); }
-  async readTerminalTurn(threadId, turnId) { if (this.readUnavailable) throw new Error(`thread/read: thread not loaded: ${threadId}`); return { terminal: { id: turnId, status: this.terminal, items: [{ type: "agentMessage", text: this.resultText }] } }; }
-  async readThread({ threadId }) { if (this.readUnavailable) throw new Error(`thread/read: thread not loaded: ${threadId}`); const thread = this.threads.get(threadId); return { thread: { turns: [{ id: thread.turnId, status: this.terminal, items: [{ type: "agentMessage", text: this.resultText }] }] } }; }
+  #resultText(thread) { return typeof this.resultText === "function" ? this.resultText(thread) : this.resultText; }
+  async readTerminalTurn(threadId, turnId) { if (this.readUnavailable) throw new Error(`thread/read: thread not loaded: ${threadId}`); const thread = this.threads.get(threadId); return { terminal: { id: turnId, status: this.terminal, items: [{ type: "agentMessage", text: this.#resultText(thread) }] } }; }
+  async readThread({ threadId }) { if (this.readUnavailable) throw new Error(`thread/read: thread not loaded: ${threadId}`); const thread = this.threads.get(threadId); return { thread: { turns: [{ id: thread.turnId, status: this.terminal, items: [{ type: "agentMessage", text: this.#resultText(thread) }] }] } }; }
   async interruptTurn() { this.terminal = "cancelled"; }
   async shutdown() { this.calls.push("shutdown"); }
   diagnostics() { return { process: { exited: this.disconnect } }; }
@@ -46,10 +47,10 @@ function roles() {
   }]));
 }
 
-function subject(root, { maxConcurrentTasks = 1, path = "codex-app-server", clients = [], clientOptions = {}, faultHooks = {}, processRunner = async () => ({ pid: 9, stdout: "verified", stderr: "" }) } = {}) {
+function subject(root, { maxConcurrentTasks = 1, clients = [], clientOptions = {}, legacyClientOptions = {}, faultHooks = {}, processRunner = async () => ({ pid: 9, stdout: "verified", stderr: "" }) } = {}) {
   const legacyClients = [];
   const router = new SwarmRouter({
-    repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", writerRuntimePath: path, processRunner, faultHooks,
+    repository: root, runtimeDir: join(root, "runtime"), baseRef: "main", model: "fake", processRunner, faultHooks,
     project: { name: "phase2", documentationDir: "docs/input", generatedDir: "docs/generated", productRoots: [] },
     router: { maxConcurrentTasks, maxChildrenPerTask: 8, maxDelegationDepth: 4, maxPlanTasks: 8, defaultParentBudget: 1000, turnTimeoutMs: 50, approvalMode: "deny" },
     autonomy: { mode: "autonomous", autoApproveWorkflowGates: true, autoRemediate: true }, budget: { weeklyTokenLimit: 10_000, weeklyWindowDays: 7 }, quota: { throttleAtUsedPercent: 90, throttleWhenUnavailable: false }, roles: roles(),
@@ -58,7 +59,7 @@ function subject(root, { maxConcurrentTasks = 1, path = "codex-app-server", clie
       const client = new RuntimeClient(options); clients.push({ task, cwd, client });
       return new CodexAppServerRuntime({ cwd, client });
     },
-    executionProviderFactory: () => { const client = new RuntimeClient(); legacyClients.push(client); return new AppServerExecutionProvider({ client }); }
+    executionProviderFactory: () => { const client = new RuntimeClient(legacyClientOptions); legacyClients.push(client); return new AppServerExecutionProvider({ client }); }
   });
   return { router, clients, legacyClients };
 }
@@ -156,16 +157,57 @@ test("Phase 2: migrated successor uses its exact predecessor artifact SHA", asyn
   } finally { fx.router.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test("Phase 2: legacy and migrated writers share the controller finalization contract", async () => {
-  const migratedRepo = repository(); const legacyRepo = repository(); const migrated = subject(migratedRepo.root, { clientOptions: { onStart: ({ cwd }) => writeFileSync(join(cwd, "src", "value.mjs"), "export const value = 2;\n") } }); const legacy = subject(legacyRepo.root, { path: "legacy" });
+test("G1: two isolated Codex writers retain alias-safe receipts through Security, QA, fan-in integration, and restart", async () => {
+  const { root, baseSha } = repository(); let restarted;
+  const gateResult = (thread) => /^Security review\b/.test(thread.goal) || /^QA\b/.test(thread.goal)
+    ? "```json\n{\"verdict\":\"pass\",\"summary\":\"deterministic gate passed\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```"
+    : "writer completed";
+  const fx = subject(root, {
+    maxConcurrentTasks: 2,
+    clientOptions: (task) => ({
+      terminalNotification: { when: "wait" }, readUnavailable: true,
+      onStart: ({ cwd }) => writeFileSync(join(cwd, "src", `${task.role}.mjs`), `export const ${task.role} = true;\n`)
+    }),
+    legacyClientOptions: { resultText: gateResult }
+  });
   try {
-    const modernTask = await writer(migrated); await migrated.router.runUntilIdle();
-    legacy.legacyClients.length = 0; await legacy.router.ensureProjectOverlay(); const legacyTask = legacy.router.enqueue({ role: "backend", title: "legacy writer", prompt: "change", allowedPaths: ["src"] });
-    // The legacy fake edits in its assigned cwd before completion.
-    legacy.router.config.executionProviderFactory = () => new AppServerExecutionProvider({ client: new RuntimeClient({ onStart: ({ cwd }) => writeFileSync(join(cwd, "src", "value.mjs"), "export const value = 2;\n") }) }); await legacy.router.runUntilIdle();
-    const modernArtifact = migrated.router.store.workerArtifact(modernTask.id); const legacyArtifact = legacy.router.store.workerArtifact(legacyTask.id);
-    assert.deepEqual(Object.keys(modernArtifact).sort(), Object.keys(legacyArtifact).sort()); assert.deepEqual(modernArtifact.changedPaths, legacyArtifact.changedPaths);
-  } finally { migrated.router.close(); legacy.router.close(); rmSync(migratedRepo.root, { recursive: true, force: true }); rmSync(legacyRepo.root, { recursive: true, force: true }); }
+    const backend = await writer(fx, "backend", { allowedPaths: ["src/backend.mjs"] });
+    const frontend = await writer(fx, "frontend", { allowedPaths: ["src/frontend.mjs"] });
+    await fx.router.runUntilIdle();
+
+    const writers = [backend, frontend].map((task) => fx.router.store.getTask(task.id));
+    assert.equal(writers.every((task) => task.status === "done"), true, JSON.stringify(writers));
+    assert.equal(fx.clients.length, 2, "configured capacity two admits both independent writers");
+    for (const task of writers) {
+      const runtime = fx.clients.find((item) => item.task.id === task.id);
+      const artifact = fx.router.store.workerArtifact(task.id);
+      const receipt = fx.router.store.events().find((event) => event.taskId === task.id && event.type === "app-server/terminal-receipt")?.payload;
+      assert.equal(runtime.cwd, task.worktree);
+      assert.equal(artifact.baseSha, baseSha);
+      assert.equal(receipt?.source, "turn_completed");
+      assert.equal(receipt?.corroboration?.available, false);
+    }
+    const securityReviews = writers.map((task) => fx.router.enqueue({ role: "security", title: "Security review", prompt: "Review the finalized writer artifact.", dependencies: [task.id], sourceWriterTaskId: task.id, allowedPaths: [] }));
+    securityReviews.forEach((security, index) => fx.router.enqueue({ role: "qa", title: "QA", prompt: "Verify the finalized writer artifact.", dependencies: [security.id], sourceWriterTaskId: writers[index].id, allowedPaths: [] }));
+    await fx.router.runUntilIdle();
+    const reviews = fx.router.list().filter((task) => task.sourceWriterTaskId === backend.id || task.sourceWriterTaskId === frontend.id);
+    assert.equal(reviews.filter((task) => task.role === "security" && task.status === "done").length, 2, JSON.stringify(reviews));
+    assert.equal(reviews.filter((task) => task.role === "qa" && task.status === "done").length, 2);
+    const integration = await fx.router.integrateFinalized([backend.id, frontend.id]);
+    assert.equal(integration.manifest.status, "candidate_ready");
+
+    fx.router.close();
+    restarted = subject(root, { maxConcurrentTasks: 2, legacyClientOptions: { resultText: gateResult } });
+    await restarted.router.recoverStaleDeliveries();
+    await restarted.router.runUntilIdle();
+    assert.equal(restarted.clients.length, 0, "restart does not create duplicate writer turns");
+    assert.equal([backend.id, frontend.id].filter((id) => restarted.router.store.workerArtifact(id)).length, 2, "restart preserves exactly one artifact per writer");
+  } finally { fx.router.close(); restarted?.router.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Phase 2: legacy writer selection is retired", () => {
+  const source = readFileSync(new URL("../src/router.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /writerRuntimePath|resolveTransitionalRuntimePath/);
 });
 
 test("Phase 2: Security and QA remain controller-owned gates for a migrated artifact", async () => {

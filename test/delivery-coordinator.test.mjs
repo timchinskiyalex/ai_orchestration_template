@@ -18,11 +18,11 @@ class DeliveryClient extends EventEmitter {
   constructor() { super(); this.id = 0; this.threads = new Map(); this.goals = []; }
   async connect() {} shutdown() {} diagnostics() { return { protocolEvents: [], stderrTail: "", process: {} }; }
   async request(method) { return method === "account/read" ? { account: {} } : method === "account/usage/read" ? { dailyUsageBuckets: [] } : { rateLimits: null }; }
-  async startThread({ cwd }) { const id = `thread-${++this.id}`; this.threads.set(id, { cwd, goal: "" }); return { thread: { id } }; }
+  async startThread({ cwd }) { const id = `thread-${++this.id}`; this.threads.set(id, { cwd, goal: "", turns: 0, turnId: null }); return { thread: { id } }; }
   async setGoal(goal) { this.goals.push(goal); this.threads.get(goal.threadId).goal = goal.objective; }
-  async startTurn({ threadId }) { return { turn: { id: `turn-${threadId}` } }; }
+  async startTurn({ threadId }) { const thread = this.threads.get(threadId); thread.turnId = `turn-${threadId}-${++thread.turns}`; return { turn: { id: thread.turnId } }; }
   async waitForTurn(threadId, turnId) { const thread = this.threads.get(threadId); if (/Writer/.test(thread.goal)) writeFileSync(join(thread.cwd, "src", "value.mjs"), "export const value = 2;\n"); return { id: turnId, status: "completed" }; }
-  async readThread({ threadId }) { const thread = this.threads.get(threadId); const text = /^Bootstrap/.test(thread.goal) ? `\`\`\`json\n${JSON.stringify(fakeBlueprint(thread.cwd))}\n\`\`\`` : /^Plan /.test(thread.goal) ? `\`\`\`json\n${JSON.stringify(fakePlan())}\n\`\`\`` : /^Security review:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"secure\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : /^QA:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"quality verified\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : "writer complete"; return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text }] }] } }; }
+  async readThread({ threadId }) { const thread = this.threads.get(threadId); const text = /^Bootstrap/.test(thread.goal) ? `\`\`\`json\n${JSON.stringify(fakeBlueprint(thread.cwd))}\n\`\`\`` : /^Plan /.test(thread.goal) ? `\`\`\`json\n${JSON.stringify(fakePlan())}\n\`\`\`` : /^Security review:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"secure\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : /^QA:/.test(thread.goal) ? "```json\n{\"verdict\":\"pass\",\"summary\":\"quality verified\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```" : "writer complete"; return { thread: { turns: [{ id: thread.turnId, status: "completed", items: [{ type: "agentMessage", text }] }] } }; }
 }
 class CorrectingPlannerClient extends DeliveryClient {
   constructor() { super(); this.plannerReads = 0; }
@@ -33,7 +33,7 @@ class CorrectingPlannerClient extends DeliveryClient {
       const text = this.plannerReads === 1
         ? "```json\n{\"tasks\":[{\"id\":\"writer\",\"title\":\"Writer\",\"prompt\":\"Writer\",\"primaryDomain\":\"backend\",\"supportingDomains\":[],\"riskFlags\":[\"invented_flag\"],\"humanApprovalRequired\":false,\"estimatedTokens\":20,\"dependsOn\":[],\"allowedPaths\":[\"src/value.mjs\"],\"acceptanceChecks\":[\"npm test\"]}]}\n```"
         : `\`\`\`json\n${JSON.stringify(fakePlan())}\n\`\`\``;
-      return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text }] }] } };
+      return { thread: { turns: [{ id: thread.turnId, status: "completed", items: [{ type: "agentMessage", text }] }] } };
     }
     return super.readThread({ threadId });
   }
@@ -54,7 +54,7 @@ class SourceBlockedClient extends DeliveryClient {
     const thread = this.threads.get(threadId);
     if (/^Bootstrap/.test(thread.goal)) {
       const blueprint = fakeBlueprint(thread.cwd, { question: { questionId: "missing-source-fact", description: "A source fact is missing.", requiredForRequirementIds: ["fix-value"], status: "unresolved" } });
-      return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text: `\`\`\`json\n${JSON.stringify(blueprint)}\n\`\`\`` }] }] } };
+      return { thread: { turns: [{ id: thread.turnId, status: "completed", items: [{ type: "agentMessage", text: `\`\`\`json\n${JSON.stringify(blueprint)}\n\`\`\`` }] }] } };
     }
     return super.readThread({ threadId });
   }
@@ -65,7 +65,7 @@ class SelfAuthorizedPolicyClient extends DeliveryClient {
     const thread = this.threads.get(threadId);
     if (/^Bootstrap/.test(thread.goal)) {
       const blueprint = fakeBlueprint(thread.cwd, { question: { questionId: "claimed-policy", description: "A required source fact is missing.", requiredForRequirementIds: ["fix-value"], status: "resolved_by_policy", policyDefault: "untrusted", resolution: "untrusted" } });
-      return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text: `\`\`\`json\n${JSON.stringify(blueprint)}\n\`\`\`` }] }] } };
+      return { thread: { turns: [{ id: thread.turnId, status: "completed", items: [{ type: "agentMessage", text: `\`\`\`json\n${JSON.stringify(blueprint)}\n\`\`\`` }] }] } };
     }
     if (/^Plan /.test(thread.goal)) this.plannerReads += 1;
     return super.readThread({ threadId });
@@ -76,7 +76,7 @@ class LegacySourceRefClient extends DeliveryClient {
     const thread = this.threads.get(threadId);
     if (/^Bootstrap/.test(thread.goal)) {
       const blueprint = fakeBlueprint(thread.cwd); blueprint.requirements[0].sourceRefs = [{ documentId: blueprint.sourceDocuments[0].documentId, locator: "# Requirement", excerptDigest: "a".repeat(64) }];
-      return { thread: { turns: [{ id: `turn-${threadId}`, items: [{ type: "agentMessage", text: `\`\`\`json\n${JSON.stringify(blueprint)}\n\`\`\`` }] }] } };
+      return { thread: { turns: [{ id: thread.turnId, status: "completed", items: [{ type: "agentMessage", text: `\`\`\`json\n${JSON.stringify(blueprint)}\n\`\`\`` }] }] } };
     }
     return super.readThread({ threadId });
   }
@@ -321,10 +321,10 @@ test("writer verification failure is repaired in the same worker thread before f
   try {
     await coordinator.begin({ source: fixture.source });
     const writer = router.list().find((task) => task.title === "Writer");
-    assert.equal(writer.status, "done");
+    assert.equal(writer.status, "done", writer.error);
     assert.equal(client.writerTurns, 2);
     assert.ok(router.store.workerArtifact(writer.id));
-    assert.equal(router.lifecycleEvents().some((event) => event.type === "writer verification retry"), true);
+    assert.equal(router.lifecycleEvents().some((event) => event.type === "migrated writer verification retry"), true);
   } finally { router.close(); rmSync(fixture.root, { recursive: true, force: true }); }
 });
 

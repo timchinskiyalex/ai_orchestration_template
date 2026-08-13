@@ -49,7 +49,7 @@ class DeterministicLifecycleClient extends EventEmitter {
           ? "```json\n{\"verdict\":\"pass\",\"summary\":\"ok\",\"findings\":[],\"executedChecks\":[],\"notRunChecks\":[]}\n```"
           : "writer complete";
     const thread = this.threads.get(threadId);
-    return { thread: { turns: [{ id: `${threadId}-turn-${thread.turns}`, items: [{ type: "agentMessage", text }] }] } };
+    return { thread: { turns: [{ id: `${threadId}-turn-${thread.turns}`, status: "completed", items: [{ type: "agentMessage", text }] }] } };
   }
 }
 
@@ -89,7 +89,7 @@ test("deterministic scaffold creates a WorkerArtifact before two dependent write
     const scaffoldQa = router.list().find((task) => task.title === "QA: Scaffold product roots");
     assert.equal(scaffoldSecurity.status, "done"); assert.equal(scaffoldQa.status, "done");
     const localQa = router.lifecycleEvents().findIndex((event) => event.type === "controller-local scaffold quality passed");
-    const firstWriterTurn = router.lifecycleEvents().findIndex((event) => event.type === "turn started" && writers.some((task) => task.id === event.taskId));
+    const firstWriterTurn = router.lifecycleEvents().findIndex((event) => event.type === "migrated writer turn started" && writers.some((task) => task.id === event.taskId));
     assert.ok(localQa >= 0 && localQa < firstWriterTurn, "frontend/backend must wait for scaffold Security -> QA release");
     assert.equal((await router.integrateFinalized([scaffold.id, ...writers.map((task) => task.id)])).manifest.status, "candidate_ready");
   } finally { router?.close(); rmSync(root, { recursive: true, force: true }); }

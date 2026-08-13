@@ -4,9 +4,7 @@ import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { AppServerExecutionProvider } from "../src/app-server-execution-provider.mjs";
 import {
-  CODEX_RUNTIME_OBSERVATION_KINDS, CodexAppServerRuntime,
-  DEFAULT_TRANSITIONAL_RUNTIME_PATH, TRANSITIONAL_RUNTIME_PATHS,
-  createTransitionalRuntime, resolveTransitionalRuntimePath
+  CODEX_RUNTIME_OBSERVATION_KINDS, CodexAppServerRuntime
 } from "../src/codex-app-server-runtime.mjs";
 import { EXECUTION_PROVIDER_VERSION, validateEnvelope } from "../src/execution-provider-contract.mjs";
 
@@ -221,14 +219,11 @@ test("thin runtime exposes only normalized progress, timeout/cancellation, and d
   assert.match(diagnostics.diagnostics, /transport closed/);
 });
 
-test("transitional switch is closed, defaults to legacy, and runtime has no controller authority", () => {
-  assert.deepEqual(TRANSITIONAL_RUNTIME_PATHS, ["legacy", "codex-app-server"]);
-  assert.equal(DEFAULT_TRANSITIONAL_RUNTIME_PATH, "legacy");
-  assert.equal(resolveTransitionalRuntimePath(), "legacy");
-  assert.throws(() => resolveTransitionalRuntimePath("remote"), /Unsupported transitional runtime path/);
-  assert.ok(createTransitionalRuntime({ runtimePath: "legacy", cwd: "D:/controller" }) instanceof AppServerExecutionProvider);
-  assert.ok(createTransitionalRuntime({ runtimePath: "codex-app-server", cwd: "D:/controller" }) instanceof CodexAppServerRuntime);
+test("runtime has no controller authority or alternate writer-runtime switch", () => {
   const source = readFileSync(new URL("../src/codex-app-server-runtime.mjs", import.meta.url), "utf8");
+  const router = readFileSync(new URL("../src/router.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(source, /state-store|StateStore|worktree-manager|WorktreeManager|worktree-finalizer|WorktreeFinalizer|integrator|Integrator|remote-adapters/i);
   assert.doesNotMatch(source, /\.transition\(|recordWorkerArtifact|finalize\(/);
+  assert.doesNotMatch(source, /TRANSITIONAL_RUNTIME_PATHS|createTransitionalRuntime|resolveTransitionalRuntimePath/);
+  assert.doesNotMatch(router, /writerRuntimePath|resolveTransitionalRuntimePath/);
 });

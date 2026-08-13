@@ -3,13 +3,6 @@ import { randomUUID } from "node:crypto";
 import { AppServerExecutionProvider } from "./app-server-execution-provider.mjs";
 import { EXECUTION_PROVIDER_VERSION, ExecutionProviderError, assertCapabilities, safeDiagnostics, validateEnvelope } from "./execution-provider-contract.mjs";
 
-// Phase 1 deliberately has exactly two named paths.  This is a transitional
-// test/migration seam, not configuration, discovery, or a provider registry.
-// Production continues to construct the proven legacy path until Phase 2
-// parity is complete, after which this switch must be removed.
-export const TRANSITIONAL_RUNTIME_PATHS = Object.freeze(["legacy", "codex-app-server"]);
-export const DEFAULT_TRANSITIONAL_RUNTIME_PATH = "legacy";
-
 // These are observations for a controller to consume.  They are explicitly
 // not task-state transitions and contain no persistence or Git authority.
 export const CODEX_RUNTIME_OBSERVATION_KINDS = Object.freeze([
@@ -36,30 +29,17 @@ const terminalObservationKind = (terminalClass) => terminalClass === "completed"
     ? "worker_cancelled"
     : "worker_failed";
 
-export function resolveTransitionalRuntimePath(runtimePath = DEFAULT_TRANSITIONAL_RUNTIME_PATH) {
-  if (!TRANSITIONAL_RUNTIME_PATHS.includes(runtimePath)) {
-    throw new TypeError(`Unsupported transitional runtime path: ${runtimePath}`);
-  }
-  return runtimePath;
-}
-
-// This helper is intentionally not wired into SwarmRouter in Phase 1.  It
-// exists only so parity tests and a later migration can select a closed path.
-export function createTransitionalRuntime({ runtimePath = DEFAULT_TRANSITIONAL_RUNTIME_PATH, ...options } = {}) {
-  return resolveTransitionalRuntimePath(runtimePath) === "legacy"
-    ? new AppServerExecutionProvider(options)
-    : new CodexAppServerRuntime(options);
-}
-
 export class CodexAppServerRuntime extends EventEmitter {
-  constructor({ cwd, client = null, clientFactory = null } = {}) {
+  constructor({ cwd, client = null, clientFactory = null, transport = null } = {}) {
     super();
     this.cwd = assertCwd(cwd);
     this.connected = false;
     this.closed = false;
-    // The existing provider is an internal App Server protocol/transport
-    // detail.  This runtime never exposes its envelope API to a controller.
-    this.#transport = new AppServerExecutionProvider({ cwd: this.cwd, client, clientFactory });
+    // The protocol transport is an implementation detail. `transport` is a
+    // deterministic test seam for this same App Server contract, not a
+    // controller-visible writer-runtime choice.
+    this.#transport = transport ?? new AppServerExecutionProvider({ cwd: this.cwd, client, clientFactory });
+    if (typeof this.#transport?.on !== "function") throw new TypeError("CodexAppServerRuntime requires an App Server protocol transport");
     this.#transport.on("lifecycle", (event) => this.#translateLifecycle(event));
   }
 
@@ -82,7 +62,9 @@ export class CodexAppServerRuntime extends EventEmitter {
 
   async startGoalTurn({ threadId, goal, turn } = {}) {
     if (typeof threadId !== "string" || !threadId) throw new TypeError("startGoalTurn requires threadId");
-    await this.#call("set_goal", { ...(goal ?? {}), threadId }, ["threadId"]);
+    // Corrective turns remain in the existing thread goal. Sending an empty
+    // goal would erase the original assignment in App Server clients.
+    if (goal && Object.keys(goal).length) await this.#call("set_goal", { ...goal, threadId }, ["threadId"]);
     const started = await this.#call("start_turn", { ...(turn ?? {}), threadId }, ["threadId", "turnId"]);
     const observation = this.#emitObservation("worker_started", {
       threadId, turnId: started.turnId, requestedTurnId: started.turnId, providerRunId: started.providerRunId

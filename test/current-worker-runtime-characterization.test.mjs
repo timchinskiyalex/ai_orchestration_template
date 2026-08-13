@@ -49,7 +49,13 @@ class CharacterizationProvider extends EventEmitter {
     return this.#ok("reconcile_terminal", args, {
       providerRunId: "characterization", threadId: this.thread.id, turnId: this.thread.turnId,
       terminalClass: "completed", requestedTurnId: args.data.turnId, resolvedTurnId: this.thread.turnId,
-      reconciliationSource: "thread_read", verifiedEquivalence: "exact"
+      reconciliationSource: "thread_read", verifiedEquivalence: "exact",
+      terminalReceipt: {
+        schemaVersion: 1, kind: "AppServerTerminalReceipt", source: "same_provider_thread_read",
+        threadId: this.thread.id, requestedTurnId: args.data.turnId, resolvedTurnId: this.thread.turnId,
+        terminalClass: "completed", correlationId: args.correlationId, providerConnectionId: "characterization",
+        capturedAt: new Date().toISOString(), corroboration: { available: true, source: "same_provider_thread_read", terminalClass: "completed" }
+      }
     });
   }
   async readFinalResult(args) { return this.#ok("read_final_result", args, { providerRunId: "characterization", threadId: args.data.threadId, turnId: args.data.turnId, resultText: "Worker-reported files: README.md (non-authoritative)." }); }

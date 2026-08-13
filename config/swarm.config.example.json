@@ -19,7 +19,6 @@
   "baseRef": "main",
   "runtimeDir": "../runtime",
   "model": "gpt-5.6-terra",
-  "writerRuntimePath": "codex-app-server",
   "router": {
     "maxConcurrentTasks": 10,
     "maxChildrenPerTask": 20,

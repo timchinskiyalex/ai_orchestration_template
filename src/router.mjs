@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { EventEmitter } from "node:events";
 import { execFileSync } from "node:child_process";
 import { AppServerExecutionProvider } from "./app-server-execution-provider.mjs";
-import { CodexAppServerRuntime, resolveTransitionalRuntimePath } from "./codex-app-server-runtime.mjs";
+import { CodexAppServerRuntime } from "./codex-app-server-runtime.mjs";
 import { EXECUTION_PROVIDER_VERSION, assertCapabilities, validateEnvelope, validateLifecycleEvent, ExecutionProviderError } from "./execution-provider-contract.mjs";
 import { BudgetGovernor } from "./budget-governor.mjs";
 import { depthOf, finalStatusForRole, assertRole, ENGINEERING_DOMAINS } from "./domain.mjs";
@@ -1019,7 +1019,7 @@ export class SwarmRouter extends EventEmitter {
       return;
     }
 
-    if (this.#usesMigratedWriterRuntime(task)) {
+    if (this.#usesCodexWriterRuntime(task)) {
       await this.#runMigratedWriter(task, { worktree, branch, overlayContext });
       return;
     }
@@ -1478,18 +1478,20 @@ export class SwarmRouter extends EventEmitter {
     this.#lifecycle(checks.failed.length ? "controller-local scaffold quality blocked" : "controller-local scaffold quality passed", { taskId: task.id, writerTaskId: writer.id });
   }
 
-  #usesMigratedWriterRuntime(task) {
+  #usesCodexWriterRuntime(task) {
     if (!MIGRATED_WRITER_ROLES.has(task?.role)) return false;
-    if (this.config.roles[task.role]?.sandbox !== "workspace-write") return false;
-    // Raw programmatic test fixtures predate Phase 2 configuration and retain
-    // legacy behavior. loadConfig() sets the production default explicitly.
-    return resolveTransitionalRuntimePath(this.config.writerRuntimePath ?? "legacy") === "codex-app-server";
+    return this.config.roles[task.role]?.sandbox === "workspace-write";
   }
 
   #createMigratedWriterRuntime(task, worktree) {
     if (typeof worktree !== "string" || !worktree) throw new Error(`Migrated writer ${task.id} requires a controller-created worktree`);
     const runtime = this.config.codexAppServerRuntimeFactory?.({ cwd: worktree, task })
-      ?? new CodexAppServerRuntime({ cwd: worktree });
+      ?? new CodexAppServerRuntime({
+        cwd: worktree,
+        // This adapts deterministic protocol fakes into the one supported
+        // writer runtime. It is not a legacy writer execution fallback.
+        transport: this.config.executionProviderFactory?.({ cwd: worktree })
+      });
     if (!runtime || typeof runtime.connect !== "function" || typeof runtime.startThread !== "function" || typeof runtime.startGoalTurn !== "function") {
       throw new TypeError("codexAppServerRuntimeFactory must return a Codex App Server runtime");
     }
