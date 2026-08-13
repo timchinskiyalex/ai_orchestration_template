@@ -154,7 +154,15 @@ async function runFake({ markdown, verify, stdout }) {
 
 async function runPlannerTurn({ cwd, prompt, stdout }) {
   const client = new AppServerClient({ cwd, serviceName: "thin-orchestrator-planner" });
+  const streamedMessageByItemId = new Map();
   const onNotification = (message) => {
+    const params = message?.params ?? {};
+    if (message?.method === "item/agentMessage/delta" && typeof params.itemId === "string" && typeof params.delta === "string") {
+      streamedMessageByItemId.set(params.itemId, `${streamedMessageByItemId.get(params.itemId) ?? ""}${params.delta}`);
+    }
+    if (message?.method === "item/completed" && params.item?.type === "agentMessage" && typeof params.item?.text === "string") {
+      streamedMessageByItemId.set(params.item.id ?? "completed", params.item.text);
+    }
     if (["item/started", "item/completed", "thread/tokenUsage/updated"].includes(message?.method)) stdout("[plan] activity");
   };
   client.on("notification", onNotification);
@@ -170,7 +178,8 @@ async function runPlannerTurn({ cwd, prompt, stdout }) {
     const terminal = await client.waitForTurn(threadId, turnId, 600_000);
     if (terminal?.status !== "completed") throw new Error(`planner terminal status is '${terminal?.status ?? "unknown"}'`);
     const read = await client.readThread({ threadId, includeTurns: true });
-    const text = finalAgentText(read);
+    const text = finalAgentText(read, terminal?.id ?? turnId)
+      ?? [...streamedMessageByItemId.values()].reverse().find((value) => typeof value === "string" && value.trim())?.trim();
     if (!text) throw new Error("planner final result unavailable");
     return text;
   } catch (error) {
@@ -190,10 +199,10 @@ async function runPlannerTurn({ cwd, prompt, stdout }) {
   }
 }
 
-function finalAgentText(read) {
+export function finalAgentText(read, turnId = null) {
   const turns = read?.thread?.turns ?? read?.turns ?? [];
-  const latest = turns.at(-1);
-  const items = latest?.items ?? read?.thread?.items ?? [];
+  const exact = turnId ? turns.find((turn) => turn?.id === turnId) : null;
+  const items = exact?.items ?? turns.at(-1)?.items ?? read?.thread?.items ?? [];
   for (const item of [...items].reverse()) {
     if (item?.type !== "agentMessage") continue;
     const text = item.text ?? item.content?.map?.((part) => part.text ?? "").join("") ?? item.content?.text;

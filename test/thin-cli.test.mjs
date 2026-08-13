@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { parseThinDeliverArgs, readMarkdownPackage, runThinDeliver, thinDeliverUsage } from "../scripts/thin-deliver.mjs";
+import { finalAgentText, parseThinDeliverArgs, readMarkdownPackage, runThinDeliver, thinDeliverUsage } from "../scripts/thin-deliver.mjs";
 
 function docsFixture(t) {
   const root = mkdtempSync(join(tmpdir(), "thin-cli-docs-"));
@@ -36,4 +36,12 @@ test("CLI parses source, repository and verification options", (t) => {
   });
   assert.match(readMarkdownPackage(docs), /Small project/);
   assert.match(thinDeliverUsage(), /thin-deliver/);
+});
+
+test("planner result reader chooses the exact resolved turn rather than an unrelated latest turn", () => {
+  const result = { thread: { turns: [
+    { id: "planner-turn", items: [{ type: "agentMessage", text: "{\"tasks\":[]}" }] },
+    { id: "other-turn", items: [{ type: "agentMessage", text: "not the planner result" }] },
+  ] } };
+  assert.equal(finalAgentText(result, "planner-turn"), "{\"tasks\":[]}");
 });
