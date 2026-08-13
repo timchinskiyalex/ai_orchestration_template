@@ -101,7 +101,11 @@ async function runLive({ markdown, repository, verify, repairSurface, stdout }) 
       repository,
       runtimeDir,
       markdown,
-      planner: async ({ markdown: source }) => createThinPlan({ markdown: source, runTurn: ({ prompt }) => runPlannerTurn({ cwd: repository, prompt, stdout }) }),
+      planner: async ({ markdown: source }) => createThinPlan({
+        markdown: source,
+        deliveryConstraints: buildDeliveryConstraints(verify),
+        runTurn: ({ prompt }) => runPlannerTurn({ cwd: repository, prompt, stdout }),
+      }),
       workerExecutor: async ({ task, taskKey, worktree }) => {
         const worker = await runThinAppServerWorker({
           cwd: worktree, taskKey, prompt: task.prompt, allowedPaths: task.allowedPaths,
@@ -117,6 +121,18 @@ async function runLive({ markdown, repository, verify, repairSurface, stdout }) 
   } finally {
     rmSync(runtimeDir, { recursive: true, force: true });
   }
+}
+
+function buildDeliveryConstraints(verify) {
+  const roots = [...new Set(String(verify || "").matchAll(/(?:^|[\s"'])((?:[A-Za-z0-9_-]+\/)+[A-Za-z0-9_-]+)/g).map((match) => match[1]))]
+    .filter((path) => !path.startsWith("node_modules/") && !path.startsWith("test/"));
+  return [
+    "The controller will run this final verification exactly:",
+    verify,
+    roots.length ? "The plan must create and use these product roots required by that verification:" : "",
+    ...roots.map((root) => `- ${root}`),
+    "These controller constraints override any conflicting illustrative paths in the Markdown.",
+  ].filter(Boolean).join("\n");
 }
 
 function createLiveRepair({ repository, repairSurface, stdout }) {

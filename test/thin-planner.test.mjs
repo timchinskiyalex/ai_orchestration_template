@@ -43,7 +43,22 @@ test("planner accepts up to twelve semantic tasks", () => {
 });
 
 test("planner rejects malformed JSON turn output", async () => {
-  await assert.rejects(createThinPlan({ markdown: "x", runTurn: async () => "not-json" }), /malformed JSON/);
+  let calls = 0;
+  await assert.rejects(createThinPlan({ markdown: "x", runTurn: async () => { calls += 1; return "not-json"; } }), /malformed JSON/);
+  assert.equal(calls, 2);
+});
+
+test("planner makes one correction turn before any worker plan is admitted", async () => {
+  let calls = 0; let correction = "";
+  const plan = await createThinPlan({ markdown: "x", runTurn: async ({ prompt }) => {
+    calls += 1;
+    if (calls === 1) return JSON.stringify({ tasks: [frontend, { ...backend, allowedPaths: ["apps"] }] });
+    correction = prompt;
+    return JSON.stringify({ tasks: [frontend, backend] });
+  } });
+  assert.equal(calls, 2);
+  assert.match(correction, /CONTROLLER PLAN REJECTION/);
+  assert.equal(plan.tasks.length, 2);
 });
 
 test("planner rejects unknown authority fields and ignores controller-only metadata", () => {
@@ -74,13 +89,13 @@ test("planner rejects unknown and cyclic dependencies", () => {
   ] }), /cycle/);
 });
 
-test("planner rejects path overlap for independent tasks but permits ordered tasks", () => {
-  assert.throws(() => validateThinPlanCandidate({ tasks: [frontend, { ...backend, allowedPaths: ["apps"] }] }), /overlapping allowed paths/);
-  const ordered = validateThinPlanCandidate({ tasks: [frontend, { ...backend, allowedPaths: ["apps"], dependsOn: ["Frontend"] }] });
-  assert.equal(ordered.tasks.length, 2);
+test("planner rejects ownership-path overlap even for ordered tasks", () => {
+  assert.throws(() => validateThinPlanCandidate({ tasks: [frontend, { ...backend, allowedPaths: ["apps"] }] }), /overlapping ownership paths/);
+  assert.throws(() => validateThinPlanCandidate({ tasks: [frontend, { ...backend, allowedPaths: ["apps"], dependsOn: ["Frontend"] }] }), /overlapping ownership paths/);
 });
 
 test("planner prompt is a small semantic contract", () => {
   assert.match(buildThinPlannerPrompt("# Brief"), /Do not include IDs/);
+  assert.match(buildThinPlannerPrompt("# Brief", { deliveryConstraints: "Use apps/api." }), /Use apps\/api/);
   assert.throws(() => buildThinPlannerPrompt(""), /non-empty/);
 });

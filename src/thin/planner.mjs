@@ -16,7 +16,7 @@ const CONTROLLER_FIELDS = new Set([
  * Build a deliberately small, semantic-only planning prompt. The controller
  * creates all task identifiers after validating the returned task list.
  */
-export function buildThinPlannerPrompt(markdown) {
+export function buildThinPlannerPrompt(markdown, { deliveryConstraints = "" } = {}) {
   if (typeof markdown !== "string" || markdown.trim() === "") {
     throw new TypeError("markdown must be a non-empty string");
   }
@@ -25,8 +25,15 @@ export function buildThinPlannerPrompt(markdown) {
     "Return JSON only (no prose or Markdown fence) with exactly this shape:",
     '{"tasks":[{"title":"...","prompt":"...","allowedPaths":["relative/path"],"dependsOn":["other task title"]}]}',
     "Return between 1 and 12 tasks. A dependency is another returned task title.",
-    "Keep independent tasks in non-overlapping file areas. Do not include IDs,",
+    "Every task owns an exclusive file area for the entire delivery: no allowed path may be equal to,",
+    "inside, or contain an allowed path of any other task, including dependencies. Combine work that",
+    "needs shared files into one task. Do not use a whole project root when a narrower ownership area",
+    "can be named. A downstream task must not repeat a predecessor's responsibility in different files.",
+    "Each worker prompt must be actionable only inside its allowedPaths. Never ask a worker to start a",
+    "long-running dev server such as `dotnet run`, `npm run dev`, or `next dev`.",
+    "Do not include IDs,",
     "SHA values, timestamps, budgets, source claims, evidence, or any technical metadata.",
+    deliveryConstraints ? `\n--- CONTROLLER DELIVERY CONSTRAINTS ---\n${deliveryConstraints}\n--- END CONTROLLER DELIVERY CONSTRAINTS ---` : "",
     "\n--- PROJECT MARKDOWN ---\n",
     markdown,
     "\n--- END PROJECT MARKDOWN ---",
@@ -37,11 +44,36 @@ export function buildThinPlannerPrompt(markdown) {
  * Calls the injected Codex turn runner and canonicalizes its semantic plan.
  * `runTurn` receives `{ prompt }` and must resolve to the model's text result.
  */
-export async function createThinPlan({ markdown, runTurn }) {
+export async function createThinPlan({ markdown, runTurn, deliveryConstraints = "" }) {
   if (typeof runTurn !== "function") throw new TypeError("runTurn must be a function");
-  const prompt = buildThinPlannerPrompt(markdown);
-  const result = await runTurn({ prompt });
-  return validateThinPlanCandidate(parsePlannerJson(result));
+  if (typeof deliveryConstraints !== "string") throw new TypeError("deliveryConstraints must be a string");
+  const initialPrompt = buildThinPlannerPrompt(markdown, { deliveryConstraints });
+  let prompt = initialPrompt;
+  let priorResult = "";
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await runTurn({ prompt, attempt: attempt + 1 });
+    try {
+      return validateThinPlanCandidate(parsePlannerJson(result));
+    } catch (error) {
+      if (attempt === 1) throw error;
+      priorResult = String(typeof result === "string" ? result : result?.text ?? "").slice(0, 12000);
+      prompt = buildThinPlannerCorrectionPrompt({ initialPrompt, priorResult, rejection: String(error.message ?? error) });
+    }
+  }
+  throw new Error("planner correction attempts exhausted");
+}
+
+export function buildThinPlannerCorrectionPrompt({ initialPrompt, priorResult, rejection }) {
+  return [
+    initialPrompt,
+    "\n--- CONTROLLER PLAN REJECTION ---",
+    String(rejection).slice(0, 500),
+    "\nYour previous JSON was rejected. Return a corrected replacement JSON only.",
+    "Do not split one owned module across tasks. Every task path must be exclusive across the whole plan.",
+    "\n--- PREVIOUS CANDIDATE ---",
+    priorResult,
+    "\n--- END PREVIOUS CANDIDATE ---",
+  ].join("\n");
 }
 
 export function parsePlannerJson(result) {
@@ -99,7 +131,7 @@ export function validateThinPlanCandidate(candidate) {
     });
   }
   assertAcyclic(rawTasks);
-  assertIndependentPathsDoNotOverlap(rawTasks);
+  assertTaskOwnershipPathsDoNotOverlap(rawTasks);
 
   return {
     tasks: rawTasks.map((task) => ({
@@ -155,32 +187,17 @@ function assertAcyclic(tasks) {
   for (const task of tasks) visit(task.title);
 }
 
-function assertIndependentPathsDoNotOverlap(tasks) {
-  const ancestors = new Map(tasks.map((task) => [task.title, allAncestors(task.title, tasks)]));
+function assertTaskOwnershipPathsDoNotOverlap(tasks) {
   for (let left = 0; left < tasks.length; left += 1) {
     for (let right = left + 1; right < tasks.length; right += 1) {
       const a = tasks[left]; const b = tasks[right];
-      const ordered = ancestors.get(a.title).has(b.title) || ancestors.get(b.title).has(a.title);
-      if (ordered) continue;
       for (const pathA of a.allowedPaths) for (const pathB of b.allowedPaths) {
         if (pathsOverlap(pathA, pathB)) {
-          throw new Error(`independent tasks '${a.title}' and '${b.title}' have overlapping allowed paths '${pathA}' and '${pathB}'`);
+          throw new Error(`tasks '${a.title}' and '${b.title}' have overlapping ownership paths '${pathA}' and '${pathB}'`);
         }
       }
     }
   }
-}
-
-function allAncestors(title, tasks) {
-  const byTitle = new Map(tasks.map((task) => [task.title, task]));
-  const result = new Set();
-  const collect = (current) => {
-    for (const dependency of byTitle.get(current).dependsOnTitles) {
-      if (!result.has(dependency)) { result.add(dependency); collect(dependency); }
-    }
-  };
-  collect(title);
-  return result;
 }
 
 function pathsOverlap(a, b) { return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`); }

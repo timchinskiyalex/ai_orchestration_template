@@ -15,7 +15,7 @@ async function git(cwd, args) {
 
 function safeErrorCode(error, fallback) {
   const message = String(error?.message ?? error);
-  if (/overlapping allowed paths/i.test(message)) return "overlapping_paths";
+  if (/overlapping (allowed|ownership) paths/i.test(message)) return "overlapping_paths";
   if (/unknown task/i.test(message)) return "unknown_dependency";
   if (/cycle/i.test(message)) return "dependency_cycle";
   if (/dependency/i.test(message)) return "invalid_dependency";
