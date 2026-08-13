@@ -173,6 +173,17 @@ async function runPlannerTurn({ cwd, prompt, stdout }) {
     const text = finalAgentText(read);
     if (!text) throw new Error("planner final result unavailable");
     return text;
+  } catch (error) {
+    // The thin path must make a live failure actionable on its first run.
+    // Keep the diagnostic bounded/redacted by AppServerClient and never print
+    // raw model output or source Markdown here.
+    const diagnostic = client.diagnostics();
+    const process = diagnostic?.process;
+    const state = process?.exited ? `process_exit:${process.code ?? "unknown"}` : "process_alive";
+    const detail = diagnostic?.stderrTail ? ` stderr=${safe(diagnostic.stderrTail)}` : "";
+    const wrapped = new Error(`${safe(error?.message)} (${state}${detail})`);
+    wrapped.cause = error;
+    throw wrapped;
   } finally {
     client.off("notification", onNotification);
     await client.shutdown().catch(() => {});
@@ -207,7 +218,7 @@ function emitControllerEvent(stdout, event) {
   else if (event.type === "integration_started") stdout("[integration] started");
   else if (event.type === "integration_test_passed") stdout(`[integration] test passed ${event.candidateSha}`);
   else if (event.type === "completed") stdout(`[completed] candidate ${event.candidateSha}`);
-  else if (event.type === "failure") stdout(`[failure] stage=${event.stage} code=${event.code} task=${event.taskKey ?? "-"} recovery=${event.recoveryWorktree ?? "-"}`);
+  else if (event.type === "failure") stdout(`[failure] stage=${event.stage} code=${event.code} task=${event.taskKey ?? "-"} recovery=${event.recoveryWorktree ?? "-"}${event.message ? ` message=${safe(event.message)}` : ""}`);
 }
 
 async function runVerification({ worktree, command }) {
