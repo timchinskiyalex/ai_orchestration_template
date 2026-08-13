@@ -87,10 +87,16 @@ export function validateThinPlanCandidate(candidate) {
   });
 
   const titleToId = new Map(rawTasks.map((task, index) => [task.title, controllerTaskId(task.title, index)]));
+  const idToTitle = new Map([...titleToId].map(([title, id]) => [id, title]));
   for (const task of rawTasks) {
-    for (const dependency of task.dependsOnTitles) {
-      if (!titleToId.has(dependency)) throw new Error(`task '${task.title}' depends on unknown task '${dependency}'`);
-    }
+    task.dependsOnTitles = task.dependsOnTitles.map((dependency) => {
+      if (titleToId.has(dependency)) return dependency;
+      // A model may echo the deterministic controller ID displayed by a
+      // previous planning convention. Accept it only when it is exactly the
+      // ID minted for one of these returned tasks; never accept a foreign ID.
+      if (idToTitle.has(dependency)) return idToTitle.get(dependency);
+      throw new Error(`task '${task.title}' depends on unknown task '${dependency}'`);
+    });
   }
   assertAcyclic(rawTasks);
   assertIndependentPathsDoNotOverlap(rawTasks);

@@ -23,6 +23,15 @@ test("planner maps title dependencies to controller IDs", () => {
   assert.deepEqual(plan.tasks[1].dependsOn, [plan.tasks[0].id]);
 });
 
+test("planner canonicalizes an exact controller-generated dependency ID back to its task", () => {
+  const first = validateThinPlanCandidate({ tasks: [frontend, backend] }).tasks[0];
+  const plan = validateThinPlanCandidate({ tasks: [
+    frontend,
+    { ...backend, dependsOn: [first.id] },
+  ] });
+  assert.deepEqual(plan.tasks[1].dependsOn, [plan.tasks[0].id]);
+});
+
 test("planner accepts up to twelve semantic tasks", () => {
   const tasks = Array.from({ length: 12 }, (_, index) => ({
     title: `Task ${index + 1}`,
