@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -95,6 +95,7 @@ test("quota-free compatibility harness passes only from exact cwd, actual diff, 
     assert.ok(runtime);
     assert.deepEqual(runtime.calls, ["connect", "thread", "turn", "observe", "reconcile", "shutdown"]);
     assert.equal(result.taskId, CODEX_RUNTIME_PROBE_TASK_ID);
+    assert.deepEqual(result.cleanup, { state: "completed" });
     assert.deepEqual(result.changedPaths, [CODEX_RUNTIME_PROBE_ALLOWED_PATH]);
     assert.equal(result.artifact.baseSha, result.baseSha);
     assert.equal(runtime.calls.includes("reconcile"), true, "fake runtime exercises the terminal receipt path");
@@ -107,6 +108,84 @@ test("quota-free compatibility harness passes only from exact cwd, actual diff, 
       "[probe] repository created", "[probe] worktree created", "[probe] runtime connected", "[probe] turn started",
       "[probe] durable terminal reconciled", "[probe] diff validated", "[probe] controller artifact committed", "[probe] probe passed"
     ]);
+  } finally { rmSync(reportsRoot, { recursive: true, force: true }); }
+});
+
+test("successful artifact shuts down the runtime before disposable cleanup", async () => {
+  const reportsRoot = mkdtempSync(join(tmpdir(), "codex-runtime-probe-order-test-reports-"));
+  let runtime = null;
+  const sequence = [];
+  try {
+    const result = await runCodexRuntimeProbe({
+      args: [CODEX_RUNTIME_PROBE_CONFIRMATION], reportsRoot,
+      runtimeFactory: ({ cwd }) => {
+        runtime = new QuotaFreeRuntime({ cwd });
+        const shutdown = runtime.shutdown.bind(runtime);
+        runtime.shutdown = async () => { sequence.push("shutdown"); await shutdown(); };
+        return runtime;
+      },
+      cleanup: ({ root, worktree }) => {
+        sequence.push("cleanup");
+        assert.equal(runtime.calls.includes("shutdown"), true);
+        rmSync(root, { recursive: true, force: true });
+        assert.equal(existsSync(worktree), false);
+      }
+    });
+    assert.deepEqual(sequence, ["shutdown", "cleanup"]);
+    assert.deepEqual(result.cleanup, { state: "completed" });
+    assert.deepEqual(runtime.calls.filter((call) => call === "shutdown"), ["shutdown"]);
+  } finally { rmSync(reportsRoot, { recursive: true, force: true }); }
+});
+
+test("cleanup failure after a successful artifact preserves the root without creating a failure report", async () => {
+  const reportsRoot = mkdtempSync(join(tmpdir(), "codex-runtime-probe-preserved-test-reports-"));
+  let runtime = null;
+  const logs = [];
+  try {
+    const result = await runCodexRuntimeProbe({
+      args: [CODEX_RUNTIME_PROBE_CONFIRMATION], reportsRoot, log: (line) => logs.push(line),
+      runtimeFactory: ({ cwd }) => { runtime = new QuotaFreeRuntime({ cwd }); return runtime; },
+      cleanup: () => { throw new Error("Permission denied while removing disposable worktree"); }
+    });
+    assert.equal(result.status, "passed");
+    assert.equal(result.cleanup.state, "preserved");
+    assert.match(result.cleanup.reason, /Permission denied/);
+    assert.match(result.cleanup.recoveryCommand, /git -C/);
+    assert.notEqual(result.artifact.headSha, result.baseSha, "cleanup failure does not mask the committed artifact");
+    assert.deepEqual(runtime.calls.filter((call) => call === "shutdown"), ["shutdown"]);
+    const persisted = JSON.parse(readFileSync(result.reportPath, "utf8"));
+    assert.equal(persisted.status, "passed");
+    assert.equal(persisted.cleanup.state, "preserved");
+    assert.deepEqual(readdirSync(reportsRoot), [result.reportPath.split(/[\\/]/).at(-1)]);
+    assert.equal(logs.includes("[probe] cleanup preserved"), true);
+    assert.equal(logs.includes("[probe] probe passed"), true);
+    assert.equal(logs.includes("[probe] probe failed"), false);
+    rmSync(runtime.cwd.replace(/\\writer-worktree$/, ""), { recursive: true, force: true });
+  } finally { rmSync(reportsRoot, { recursive: true, force: true }); }
+});
+
+test("failure before the artifact remains failed and preserves disposable-root recovery", async () => {
+  const reportsRoot = mkdtempSync(join(tmpdir(), "codex-runtime-probe-failure-test-reports-"));
+  let failure = null;
+  let runtime = null;
+  try {
+    await assert.rejects(
+      () => runCodexRuntimeProbe({
+        args: [CODEX_RUNTIME_PROBE_CONFIRMATION], reportsRoot,
+        runtimeFactory: ({ cwd }) => {
+          runtime = new QuotaFreeRuntime({ cwd });
+          runtime.startGoalTurn = async () => { throw new Error("turn failed before artifact"); };
+          return runtime;
+        }
+      }),
+      (error) => { failure = error; return true; }
+    );
+    assert.equal(failure.probeReport.status, "failed");
+    assert.match(failure.probeReport.stage, /turn started/);
+    assert.equal(existsSync(failure.probeReport.preservedDisposableRoot), true);
+    assert.match(failure.probeReport.recoveryCommand, /git -C/);
+    assert.deepEqual(runtime.calls.filter((call) => call === "shutdown"), ["shutdown"]);
+    rmSync(failure.probeReport.preservedDisposableRoot, { recursive: true, force: true });
   } finally { rmSync(reportsRoot, { recursive: true, force: true }); }
 });
 

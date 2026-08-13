@@ -118,6 +118,22 @@ function persistProbeReport(report, reportsRoot = null) {
   return path;
 }
 
+function updatePersistedProbeReport(path, report) {
+  writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+}
+
+function cleanupRecoveryCommand({ root, worktree }) {
+  return root && worktree ? `git -C "${root}" worktree remove --force "${worktree}"` : null;
+}
+
+function preservedCleanup(error, repository) {
+  return {
+    state: "preserved",
+    reason: redact(error?.message || "Disposable probe cleanup could not be completed."),
+    recoveryCommand: cleanupRecoveryCommand(repository)
+  };
+}
+
 export function cleanupPassedCodexRuntimeProbeRoot({ root, worktree }) {
   if (!root || !worktree || !resolve(root).startsWith(`${resolve(tmpdir())}${sep}`) || !resolve(root).includes("codex-runtime-probe-")) throw new Error("Refusing to clean a non-disposable Codex runtime probe root");
   if (existsSync(worktree)) git(root, ["worktree", "remove", "--force", worktree]);
@@ -134,6 +150,12 @@ export async function runCodexRuntimeProbe({ args = [], runtimeFactory = ({ cwd 
   let resolvedTurnId = null;
   let lifecycleCandidate = null;
   let durableTerminal = null;
+  let shutdownStarted = false;
+  const shutdownRuntime = async () => {
+    if (shutdownStarted || !runtime?.shutdown) return;
+    shutdownStarted = true;
+    await runtime.shutdown();
+  };
   try {
     repository = createCodexRuntimeProbeRepository();
     createCodexRuntimeProbeWorktree(repository);
@@ -167,7 +189,16 @@ export async function runCodexRuntimeProbe({ args = [], runtimeFactory = ({ cwd 
     stage = "controller artifact committed"; log(`[probe] ${stage}`);
     const report = { schemaVersion: 1, kind: "CodexRuntimeProbeReport", status: "passed", runtimePath: CODEX_RUNTIME_PROBE_RUNTIME_PATH, taskId: CODEX_RUNTIME_PROBE_TASK_ID, baseSha: repository.baseSha, threadId, requestedTurnId, resolvedTurnId, changedPaths, artifact: { ...artifact, path: finalized.path } };
     const reportPath = persistProbeReport(report, reportsRoot);
-    cleanup({ root: repository.root, worktree: repository.worktree });
+    try {
+      await shutdownRuntime();
+      await cleanup({ root: repository.root, worktree: repository.worktree });
+      report.cleanup = { state: "completed" };
+    } catch (error) {
+      report.cleanup = preservedCleanup(error, repository);
+      log("[probe] cleanup preserved");
+      if (report.cleanup.recoveryCommand) log(`[probe] recovery: ${report.cleanup.recoveryCommand}`);
+    }
+    updatePersistedProbeReport(reportPath, report);
     stage = "probe passed"; log(`[probe] ${stage}`);
     return { ...report, reportPath };
   } catch (error) {
@@ -180,6 +211,6 @@ export async function runCodexRuntimeProbe({ args = [], runtimeFactory = ({ cwd 
     if (report.recoveryCommand) log(`[probe] recovery: ${report.recoveryCommand}`);
     throw Object.assign(new Error(report.error.message), { probeReport: report, reportPath });
   } finally {
-    await runtime?.shutdown?.().catch(() => {});
+    await shutdownRuntime().catch(() => {});
   }
 }
