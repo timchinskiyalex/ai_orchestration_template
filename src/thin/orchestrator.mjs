@@ -251,6 +251,9 @@ export async function runThinOrchestrator({
   }
 
   if (verificationFailure) {
+    if (verificationFailure?.noRepair) {
+      return fail({ emit, stage: "integration", code: "verification_environment_failed", recoveryWorktree: verification.worktree, error: verificationFailure });
+    }
     if (!repair) {
       return fail({ emit, stage: "integration", code: "verification_failed", recoveryWorktree: verification.worktree, error: verificationFailure });
     }

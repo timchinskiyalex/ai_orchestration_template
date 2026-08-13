@@ -143,6 +143,7 @@ async function runCandidateRepair({ repository, candidateSha, verify, repairSurf
       stdout(`[completed] candidate ${worktree.baseSha}`);
       return { ok: true, candidateSha: worktree.baseSha };
     } catch (failure) {
+      if (failure?.noRepair) throw failure;
       stdout("[repair] started");
       const repair = createLiveRepair({ repository, repairSurface, stdout });
       const repaired = await repair({ verificationFailure: failure, candidateSha: worktree.baseSha, worktree: worktree.worktree, artifacts: [], attempts: 0 });
@@ -353,13 +354,22 @@ export function npmPrefixesRequiredBy(command) {
 export async function runVerification({ worktree, command, processRunner = null }) {
   const runner = processRunner ?? (async ({ executable, args, cwd, timeout }) => exec(executable, args, { cwd, encoding: "utf8", timeout }));
   for (const prefix of npmPrefixesRequiredBy(command)) {
-    const lockfile = join(worktree, prefix, "package-lock.json");
+    const packageDirectory = resolve(worktree, prefix);
+    const worktreeRoot = resolve(worktree);
+    if (!packageDirectory.startsWith(`${worktreeRoot}${process.platform === "win32" ? "\\" : "/"}`)) {
+      throw new Error(`verification npm prefix escapes the candidate worktree: '${prefix}'`);
+    }
+    const lockfile = join(packageDirectory, "package-lock.json");
     if (!existsSync(lockfile)) throw new Error(`verification requires package-lock.json for npm prefix '${prefix}'`);
     try {
-      await runner({ executable: process.platform === "win32" ? "npm.cmd" : "npm", args: ["ci", "--prefix", prefix], cwd: worktree, timeout: 180_000 });
+      const npmCall = process.platform === "win32"
+        ? { executable: process.env.ComSpec ?? "cmd.exe", args: ["/d", "/s", "/c", "npm ci"] }
+        : { executable: "npm", args: ["ci"] };
+      await runner({ ...npmCall, cwd: packageDirectory, timeout: 180_000 });
     } catch (error) {
       const wrapped = new Error(`verification dependency install failed for '${prefix}': ${safe(error?.message)}`);
       wrapped.output = [error?.stdout, error?.stderr].filter((value) => typeof value === "string" && value.trim()).join("\n");
+      wrapped.noRepair = true;
       throw wrapped;
     }
   }

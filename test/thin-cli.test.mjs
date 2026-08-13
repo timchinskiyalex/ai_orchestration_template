@@ -56,7 +56,9 @@ test("verification installs lockfile-pinned npm dependencies before the declared
   writeFileSync(join(root, "apps", "web", "package-lock.json"), "{}");
   const calls = [];
   await runVerification({ worktree: root, command: "npm --prefix apps/web run build", processRunner: async (call) => { calls.push(call); } });
-  assert.deepEqual(calls[0].args, ["ci", "--prefix", "apps/web"]);
+  if (process.platform === "win32") assert.equal(calls[0].args.at(-1), "npm ci");
+  else assert.deepEqual(calls[0].args, ["ci"]);
+  assert.equal(calls[0].cwd, join(root, "apps", "web"));
   assert.equal(calls[1].args.at(-1), "npm --prefix apps/web run build");
   assert.deepEqual(npmPrefixesRequiredBy("dotnet test x && npm --prefix apps/web run build"), ["apps/web"]);
 });
