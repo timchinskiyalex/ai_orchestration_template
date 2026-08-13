@@ -10,14 +10,15 @@ const MAX_MARKDOWN_BYTES = 2_000_000;
 const BASELINE_IDENTITY = { name: "Thin Orchestrator", email: "thin-orchestrator@local" };
 
 export function thinNewProjectUsage() {
-  return "Usage: node scripts/thin-new-project.mjs --target <new-absolute-directory> --docs <absolute-markdown-file-or-directory> --verify <command> --confirm-spend-quota [--repair-surface <path,path>] [--remote <url> --branch <branch>]";
+  return "Usage: node scripts/thin-new-project.mjs --target <new-absolute-directory> --docs <absolute-markdown-file-or-directory> --verify <command> --confirm-spend-quota [--acceptance --repair-surface <path,path>] [--remote <url> --branch <branch>]";
 }
 
 export function parseThinNewProjectArgs(argv) {
-  const options = { target: null, docs: null, verify: null, repairSurface: null, remote: null, branch: null, confirm: false };
+  const options = { target: null, docs: null, verify: null, repairSurface: null, remote: null, branch: null, confirm: false, acceptance: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--confirm-spend-quota") options.confirm = true;
+    else if (flag === "--acceptance") options.acceptance = true;
     else if (["--target", "--docs", "--verify", "--repair-surface", "--remote", "--branch"].includes(flag)) {
       const value = argv[++index];
       if (typeof value !== "string" || value.trim() === "" || value.startsWith("--")) throw new Error(`${flag} requires a value`);
@@ -40,7 +41,9 @@ export async function createThinNewProject({
   remote = null,
   branch = null,
   confirm = false,
+  acceptance = false,
   deliveryRunner = defaultDeliveryRunner,
+  acceptanceRunner = defaultAcceptanceRunner,
   gitRunner = defaultGitRunner,
   stdout = console.log,
 } = {}) {
@@ -50,7 +53,8 @@ export async function createThinNewProject({
   const normalizedRepairSurface = repairSurface == null ? null : parseRepairSurface(repairSurface);
   validateRemoteOptions({ remote, branch });
   if (confirm !== true) throw new Error("--confirm-spend-quota is required before thin delivery");
-  if (typeof deliveryRunner !== "function" || typeof gitRunner !== "function") throw new TypeError("deliveryRunner and gitRunner must be functions");
+  if (acceptance === true && !normalizedRepairSurface?.length) throw new Error("--acceptance requires an explicit --repair-surface");
+  if (typeof deliveryRunner !== "function" || typeof acceptanceRunner !== "function" || typeof gitRunner !== "function") throw new TypeError("deliveryRunner, acceptanceRunner, and gitRunner must be functions");
   if (lstatSync(docsPath).isDirectory() && isInside(targetPath, docsPath)) {
     throw new Error("target must not be inside the documentation source path");
   }
@@ -60,7 +64,10 @@ export async function createThinNewProject({
     mkdirSync(targetPath);
     const copied = copyMarkdownSnapshot({ source: docsPath, destination: join(targetPath, "docs", "source") });
     if (!copied.length) throw new Error("docs must contain at least one Markdown file");
-    await gitRunner({ cwd: targetPath, args: ["init"] });
+    // A remotely published project must start on the explicit, non-protected
+    // branch selected by the caller.  It is never renamed to, or pushed to,
+    // main after delivery/acceptance has begun.
+    await gitRunner({ cwd: targetPath, args: remote ? ["init", `--initial-branch=${branch}`] : ["init"] });
     await gitRunner({ cwd: targetPath, args: ["add", "--", "docs/source"] });
     await gitRunner({ cwd: targetPath, args: [
       "-c", `user.name=${BASELINE_IDENTITY.name}`,
@@ -82,14 +89,35 @@ export async function createThinNewProject({
       return failed("delivery_failed", targetPath, baselineSha, stdout);
     }
 
-    if (remote) {
-      await gitRunner({ cwd: targetPath, args: ["branch", "-M", branch] });
-      await gitRunner({ cwd: targetPath, args: ["remote", "add", "origin", remote] });
-      await gitRunner({ cwd: targetPath, args: ["push", "--set-upstream", "origin", branch] });
-      stdout(`[remote] pushed ${branch}`);
+    let acceptedCandidateSha = delivery.candidateSha;
+    let acceptanceCandidateBranch = null;
+    if (acceptance === true) {
+      const accepted = await acceptanceRunner({
+        repository: targetPath,
+        docs: join(targetPath, "docs", "source"),
+        candidateSha: delivery.candidateSha,
+        verify: verificationCommand,
+        repairSurface: normalizedRepairSurface,
+        confirm: true,
+        stdout,
+      });
+      if (!accepted?.ok || !isGitSha(accepted.candidateSha)) return failed("acceptance_failed", targetPath, baselineSha, stdout);
+      acceptedCandidateSha = accepted.candidateSha;
+      acceptanceCandidateBranch = accepted.candidateBranch == null ? null : validateAcceptanceCandidateBranch(accepted.candidateBranch);
+      stdout(`[acceptance] accepted ${acceptedCandidateSha}${acceptanceCandidateBranch ? ` branch=${acceptanceCandidateBranch}` : ""}`);
     }
-    stdout(`[completed] candidate ${delivery.candidateSha}`);
-    return { ok: true, target: targetPath, baselineSha, candidateSha: delivery.candidateSha, copiedMarkdown: copied, branch: branch ?? null };
+
+    if (remote) {
+      await gitRunner({ cwd: targetPath, args: ["remote", "add", "origin", remote] });
+      const pushBranch = acceptanceCandidateBranch ?? branch;
+      // In the repaired case `pushBranch` is the controller-created branch
+      // whose local ref was verified by thin-accept.  Do not infer HEAD and
+      // do not alter the initial branch.
+      await gitRunner({ cwd: targetPath, args: ["push", "--set-upstream", "origin", `${pushBranch}:${pushBranch}`] });
+      stdout(`[remote] pushed ${pushBranch}`);
+    }
+    stdout(`[completed] candidate ${acceptedCandidateSha}`);
+    return { ok: true, target: targetPath, baselineSha, candidateSha: acceptedCandidateSha, copiedMarkdown: copied, branch: acceptanceCandidateBranch ?? branch ?? null };
   } catch (error) {
     return failed("new_project_failed", targetPath, baselineSha, stdout, error);
   }
@@ -194,6 +222,14 @@ function validateRemoteOptions({ remote, branch }) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(branch) || branch.includes("..") || branch.includes("//") || branch.endsWith("/")) {
     throw new Error("branch must be an explicit safe Git branch name");
   }
+  if (["main", "master"].includes(branch.toLowerCase())) throw new Error("remote branch must not be main or master");
+}
+
+function validateAcceptanceCandidateBranch(value) {
+  if (typeof value !== "string" || !/^thin\/acceptance-candidate-[A-Za-z0-9._-]+(?:-[A-Za-z0-9._-]+)*$/.test(value)) {
+    throw new Error("acceptance candidate branch is not a verified controller-owned branch");
+  }
+  return value;
 }
 
 function isInside(child, parent) {
@@ -230,6 +266,20 @@ async function defaultDeliveryRunner({ repository, docs, verify, repairSurface, 
   });
   const candidate = [...output].reverse().map((line) => /^\[completed\] candidate ([0-9a-f]{7,64})$/i.exec(line)?.[1]).find(Boolean) ?? null;
   return { ok: code === 0 && isGitSha(candidate), candidateSha: candidate };
+}
+
+async function defaultAcceptanceRunner({ repository, docs, candidateSha, verify, repairSurface, confirm, stdout }) {
+  const { runThinAccept } = await import("./thin-accept.mjs");
+  const output = [];
+  const argv = ["--repo", repository, "--docs", docs, "--candidate", candidateSha, "--verify", verify, "--repair-surface", repairSurface.join(",")];
+  if (confirm) argv.push("--confirm-spend-quota");
+  const code = await runThinAccept({
+    argv,
+    stdout: (line) => { output.push(String(line)); stdout(line); },
+    stderr: (line) => { output.push(String(line)); stdout(line); },
+  });
+  const completed = [...output].reverse().map((line) => /^\[completed\] accepted candidate ([0-9a-f]{7,64})(?: branch=(thin\/acceptance-candidate-[A-Za-z0-9._-]+(?:-[A-Za-z0-9._-]+)*))?$/i.exec(line)).find(Boolean);
+  return { ok: code === 0 && Boolean(completed), candidateSha: completed?.[1] ?? null, candidateBranch: completed?.[2] ?? null };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
