@@ -4,12 +4,65 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseThinAcceptArgs, runThinAccept, thinAcceptUsage } from "../scripts/thin-accept.mjs";
+import { EventEmitter } from "node:events";
+import { parseThinAcceptArgs, runSemanticAuditTurn, runThinAccept, ThinAcceptanceAuditRuntimeError, thinAcceptUsage } from "../scripts/thin-accept.mjs";
 
 test("thin acceptance CLI parses only explicit candidate and repair inputs", () => {
   const parsed = parseThinAcceptArgs(["--repo", "repo", "--docs", "docs", "--candidate", "abcdef1", "--verify", "node --test", "--repair-surface", "apps/api, apps/web", "--confirm-spend-quota"]);
-  assert.deepEqual(parsed, { repo: "repo", docs: "docs", candidate: "abcdef1", verify: "node --test", repairSurface: ["apps/api", "apps/web"], confirm: true, help: false });
+  assert.deepEqual(parsed, { repo: "repo", docs: "docs", candidate: "abcdef1", verify: "node --test", repairSurface: ["apps/api", "apps/web"], auditTimeoutMs: 180_000, confirm: true, help: false });
   assert.match(thinAcceptUsage(), /thin-accept/);
+});
+
+test("acceptance audit uses the thin runtime receipt and resolved turn alias", async () => {
+  const runtime = new FakeAcceptanceRuntime({ alias: true });
+  const text = await runSemanticAuditTurn({
+    cwd: runtime.cwd,
+    prompt: "Return JSON.",
+    stdout: () => {},
+    timeoutMs: 1_000,
+    runtimeFactory: () => runtime
+  });
+  assert.equal(text, '{"results":[]}');
+  assert.deepEqual(runtime.calls.map(([method]) => method), ["connect", "startThread", "startGoalTurn", "observeTerminal", "reconcileTerminal", "readFinalResult", "shutdown"]);
+  assert.deepEqual(runtime.calls.find(([method]) => method === "reconcileTerminal")[1], { threadId: "audit-thread", turnId: "audit-requested", timeoutMs: 1_000 });
+  assert.deepEqual(runtime.calls.find(([method]) => method === "readFinalResult")[1], { threadId: "audit-thread", turnId: "audit-resolved" });
+  assert.equal(runtime.closed, true);
+});
+
+test("acceptance audit emits bounded heartbeats and cancels then shuts down on timeout", async () => {
+  const runtime = new FakeAcceptanceRuntime({ timeout: true });
+  const output = [];
+  await assert.rejects(
+    runSemanticAuditTurn({ cwd: runtime.cwd, prompt: "Return JSON.", stdout: (line) => output.push(line), timeoutMs: 1_000, heartbeatMs: 5, runtimeFactory: () => runtime }),
+    (error) => error instanceof ThinAcceptanceAuditRuntimeError && error.code === "timeout"
+  );
+  assert.ok(output.some((line) => line.startsWith("[acceptance] heartbeat thread=audit-thread turn=audit-requested")));
+  assert.equal(runtime.calls.some(([method]) => method === "cancel"), true);
+  assert.equal(runtime.closed, true);
+});
+
+test("acceptance failure report persists only safe runtime terminal diagnostics", async (t) => {
+  const fixture = createRepositoryFixture(t);
+  const output = [];
+  const code = await runThinAccept({
+    argv: acceptanceArgv(fixture), stdout: (line) => output.push(line), stderr: (line) => output.push(line),
+    dependencies: {
+      createRuntimeDir: () => fixture.runtime,
+      acceptanceRuntimeFactory: ({ cwd }) => new FakeAcceptanceRuntime({ cwd, timeout: true, diagnostics: "process exited; SECRET=do-not-leak" }),
+      acceptanceHeartbeatMs: 5
+    }
+  });
+  assert.equal(code, 1);
+  const reportPath = output.find((line) => line.startsWith("[acceptance] report ")).slice("[acceptance] report ".length);
+  const report = JSON.parse(readFileSync(reportPath, "utf8"));
+  assert.equal(report.code, "audit_execution_failed");
+  assert.deepEqual(report.auditRuntime, {
+    threadId: "audit-thread", requestedTurnId: "audit-requested", resolvedTurnId: null,
+    runtimeStage: "observe_terminal", code: "timeout", errorClass: "runtime",
+    process: "process exited; SECRET=[redacted]", reconnectRequired: false
+  });
+  // The persisted report is the contract; the fake runtime's cancellation
+  // and shutdown behavior is covered directly above.
 });
 
 test("accepted repair remains on an explicit candidate branch without mutating the source branch", async (t) => {
@@ -121,4 +174,32 @@ async function cleanupPreservedWorktree(repository, worktree, branch = null) {
 
 function git(cwd, args) {
   return String(execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" })).trim();
+}
+
+class FakeAcceptanceRuntime extends EventEmitter {
+  constructor({ cwd = "D:/controller-owned/acceptance-worktree", alias = false, timeout = false, diagnostics = "process healthy" } = {}) {
+    super();
+    this.cwd = cwd;
+    this.alias = alias; this.timeout = timeout; this.diagnosticText = diagnostics; this.calls = []; this.closed = false;
+  }
+  async connect() { this.calls.push(["connect"]); }
+  async startThread(data) { this.calls.push(["startThread", data]); return { threadId: "audit-thread" }; }
+  async startGoalTurn(data) { this.calls.push(["startGoalTurn", data]); return { threadId: "audit-thread", turnId: "audit-requested" }; }
+  async observeTerminal(data) {
+    this.calls.push(["observeTerminal", data]);
+    if (this.timeout) { await new Promise((resolve) => setTimeout(resolve, 15)); throw new Error("timed out"); }
+    return { kind: "worker_terminal_candidate", threadId: "audit-thread", turnId: this.alias ? "audit-resolved" : "audit-requested", terminalClass: "completed" };
+  }
+  async reconcileTerminal(data) {
+    this.calls.push(["reconcileTerminal", data]);
+    const resolvedTurnId = this.alias ? "audit-resolved" : "audit-requested";
+    return {
+      kind: "worker_completed", threadId: "audit-thread", turnId: resolvedTurnId, terminalClass: "completed",
+      terminalReceipt: { schemaVersion: 1, kind: "AppServerTerminalReceipt", source: "turn_completed", threadId: "audit-thread", requestedTurnId: "audit-requested", resolvedTurnId, terminalClass: "completed", correlationId: "audit-correlation" }
+    };
+  }
+  async readFinalResult(data) { this.calls.push(["readFinalResult", data]); return { threadId: "audit-thread", turnId: data.turnId, resultText: '{"results":[]}' }; }
+  async cancel(data) { this.calls.push(["cancel", data]); return { kind: "worker_cancelled" }; }
+  async diagnostics() { this.calls.push(["diagnostics"]); return { diagnostics: this.diagnosticText, reconnectRequired: false }; }
+  async shutdown() { this.calls.push(["shutdown"]); this.closed = true; }
 }

@@ -98,7 +98,7 @@ export async function runThinAcceptance({ markdown, candidateSha, audit, verify,
     emit("audit_started", { phase, candidateSha: currentSha });
     let parsed;
     try { parsed = await audit({ criteria, candidateSha: currentSha, prompt: buildThinAcceptancePrompt({ criteria, candidateSha: currentSha }), phase }); }
-    catch (error) { return { ok: false, code: "audit_execution_failed", detail: safeError(error) }; }
+    catch (error) { return { ok: false, code: "audit_execution_failed", detail: safeError(error), auditRuntime: safeAuditRuntime(error?.acceptanceAuditDiagnostic) }; }
     try {
       const report = validateThinAcceptanceCandidate(typeof parsed === "string" ? JSON.parse(parsed) : parsed, criteria);
       emit("audit_completed", { phase, passing: report.passing });
@@ -118,7 +118,7 @@ export async function runThinAcceptance({ markdown, candidateSha, audit, verify,
   };
 
   let audited = await auditOnce("initial");
-  if (!audited.ok) return blocked(audited.code, { candidateSha: currentSha, sourceSnapshot, criteria, events, detail: audited.detail });
+  if (!audited.ok) return blocked(audited.code, { candidateSha: currentSha, sourceSnapshot, criteria, events, detail: audited.detail, auditRuntime: audited.auditRuntime });
   let verified = await verifyOnce("initial");
   if (audited.report.passing && verified.ok) return accepted({ candidateSha: currentSha, sourceSnapshot, criteria, report: audited.report, verification: verified, repaired: false, events });
   if (!repair) return blocked("acceptance_unverified", { candidateSha: currentSha, sourceSnapshot, criteria, report: audited.report, verification: verified, events });
@@ -142,7 +142,7 @@ export async function runThinAcceptance({ markdown, candidateSha, audit, verify,
   emit("repair_completed", { candidateSha: currentSha, attempts: repaired.attempts ?? 1 });
 
   audited = await auditOnce("after_repair");
-  if (!audited.ok) return blocked(audited.code, { candidateSha: currentSha, sourceSnapshot, criteria, events, detail: audited.detail });
+  if (!audited.ok) return blocked(audited.code, { candidateSha: currentSha, sourceSnapshot, criteria, events, detail: audited.detail, auditRuntime: audited.auditRuntime });
   verified = await verifyOnce("after_repair");
   if (!audited.report.passing || !verified.ok) return blocked("acceptance_unverified_after_repair", { candidateSha: currentSha, sourceSnapshot, criteria, report: audited.report, verification: verified, events });
   return accepted({ candidateSha: currentSha, sourceSnapshot, criteria, report: audited.report, verification: verified, repaired: true, events });
@@ -151,11 +151,11 @@ export async function runThinAcceptance({ markdown, candidateSha, audit, verify,
 function accepted({ candidateSha, sourceSnapshot, criteria, report, verification, repaired, events }) {
   return Object.freeze({ ok: true, state: "completed_spec_verified", candidateSha, repaired, report: boundedReport({ state: "completed_spec_verified", candidateSha, sourceSnapshot, criteria, results: report.results, verification }), events });
 }
-function blocked(code, { candidateSha, sourceSnapshot = null, criteria, report = null, verification = null, events, detail = null }) {
-  return Object.freeze({ ok: false, state: "blocked", code, candidateSha, report: boundedReport({ state: "blocked", code, candidateSha, sourceSnapshot, criteria, results: report?.results ?? [], verification, detail }), events });
+function blocked(code, { candidateSha, sourceSnapshot = null, criteria, report = null, verification = null, events, detail = null, auditRuntime = null }) {
+  return Object.freeze({ ok: false, state: "blocked", code, candidateSha, report: boundedReport({ state: "blocked", code, candidateSha, sourceSnapshot, criteria, results: report?.results ?? [], verification, detail, auditRuntime }), events });
 }
-function boundedReport({ state, code = null, candidateSha, sourceSnapshot, criteria, results, verification, detail = null }) {
-  return Object.freeze({ schemaVersion: 1, kind: "ThinAcceptanceReport", state, code, candidateSha, sourceSnapshot: sourceSnapshot ? { sourceDigest: sourceSnapshot.sourceDigest, lineCount: sourceSnapshot.lineCount } : null, criterionCount: criteria.length, criteria: criteria.map((criterion) => ({ requirementId: criterion.requirementId, criterionId: criterion.criterionId, sourceRef: criterion.sourceRef })), results: results.map((row) => ({ criterionId: row.criterionId, status: row.status, reason: bounded(row.reason) })), verification: verification?.ok ? { verificationId: verification.verificationId, candidateSha: verification.candidateSha, status: "pass" } : { verificationId: verification?.verificationId ?? null, candidateSha, status: "failed" }, detail: detail ? bounded(detail) : null });
+function boundedReport({ state, code = null, candidateSha, sourceSnapshot, criteria, results, verification, detail = null, auditRuntime = null }) {
+  return Object.freeze({ schemaVersion: 1, kind: "ThinAcceptanceReport", state, code, candidateSha, sourceSnapshot: sourceSnapshot ? { sourceDigest: sourceSnapshot.sourceDigest, lineCount: sourceSnapshot.lineCount } : null, criterionCount: criteria.length, criteria: criteria.map((criterion) => ({ requirementId: criterion.requirementId, criterionId: criterion.criterionId, sourceRef: criterion.sourceRef })), results: results.map((row) => ({ criterionId: row.criterionId, status: row.status, reason: bounded(row.reason) })), verification: verification?.ok ? { verificationId: verification.verificationId, candidateSha: verification.candidateSha, status: "pass" } : { verificationId: verification?.verificationId ?? null, candidateSha, status: "failed" }, detail: detail ? bounded(detail) : null, auditRuntime: safeAuditRuntime(auditRuntime) });
 }
 function repairContext(report, verification) {
   const gaps = report.results.filter((row) => row.status !== "pass").map((row) => `${row.criterionId}: ${row.status}: ${row.reason}`);
@@ -164,5 +164,15 @@ function repairContext(report, verification) {
 }
 function bounded(value) { return String(value ?? "").replace(/(?:authorization|bearer|token|password)\s*[:=]\s*\S+/ig, "$1=[REDACTED]").replace(/[\r\n]+/g, " ").slice(0, 2_000); }
 function safeError(error) { return bounded(error?.message ?? error); }
+function safeAuditRuntime(value) {
+  if (!value || typeof value !== "object") return null;
+  const safeId = (item) => typeof item === "string" && item.length <= 512 ? item : null;
+  return Object.freeze({
+    threadId: safeId(value.threadId), requestedTurnId: safeId(value.requestedTurnId), resolvedTurnId: safeId(value.resolvedTurnId),
+    runtimeStage: safeId(value.runtimeStage), code: safeId(value.code), errorClass: safeId(value.errorClass),
+    process: typeof value.process === "string" ? bounded(value.process) : null,
+    reconnectRequired: value.reconnectRequired === true
+  });
+}
 function isPlainObject(value) { return value != null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function sameKeys(value, keys) { const actual = Object.keys(value).sort(); return actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index]); }
