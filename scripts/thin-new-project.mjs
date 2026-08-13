@@ -10,20 +10,23 @@ const MAX_MARKDOWN_BYTES = 2_000_000;
 const BASELINE_IDENTITY = { name: "Thin Orchestrator", email: "thin-orchestrator@local" };
 
 export function thinNewProjectUsage() {
-  return "Usage: node scripts/thin-new-project.mjs --target <new-absolute-directory> --docs <absolute-markdown-file-or-directory> --verify <command> --confirm-spend-quota [--acceptance --repair-surface <path,path>] [--security] [--remote <url> --branch <branch>]";
+  return "Usage: node scripts/thin-new-project.mjs --target <new-absolute-directory> --docs <absolute-markdown-file-or-directory> --verify <command> --confirm-spend-quota [--acceptance --repair-surface <path,path>] [--security] [--remote <url> --branch <branch> [--github-release --base <branch> --required-check <CI-context> ... [--auto-merge]]]";
 }
 
 export function parseThinNewProjectArgs(argv) {
-  const options = { target: null, docs: null, verify: null, repairSurface: null, remote: null, branch: null, confirm: false, acceptance: false, security: false };
+  const options = { target: null, docs: null, verify: null, repairSurface: null, remote: null, branch: null, base: null, requiredChecks: [], confirm: false, acceptance: false, security: false, githubRelease: false, autoMerge: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--confirm-spend-quota") options.confirm = true;
     else if (flag === "--acceptance") options.acceptance = true;
     else if (flag === "--security") options.security = true;
-    else if (["--target", "--docs", "--verify", "--repair-surface", "--remote", "--branch"].includes(flag)) {
+    else if (flag === "--github-release") options.githubRelease = true;
+    else if (flag === "--auto-merge") options.autoMerge = true;
+    else if (["--target", "--docs", "--verify", "--repair-surface", "--remote", "--branch", "--base", "--required-check"].includes(flag)) {
       const value = argv[++index];
       if (typeof value !== "string" || value.trim() === "" || value.startsWith("--")) throw new Error(`${flag} requires a value`);
-      options[flag.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = value.trim();
+      if (flag === "--required-check") options.requiredChecks.push(value.trim());
+      else options[flag.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = value.trim();
     } else if (flag === "--help" || flag === "-h") options.help = true;
     else throw new Error(`unknown option: ${flag}`);
   }
@@ -44,9 +47,14 @@ export async function createThinNewProject({
   confirm = false,
   acceptance = false,
   security = false,
+  githubRelease = false,
+  base = null,
+  requiredChecks = [],
+  autoMerge = false,
   deliveryRunner = defaultDeliveryRunner,
   acceptanceRunner = defaultAcceptanceRunner,
   securityRunner = defaultSecurityRunner,
+  publicationRunner = defaultPublicationRunner,
   gitRunner = defaultGitRunner,
   stdout = console.log,
 } = {}) {
@@ -59,7 +67,8 @@ export async function createThinNewProject({
   if (acceptance === true && !normalizedRepairSurface?.length) throw new Error("--acceptance requires an explicit --repair-surface");
   if (remote && acceptance !== true) throw new Error("--remote requires --acceptance so publication cannot bypass product acceptance");
   if (remote && security !== true) throw new Error("--remote requires --security so publication cannot bypass the security gate");
-  if (typeof deliveryRunner !== "function" || typeof acceptanceRunner !== "function" || typeof securityRunner !== "function" || typeof gitRunner !== "function") throw new TypeError("deliveryRunner, acceptanceRunner, securityRunner, and gitRunner must be functions");
+  validateGitHubReleaseOptions({ githubRelease, remote, acceptance, security, base, branch, requiredChecks, autoMerge });
+  if (typeof deliveryRunner !== "function" || typeof acceptanceRunner !== "function" || typeof securityRunner !== "function" || typeof publicationRunner !== "function" || typeof gitRunner !== "function") throw new TypeError("deliveryRunner, acceptanceRunner, securityRunner, publicationRunner, and gitRunner must be functions");
   if (lstatSync(docsPath).isDirectory() && isInside(targetPath, docsPath)) {
     throw new Error("target must not be inside the documentation source path");
   }
@@ -97,6 +106,7 @@ export async function createThinNewProject({
 
     let acceptedCandidateSha = delivery.candidateSha;
     let acceptanceCandidateBranch = null;
+    let acceptanceReport = null;
     if (acceptance === true) {
       const accepted = await acceptanceRunner({
         repository: targetPath,
@@ -110,6 +120,7 @@ export async function createThinNewProject({
       if (!accepted?.ok || !isGitSha(accepted.candidateSha)) return failed("acceptance_failed", targetPath, baselineSha, stdout);
       acceptedCandidateSha = accepted.candidateSha;
       acceptanceCandidateBranch = accepted.candidateBranch == null ? null : validateAcceptanceCandidateBranch(accepted.candidateBranch);
+      acceptanceReport = accepted.acceptanceReport ?? null;
       stdout(`[acceptance] accepted ${acceptedCandidateSha}${acceptanceCandidateBranch ? ` branch=${acceptanceCandidateBranch}` : ""}`);
     }
 
@@ -132,8 +143,26 @@ export async function createThinNewProject({
       const localBranchSha = await gitRunner({ cwd: targetPath, args: ["rev-parse", "--verify", `${pushBranch}^{commit}`] });
       if (String(localBranchSha).trim().toLowerCase() !== acceptedCandidateSha.toLowerCase()) throw new Error("candidate branch does not resolve to the accepted candidate SHA");
       await gitRunner({ cwd: targetPath, args: ["remote", "add", "origin", remote] });
-      await gitRunner({ cwd: targetPath, args: ["push", "--set-upstream", "origin", `${pushBranch}:${pushBranch}`] });
-      stdout(`[remote] pushed ${pushBranch}`);
+      if (githubRelease) {
+        if (!isCompletedAcceptanceReport(acceptanceReport, acceptedCandidateSha)) throw new Error("GitHub release requires the exact completed acceptance report for the accepted candidate SHA");
+        const publication = await publicationRunner({
+          repository: targetPath,
+          runtimeDir: join(targetPath, ".thin-runtime"),
+          acceptance: acceptanceReport,
+          remoteName: "origin",
+          allowedRemotes: ["origin"],
+          branch: pushBranch,
+          base,
+          requiredCiContexts: [...new Set(requiredChecks)],
+          autoMerge,
+          stdout,
+        });
+        if (!publication?.ok) return failed(publication?.code ?? "github_release_blocked", targetPath, baselineSha, stdout, new Error(publication?.state ?? "GitHub release blocked"));
+        stdout(`[github-release] ${publication.state} ${pushBranch}`);
+      } else {
+        await gitRunner({ cwd: targetPath, args: ["push", "--set-upstream", "origin", `${pushBranch}:${pushBranch}`] });
+        stdout(`[remote] pushed ${pushBranch}`);
+      }
     }
     stdout(`[completed] candidate ${acceptedCandidateSha}`);
     return { ok: true, target: targetPath, baselineSha, candidateSha: acceptedCandidateSha, copiedMarkdown: copied, branch: acceptanceCandidateBranch ?? branch ?? null };
@@ -244,6 +273,25 @@ function validateRemoteOptions({ remote, branch }) {
   if (["main", "master"].includes(branch.toLowerCase())) throw new Error("remote branch must not be main or master");
 }
 
+function validateGitHubReleaseOptions({ githubRelease, remote, acceptance, security, base, branch, requiredChecks, autoMerge }) {
+  if (githubRelease !== true && githubRelease !== false) throw new Error("githubRelease must be boolean");
+  if (!githubRelease) {
+    if (base != null || requiredChecks.length || autoMerge) throw new Error("--base, --required-check and --auto-merge require --github-release");
+    return;
+  }
+  if (!remote || acceptance !== true || security !== true) throw new Error("--github-release requires --remote, --acceptance and --security");
+  if (!safeGitBranch(base) || base === branch) throw new Error("--github-release requires an explicit safe --base distinct from --branch");
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length || requiredChecks.some((value) => typeof value !== "string" || !value.trim() || value.length > 200)) throw new Error("--github-release requires at least one --required-check");
+  if (autoMerge !== true && autoMerge !== false) throw new Error("autoMerge must be boolean");
+}
+
+function safeGitBranch(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(value) && !value.includes("..") && !value.includes("//") && !value.endsWith("/");
+}
+function isCompletedAcceptanceReport(value, candidateSha) {
+  return value != null && typeof value === "object" && value.schemaVersion === 2 && value.state === "completed_spec_verified" && typeof value.candidateSha === "string" && value.candidateSha.toLowerCase() === candidateSha.toLowerCase();
+}
+
 function validateAcceptanceCandidateBranch(value) {
   if (typeof value !== "string" || !/^thin\/acceptance-candidate-[A-Za-z0-9._-]+(?:-[A-Za-z0-9._-]+)*$/.test(value)) {
     throw new Error("acceptance candidate branch is not a verified controller-owned branch");
@@ -298,7 +346,20 @@ async function defaultAcceptanceRunner({ repository, docs, candidateSha, verify,
     stderr: (line) => { output.push(String(line)); stdout(line); },
   });
   const completed = [...output].reverse().map((line) => /^\[completed\] accepted candidate ([0-9a-f]{7,64})(?: branch=(thin\/acceptance-candidate-[A-Za-z0-9._-]+(?:-[A-Za-z0-9._-]+)*))?$/i.exec(line)).find(Boolean);
-  return { ok: code === 0 && Boolean(completed), candidateSha: completed?.[1] ?? null, candidateBranch: completed?.[2] ?? null };
+  const reportPath = [...output].reverse().map((line) => /^\[acceptance\] report (.+)$/.exec(line)?.[1]).find(Boolean) ?? null;
+  let acceptanceReport = null;
+  if (reportPath) {
+    try { acceptanceReport = JSON.parse(readFileSync(reportPath, "utf8")); } catch { acceptanceReport = null; }
+  }
+  return { ok: code === 0 && Boolean(completed), candidateSha: completed?.[1] ?? null, candidateBranch: completed?.[2] ?? null, acceptanceReport };
+}
+
+async function defaultPublicationRunner({ repository, runtimeDir, acceptance, remoteName, allowedRemotes, branch, base, requiredCiContexts, autoMerge, stdout }) {
+  const { publishThinCandidate } = await import("../src/thin/github-publication.mjs");
+  return publishThinCandidate({
+    repository, runtimeDir, acceptance, remoteName, allowedRemotes, branch, base, requiredCiContexts, autoMerge,
+    onEvent: (event) => stdout(`[publication] ${event.type}`),
+  });
 }
 
 async function defaultSecurityRunner({ repository, candidateSha, verify, stdout }) {
