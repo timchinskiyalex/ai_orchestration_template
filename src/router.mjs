@@ -763,7 +763,10 @@ export class SwarmRouter extends EventEmitter {
       try { await this.#provider(client, "shutdown", {}); } catch {}
       if (this.activeClient === client) this.activeClient = null;
       this.activeTurns.clear();
-      this.activeDeliverySessionId = null;
+      // Provider teardown between waves must not discard this controller's
+      // delivery lease. A different router instance has no in-memory session
+      // and will still fail the compare-and-set ownership check.
+      if (!deliveryRunId) this.activeDeliverySessionId = null;
     }
   }
 
@@ -1012,7 +1015,25 @@ export class SwarmRouter extends EventEmitter {
     const manifest = integration?.manifest; const run = this.activeDeliveryRunId ? this.store.deliveryRun(this.activeDeliveryRunId) : null;
     const stored = run?.blueprintId ? this.store.productBlueprint(run.blueprintId) : null;
     if (!run || !stored || !manifest || !integration.path || run.candidate?.sha?.toLowerCase() !== manifest.candidateSha?.toLowerCase()) throw new Error("Final acceptance requires the persisted run, blueprint, manifest, and candidate.");
-    const applied = new Set(manifest.appliedArtifacts ?? []); const tasks = this.list().filter((task) => task.deliveryRunId === run.id);
+    // A later wave is integrated from the prior verified global checkpoint,
+    // so its manifest applies only the current-wave leaves.  Reconstruct the
+    // immutable checkpoint ancestry by SHA before judging requirement lineage:
+    // earlier artifacts remain part of this exact candidate, but only through
+    // a persisted, verified checkpoint whose output is the next base.
+    const applied = new Set(manifest.appliedArtifacts ?? []);
+    for (const node of manifest.effectiveLineage ?? []) if (node.kind === "artifact") applied.add(node.id);
+    const seenCheckpointOutputs = new Set(); let ancestorBase = manifest.baseSha;
+    while (ancestorBase && !seenCheckpointOutputs.has(ancestorBase)) {
+      const checkpoint = this.store.planBatches(run.id)
+        .map((batch) => this.store.globalWaveCheckpoint(run.id, batch.wave))
+        .find((item) => item?.status === "passed" && item.outputSha === ancestorBase);
+      if (!checkpoint) break;
+      seenCheckpointOutputs.add(checkpoint.outputSha);
+      for (const node of checkpoint.effectiveLineage ?? []) if (node.kind === "artifact") applied.add(node.id);
+      for (const input of checkpoint.inputArtifacts ?? []) applied.add(input.artifactId);
+      ancestorBase = checkpoint.baseSha;
+    }
+    const tasks = this.list().filter((task) => task.deliveryRunId === run.id);
     const statusFor = (requirementId) => {
       const writers = tasks.filter((task) => task.requirementIds.includes(requirementId) && ENGINEERING_DOMAINS.has(task.role) && !["qa", "security"].includes(task.role));
       const artifacts = writers.map((task) => this.store.workerArtifact(task.id)).filter(Boolean);
@@ -1811,7 +1832,10 @@ export class SwarmRouter extends EventEmitter {
       for (const id of parents) {
         const predecessor = byId.get(id);
         if (!predecessor || ["failed", "cancelled", "blocked_budget", "blocked_specification", "interrupted"].includes(predecessor.status)) add(task, "unreachable_writer_predecessor", id);
-        else if (predecessor.status !== "done" || predecessor.executionReleaseState !== "released") add(task, "unsatisfied_writer_predecessor", id);
+        // A non-terminal predecessor can be waiting for its own review or a
+        // controller fan-in barrier. That is normal scheduler progress, not a
+        // deadlock; only immutable absence/terminal failure is integrity-blocked.
+        else if (predecessor.status !== "done" || predecessor.executionReleaseState !== "released") continue;
         else if (!this.store.workerArtifact(id)) add(task, "missing_writer_artifact", id);
       }
       if (parents.length > 1) {

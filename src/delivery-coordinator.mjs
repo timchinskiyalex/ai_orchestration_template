@@ -49,7 +49,7 @@ export class DeliveryCoordinator {
       // Preserve the historical Bootstrap task used by baseline diagnostics,
       // but block the run before the scheduler can claim it.
       const bootstrap = this.router.startProject();
-      this.router.store.linkTaskToDelivery(bootstrap.id, blocked.id);
+      this.router.store.attachBootstrapTaskToDelivery(bootstrap.id, blocked.id);
       return this.router.blockRunForRepositoryBaseline(blocked, error);
     }
     let run = this.router.createDeliveryRun({ id: randomUUID(), source, bootstrapTaskId: null, confirmRemotePush: false, sourceClaimInputMode: intake.sourceClaimInput, repositoryMode: this.router.projectMode?.mode, projectMode: this.router.projectMode, repositoryBaseSha: baselineDraft?.baseSha ?? null });
@@ -60,7 +60,7 @@ export class DeliveryCoordinator {
     } catch (error) { return /source_claim_audit|admission_blocked/i.test(String(error?.message ?? error)) ? this.router.blockRunForSourceClaimAudit(run, error) : this.router.blockRunForSourceExtraction(run, error); }
     // Admission is complete before Bootstrap may be queued.
     const bootstrap = this.router.startProject();
-    this.router.store.linkTaskToDelivery(bootstrap.id, run.id);
+    run = this.router.store.attachBootstrapTaskToDelivery(bootstrap.id, run.id);
     // The immutable draft is finalized only after Bootstrap persists the
     // ProductBlueprint it must bind.
     this.router.store.updateDeliveryRun(run.id, { state: "running", confirmRemotePush: this.router.isAutonomous() });

@@ -644,6 +644,23 @@ export class StateStore {
     return this.getTask(taskId);
   }
 
+  attachBootstrapTaskToDelivery(taskId, deliveryRunId) {
+    const task = this.getTask(taskId); const run = this.deliveryRun(deliveryRunId);
+    if (!task || task.role !== "bootstrap") throw new Error("Delivery Bootstrap linkage requires a Bootstrap task");
+    if (!run) throw new Error(`Delivery run not found: ${deliveryRunId}`);
+    if (run.bootstrapTaskId && run.bootstrapTaskId !== taskId) throw new Error("Delivery run already has a different Bootstrap task");
+    if (task.deliveryRunId && task.deliveryRunId !== deliveryRunId) throw new Error("Bootstrap task is already linked to a different delivery run");
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE tasks SET delivery_run_id = ?, updated_at = ? WHERE id = ?").run(deliveryRunId, timestamp, taskId);
+      this.db.prepare("UPDATE delivery_runs SET bootstrap_task_id = ?, updated_at = ? WHERE id = ? AND (bootstrap_task_id IS NULL OR bootstrap_task_id = ?)").run(taskId, timestamp, deliveryRunId, taskId);
+      this.#insertEvent(taskId, "delivery/bootstrap-linked", { deliveryRunId, bootstrapTaskId: taskId });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(deliveryRunId);
+  }
+
   recordBudgetInterruption({ taskId, deliveryRunId = null, threadId, turnId, actualTokens, interruptThresholdTokens, configuredBudgetCap, reason = "budget_interrupt" }) {
     const interruptedAt = now();
     const thresholdOvershootTokens = Math.max(0, actualTokens - interruptThresholdTokens);
