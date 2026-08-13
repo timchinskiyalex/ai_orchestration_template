@@ -20,7 +20,7 @@ test("real G2/G3 raw-Markdown local candidate: two parallel writers, no remote p
   const root = mkdtempSync(join(tmpdir(), "orchestration-g2g3-local-candidate-")); const source = join(root, "raw-requirements"); let router; let passed = false;
   try {
     git(root, ["init", "-b", "main"]); mkdirSync(source, { recursive: true }); mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
-    writeFileSync(join(source, "requirements.md"), "# Local candidate fixture\nImplement `src/alpha.mjs` exporting `alpha = true`.\nImplement `src/beta.mjs` exporting `beta = true`.\nBoth requirements are mandatory and must be independently implemented.\n");
+    writeFileSync(join(source, "requirements.md"), "# Requirements\nImplement `src/alpha.mjs` exporting `alpha = true`.\nImplement `src/beta.mjs` exporting `beta = true`.\nThe alpha implementation owns only `src/alpha.mjs`.\nThe beta implementation owns only `src/beta.mjs`.\nAlpha and beta have no dependency on each other.\nBoth are eligible to start concurrently.\nEach must be implemented and verified separately.\n");
     // The actual acceptance contract is the controller's exact-SHA ProductEvidence
     // execution. This stable command keeps writer QA deterministic across the two
     // independent files while the App Server performs the real writer turns.
