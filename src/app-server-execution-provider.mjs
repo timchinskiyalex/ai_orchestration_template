@@ -4,6 +4,8 @@ import { AppServerClient } from "./app-server-client.mjs";
 import { EXECUTION_PROVIDER_VERSION, REQUIRED_EXECUTION_CAPABILITIES, envelope, lifecycleEvent, safeDiagnostics } from "./execution-provider-contract.mjs";
 
 const terminal = new Set(["completed", "failed", "interrupted", "cancelled"]);
+const PENDING_TERMINAL_CANDIDATE_LIMIT = 64;
+const PENDING_TERMINAL_CANDIDATE_TTL_MS = 60_000;
 const usage = (params = {}) => {
   const raw = params.tokenUsage ?? params.usage ?? params;
   const value = raw?.last ?? raw?.total ?? raw;
@@ -34,12 +36,12 @@ export class AppServerExecutionProvider extends EventEmitter {
   constructor({ cwd, client = null, clientFactory = null } = {}) {
     super();
     this.client = client ?? (clientFactory ? clientFactory({ cwd }) : new AppServerClient({ cwd }));
-    this.connected = false; this.closed = false; this.interrupted = new Set(); this.active = new Map(); this.terminalReceipts = new Map(); this.approvalRequests = new Map();
+    this.connected = false; this.closed = false; this.interrupted = new Set(); this.active = new Map(); this.terminalReceipts = new Map(); this.pendingTerminalCandidates = new Map(); this.approvalRequests = new Map();
     this.providerConnectionId = randomUUID();
     this.client.on?.("notification", (message) => this.#notification(message));
     this.client.on?.("serverRequest", (message) => this.#serverRequest(message));
     this.client.on?.("protocol", (event) => this.#protocol(event));
-    this.client.on?.("exit", (details) => this.emit("lifecycle", lifecycleEvent({ kind: "process_exit", providerGlobal: true, success: false, errorCode: "process_exit", errorClass: "transport", diagnostics: details })));
+    this.client.on?.("exit", (details) => { this.connected = false; this.#clearPendingTerminalCandidates(); this.emit("lifecycle", lifecycleEvent({ kind: "process_exit", providerGlobal: true, success: false, errorCode: "process_exit", errorClass: "transport", diagnostics: details })); });
   }
   async handshake(args) {
     if (args.contractVersion !== EXECUTION_PROVIDER_VERSION) return this.#failure("handshake", args, "unsupported_contract_version", "protocol");
@@ -98,19 +100,49 @@ export class AppServerExecutionProvider extends EventEmitter {
   async readFinalResult(args) { return this.#raw("read_final_result", args, async () => { const result = await this.client.readThread({ threadId: args.data.threadId, includeTurns: true }); const turns = result?.thread?.turns ?? result?.turns ?? []; const turn = turns.find((item) => item?.id === args.data.turnId); const text = (turn?.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text; if (!text?.trim()) throw new Error("result_unavailable"); return { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: `${args.data.threadId}:${args.data.turnId}`, resultText: text }; }); }
   async interruptTurn(args) { const key = `${args.data.threadId}:${args.data.turnId}`; if (this.interrupted.has(key)) return this.#ok("interrupt_turn", args, { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: key, terminalClass: "interrupted" }); this.interrupted.add(key); return this.#raw("interrupt_turn", args, async () => { await this.client.interruptTurn(args.data); return { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: key, terminalClass: "interrupted" }; }); }
   async approvalResponse(args) { return this.#raw("approval_response", args, async () => { const { requestId, response } = args.data; if (typeof requestId !== "string" || !response || typeof response !== "object") throw new Error("invalid approval response"); const rawId = this.approvalRequests.get(requestId); if (rawId === undefined) throw new Error("unknown approval request"); this.client.respond(rawId, response); this.approvalRequests.delete(requestId); return { providerRunId: "app-server", requestId }; }); }
-  async shutdown(args) { if (!this.closed) { this.closed = true; await this.client.shutdown(); } return this.#ok("shutdown", args, { providerRunId: "app-server", terminalClass: "shutdown" }); }
+  async shutdown(args) { if (!this.closed) { this.closed = true; this.#clearPendingTerminalCandidates(); await this.client.shutdown(); } return this.#ok("shutdown", args, { providerRunId: "app-server", terminalClass: "shutdown" }); }
   async diagnostics(args) { return this.#ok("diagnostics", args, { diagnostics: safeDiagnostics(this.client.diagnostics?.() ?? {}) }); }
 
   #bind(threadId, turnId, correlationId, requestedTurnId = turnId) { if (typeof threadId === "string" && typeof turnId === "string" && typeof correlationId === "string") this.active.set(`${threadId}:${turnId}`, { correlationId, requestedTurnId }); }
   #active(threadId, turnId) { return this.active.get(`${threadId}:${turnId}`) ?? null; }
   #correlation(threadId, turnId) { return this.#active(threadId, turnId)?.correlationId ?? null; }
+  #hasControllerOwnedRequestedTurn(threadId) {
+    for (const [key, active] of this.active) if (key === `${threadId}:${active.requestedTurnId}`) return true;
+    return false;
+  }
+  #pendingTerminalCandidateKey(threadId, resolvedTurnId) { return `${threadId}:${resolvedTurnId}`; }
+  #clearPendingTerminalCandidates() { this.pendingTerminalCandidates.clear(); }
+  #prunePendingTerminalCandidates(now = Date.now()) {
+    for (const [key, candidate] of this.pendingTerminalCandidates) {
+      if (now - candidate.capturedAtMs > PENDING_TERMINAL_CANDIDATE_TTL_MS) this.pendingTerminalCandidates.delete(key);
+    }
+    while (this.pendingTerminalCandidates.size > PENDING_TERMINAL_CANDIDATE_LIMIT) this.pendingTerminalCandidates.delete(this.pendingTerminalCandidates.keys().next().value);
+  }
+  #rememberPendingTerminalCandidate({ threadId, resolvedTurnId, terminalClass, usage: candidateUsage }) {
+    if (!this.connected || this.closed || !terminal.has(terminalClass) || !this.#hasControllerOwnedRequestedTurn(threadId)) return;
+    const key = this.#pendingTerminalCandidateKey(threadId, resolvedTurnId); const capturedAtMs = Date.now(); this.#prunePendingTerminalCandidates(capturedAtMs);
+    if (this.pendingTerminalCandidates.has(key)) return;
+    this.pendingTerminalCandidates.set(key, Object.freeze({ threadId, resolvedTurnId, terminalClass, usage: candidateUsage ?? null, capturedAtMs }));
+    this.#prunePendingTerminalCandidates(capturedAtMs);
+  }
+  #storeTerminalReceipt({ threadId, requestedTurnId, resolvedTurnId, terminalClass, correlationId, source, corroboration = null }) {
+    if (!this.connected || this.closed || !terminal.has(terminalClass)) return null;
+    if (this.terminalReceipts.has(`${threadId}:${resolvedTurnId}`) || this.#terminalReceipt(threadId, requestedTurnId)) return null;
+    const receipt = this.#receipt({ threadId, requestedTurnId, resolvedTurnId, terminalClass, correlationId, source, corroboration });
+    this.terminalReceipts.set(`${threadId}:${resolvedTurnId}`, receipt);
+    return receipt;
+  }
   #task(kind, params, data = {}) {
     const threadId = params?.threadId ?? params?.thread?.id;
     const turnId = params?.turnId ?? params?.turn?.id;
     const active = this.#active(threadId, turnId); const correlationId = active?.correlationId ?? null;
-    if (!correlationId || typeof threadId !== "string" || typeof turnId !== "string") return;
+    if (typeof threadId !== "string" || typeof turnId !== "string") return;
+    if (!correlationId) {
+      if (kind === "turn_completed" && terminal.has(data.terminalClass)) this.#rememberPendingTerminalCandidate({ threadId, resolvedTurnId: turnId, terminalClass: data.terminalClass, usage: data.usage });
+      return;
+    }
     if (kind === "turn_completed" && terminal.has(data.terminalClass) && this.connected && !this.closed) {
-      this.terminalReceipts.set(`${threadId}:${turnId}`, this.#receipt({ threadId, requestedTurnId: active.requestedTurnId, resolvedTurnId: turnId, terminalClass: data.terminalClass, correlationId, source: "turn_completed" }));
+      if (!this.#storeTerminalReceipt({ threadId, requestedTurnId: active.requestedTurnId, resolvedTurnId: turnId, terminalClass: data.terminalClass, correlationId, source: "turn_completed" })) return;
     }
     this.emit("lifecycle", lifecycleEvent({ kind, correlationId, data: { threadId, turnId, providerRunId: `${threadId}:${turnId}`, ...data } }));
   }
@@ -123,10 +155,21 @@ export class AppServerExecutionProvider extends EventEmitter {
   }
   #protocol(event) {
     if (event?.method !== "turn-id-alias" || typeof event.threadId !== "string" || typeof event.requestedTurnId !== "string" || typeof event.resolvedTurnId !== "string") return;
-    const correlationId = this.#correlation(event.threadId, event.requestedTurnId);
-    if (!correlationId) return;
-    this.#bind(event.threadId, event.resolvedTurnId, correlationId, event.requestedTurnId);
-    this.emit("lifecycle", lifecycleEvent({ kind: "turn_alias", correlationId, data: { threadId: event.threadId, turnId: event.resolvedTurnId, requestedTurnId: event.requestedTurnId, resolvedTurnId: event.resolvedTurnId, providerRunId: `${event.threadId}:${event.resolvedTurnId}` } }));
+    const active = this.#active(event.threadId, event.requestedTurnId);
+    if (!active || active.requestedTurnId !== event.requestedTurnId || event.requestedTurnId === event.resolvedTurnId) return;
+    const resolved = this.#active(event.threadId, event.resolvedTurnId);
+    if (resolved && (resolved.correlationId !== active.correlationId || resolved.requestedTurnId !== event.requestedTurnId)) return;
+    if (resolved) return;
+    this.#bind(event.threadId, event.resolvedTurnId, active.correlationId, event.requestedTurnId);
+    this.emit("lifecycle", lifecycleEvent({ kind: "turn_alias", correlationId: active.correlationId, data: { threadId: event.threadId, turnId: event.resolvedTurnId, requestedTurnId: event.requestedTurnId, resolvedTurnId: event.resolvedTurnId, providerRunId: `${event.threadId}:${event.resolvedTurnId}` } }));
+    this.#prunePendingTerminalCandidates();
+    const key = this.#pendingTerminalCandidateKey(event.threadId, event.resolvedTurnId);
+    const candidate = this.pendingTerminalCandidates.get(key);
+    if (!candidate || candidate.threadId !== event.threadId || candidate.resolvedTurnId !== event.resolvedTurnId || !terminal.has(candidate.terminalClass)) return;
+    const receipt = this.#storeTerminalReceipt({ threadId: event.threadId, requestedTurnId: event.requestedTurnId, resolvedTurnId: event.resolvedTurnId, terminalClass: candidate.terminalClass, correlationId: active.correlationId, source: "turn_completed" });
+    this.pendingTerminalCandidates.delete(key);
+    if (!receipt) return;
+    this.emit("lifecycle", lifecycleEvent({ kind: "turn_completed", correlationId: active.correlationId, data: { threadId: event.threadId, turnId: event.resolvedTurnId, providerRunId: `${event.threadId}:${event.resolvedTurnId}`, terminalClass: candidate.terminalClass, usage: candidate.usage } }));
   }
   #serverRequest(message) {
     const params = message?.params ?? {}; const correlationId = this.#correlation(params.threadId, params.turnId);

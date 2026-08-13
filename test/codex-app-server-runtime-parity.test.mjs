@@ -64,6 +64,14 @@ async function runRuntime(client, cwd) {
   return { runtime, thread, turn, candidate, durable, result, observations, calls: client.calls };
 }
 
+async function aliasRuntime({ threadReadError = "thread/read: thread not loaded" } = {}) {
+  const client = new FakeAppServerClient({ alias: true, threadReadError });
+  const runtime = new CodexAppServerRuntime({ cwd: "D:/controller-authorized/worktree", client }); const observations = [];
+  runtime.on("observation", (observation) => observations.push(observation));
+  await runtime.connect(); const thread = await runtime.startThread(); const turn = await runtime.startGoalTurn({ threadId: thread.threadId, goal: {}, turn: {} });
+  return { client, runtime, observations, thread, turn };
+}
+
 test("thin runtime has parity with current App Server path for controller cwd, start, durable alias reconciliation, and result read", async () => {
   const cwd = "D:/controller-authorized/worktree";
   const legacy = await runLegacy(new FakeAppServerClient({ alias: true }), cwd);
@@ -122,6 +130,76 @@ test("missing status, foreign identities, and untrusted aliases cannot create a 
     client.emit("notification", { method: "turn/completed", params });
     await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "execution_provider_terminal_unavailable");
   }
+});
+
+test("resolved turn/completed pending before a confirmed alias produces one receipt and reconciles", async () => {
+  const { client, runtime, observations, thread, turn } = await aliasRuntime();
+  client.emit("notification", { method: "turn/completed", params: { threadId: thread.threadId, turn: { id: "turn-resolved", status: "completed" } } });
+  assert.equal(observations.some((item) => item.kind === "worker_terminal_candidate"), false, "unconfirmed aliases are not controller observations");
+  client.emit("protocol", { method: "turn-id-alias", threadId: thread.threadId, requestedTurnId: turn.turnId, resolvedTurnId: "turn-resolved" });
+  const durable = await runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 });
+  assert.equal(durable.terminalReceipt.source, "turn_completed");
+  assert.deepEqual({ requestedTurnId: durable.requestedTurnId, resolvedTurnId: durable.resolvedTurnId, terminalClass: durable.terminalClass }, { requestedTurnId: "turn-requested", resolvedTurnId: "turn-resolved", terminalClass: "completed" });
+  assert.equal(observations.filter((item) => item.kind === "worker_terminal_candidate").length, 1);
+});
+
+test("pending terminal candidates require an exact confirmed thread and resolved turn alias", async () => {
+  for (const candidate of [
+    { threadId: "other-thread", resolvedTurnId: "turn-resolved" },
+    { threadId: "thread-controller-cwd", resolvedTurnId: "other-resolved" }
+  ]) {
+    const { client, runtime, thread, turn } = await aliasRuntime();
+    client.emit("notification", { method: "turn/completed", params: { threadId: candidate.threadId, turn: { id: candidate.resolvedTurnId, status: "completed" } } });
+    client.emit("protocol", { method: "turn-id-alias", threadId: thread.threadId, requestedTurnId: turn.turnId, resolvedTurnId: "turn-resolved" });
+    await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "execution_provider_terminal_unavailable");
+  }
+});
+
+test("missing terminal status never enters pending state", async () => {
+  const { client, runtime, thread, turn } = await aliasRuntime();
+  client.emit("notification", { method: "turn/completed", params: { threadId: thread.threadId, turn: { id: "turn-resolved" } } });
+  client.emit("protocol", { method: "turn-id-alias", threadId: thread.threadId, requestedTurnId: turn.turnId, resolvedTurnId: "turn-resolved" });
+  await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "execution_provider_terminal_unavailable");
+});
+
+test("stale or duplicate aliases and duplicate completion cannot create a second receipt", async () => {
+  const { client, runtime, observations, thread, turn } = await aliasRuntime();
+  client.emit("notification", { method: "turn/completed", params: { threadId: thread.threadId, turn: { id: "turn-resolved", status: "completed" } } });
+  client.emit("protocol", { method: "turn-id-alias", threadId: thread.threadId, requestedTurnId: "stale-requested", resolvedTurnId: "turn-resolved" });
+  client.emit("protocol", { method: "turn-id-alias", threadId: thread.threadId, requestedTurnId: turn.turnId, resolvedTurnId: "turn-resolved" });
+  client.emit("protocol", { method: "turn-id-alias", threadId: thread.threadId, requestedTurnId: turn.turnId, resolvedTurnId: "turn-resolved" });
+  client.emit("notification", { method: "turn/completed", params: { threadId: thread.threadId, turn: { id: "turn-resolved", status: "completed" } } });
+  const durable = await runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 });
+  assert.equal(durable.terminalReceipt.resolvedTurnId, "turn-resolved");
+  assert.equal(observations.filter((item) => item.kind === "worker_terminal_candidate").length, 1);
+});
+
+test("shutdown or process exit clears pending terminal candidates", async () => {
+  for (const action of ["shutdown", "exit"]) {
+    const { client, runtime, thread, turn } = await aliasRuntime();
+    client.emit("notification", { method: "turn/completed", params: { threadId: thread.threadId, turn: { id: "turn-resolved", status: "completed" } } });
+    if (action === "shutdown") await runtime.shutdown(); else client.emit("exit", { code: 17, signal: "SIGTERM" });
+    client.emit("protocol", { method: "turn-id-alias", threadId: thread.threadId, requestedTurnId: turn.turnId, resolvedTurnId: "turn-resolved" });
+    await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "execution_provider_terminal_unavailable");
+  }
+});
+
+test("the quota-free Codex runtime probe fake path exercises alias-before-receipt reconciliation", async () => {
+  const { client, runtime, thread, turn } = await aliasRuntime();
+  client.emit("notification", { method: "turn/completed", params: { threadId: thread.threadId, turn: { id: "turn-resolved", status: "completed" } } });
+  client.emit("protocol", { method: "turn-id-alias", threadId: thread.threadId, requestedTurnId: turn.turnId, resolvedTurnId: "turn-resolved" });
+  const result = await runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 });
+  assert.equal(result.kind, "worker_completed");
+  assert.equal(result.terminalReceipt.resolvedTurnId, "turn-resolved");
+});
+
+test("existing exact-ID turn/completed receipt path remains unchanged", async () => {
+  const { client, runtime, observations, thread, turn } = await aliasRuntime();
+  client.emit("notification", { method: "turn/completed", params: { threadId: thread.threadId, turn: { id: turn.turnId, status: "completed" } } });
+  const durable = await runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 });
+  assert.equal(durable.terminalReceipt.resolvedTurnId, turn.turnId);
+  assert.equal(durable.verifiedEquivalence, "exact");
+  assert.equal(observations.filter((item) => item.kind === "worker_terminal_candidate").length, 1);
 });
 
 test("thin runtime exposes only normalized progress, timeout/cancellation, and disconnect diagnostics", async () => {

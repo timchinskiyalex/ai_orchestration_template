@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,6 +17,7 @@ import {
   parseCodexRuntimeProbeArguments,
   runCodexRuntimeProbe
 } from "../src/codex-runtime-probe.mjs";
+import { CodexAppServerRuntime } from "../src/codex-app-server-runtime.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -35,6 +37,30 @@ class QuotaFreeRuntime {
   async reconcileTerminal() { this.calls.push("reconcile"); return { kind: "worker_completed", terminalClass: "completed", turnId: "turn-resolved", requestedTurnId: "turn-requested", resolvedTurnId: "turn-resolved", terminalReceipt: { schemaVersion: 1, kind: "AppServerTerminalReceipt", source: "turn_completed", threadId: "thread-probe", requestedTurnId: "turn-requested", resolvedTurnId: "turn-resolved", terminalClass: "completed" } }; }
   async diagnostics() { return { connected: true, closed: false, diagnostics: JSON.stringify({ process: { alive: true, exited: false, code: null, signal: null } }) }; }
   async shutdown() { this.calls.push("shutdown"); }
+}
+
+class AliasBeforeReceiptProbeClient extends EventEmitter {
+  constructor() { super(); this.events = []; this.cwd = null; this.closed = false; }
+  async connect() {}
+  async startThread({ cwd }) { this.cwd = cwd; return { thread: { id: "thread-probe" } }; }
+  async setGoal() {}
+  async startTurn() {
+    mkdirSync(join(this.cwd, "src"), { recursive: true });
+    writeFileSync(join(this.cwd, CODEX_RUNTIME_PROBE_ALLOWED_PATH), CODEX_RUNTIME_PROBE_FILE_CONTENT, "utf8");
+    return { turn: { id: "turn-requested" } };
+  }
+  async waitForTurn(threadId, requestedTurnId) {
+    this.events.push("turn/completed");
+    this.emit("notification", { method: "turn/completed", params: { threadId, turn: { id: "turn-resolved", status: "completed" } } });
+    this.events.push("turn-id-alias");
+    this.emit("protocol", { method: "turn-id-alias", threadId, requestedTurnId, resolvedTurnId: "turn-resolved" });
+    return { id: "turn-resolved", status: "completed" };
+  }
+  async readTerminalTurn() { throw new Error("thread/read: thread not loaded"); }
+  async readThread() { throw new Error("thread/read: thread not loaded"); }
+  async interruptTurn() {}
+  async shutdown() { this.closed = true; }
+  diagnostics() { return { process: { alive: !this.closed, exited: false, code: null, signal: null }, stderrTail: "", protocolEvents: [] }; }
 }
 
 test("runtime probe confirmation gate fails closed before a runtime can be created", async () => {
@@ -81,6 +107,23 @@ test("quota-free compatibility harness passes only from exact cwd, actual diff, 
       "[probe] repository created", "[probe] worktree created", "[probe] runtime connected", "[probe] turn started",
       "[probe] durable terminal reconciled", "[probe] diff validated", "[probe] controller artifact committed", "[probe] probe passed"
     ]);
+  } finally { rmSync(reportsRoot, { recursive: true, force: true }); }
+});
+
+test("quota-free probe fake passes through completed-before-alias receipt reconciliation", async () => {
+  const reportsRoot = mkdtempSync(join(tmpdir(), "codex-runtime-probe-alias-test-reports-"));
+  let client = null;
+  try {
+    const result = await runCodexRuntimeProbe({
+      args: [CODEX_RUNTIME_PROBE_CONFIRMATION], reportsRoot,
+      runtimeFactory: ({ cwd }) => {
+        client = new AliasBeforeReceiptProbeClient();
+        return new CodexAppServerRuntime({ cwd, client });
+      }
+    });
+    assert.deepEqual(client.events, ["turn/completed", "turn-id-alias"]);
+    assert.equal(result.requestedTurnId, "turn-requested");
+    assert.equal(result.resolvedTurnId, "turn-resolved");
   } finally { rmSync(reportsRoot, { recursive: true, force: true }); }
 });
 
