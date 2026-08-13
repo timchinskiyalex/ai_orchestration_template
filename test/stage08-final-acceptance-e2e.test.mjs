@@ -33,13 +33,8 @@ function rawAudit(root) {
   const extraction = canonicalizeSourceClaimExtractionCandidate(rawExtraction(root), { sourceResolver: resolver });
   const subject = auditSubjectFromExtraction(extraction);
   return {
-    schemaVersion: 1,
-    kind: "SourceClaimAudit",
-    documentSetDigest: subject.documentSetDigest,
-    candidateId: subject.candidateId,
-    candidateDigest: subject.candidateDigest,
-    decisions: subject.claims.map((claim) => ({ claimId: claim.claimId, decision: "admitted", classification: "mandatory", reasonCodes: ["verified"], sourceRefs: claim.sourceRefs })),
-    coverage: normalizedSourceUnits(resolver).map((unit) => ({ ...unit, disposition: "covered", reasonCodes: ["verified"], candidateClaimIds: subject.claims.filter((claim) => claim.sourceRefs.some((ref) => ref.documentId === unit.documentId && ref.startLine <= unit.startLine && ref.endLine >= unit.endLine)).map((claim) => claim.claimId) }))
+    decisions: subject.claims.map((claim) => ({ claimId: claim.claimId, decision: "admitted", classification: "mandatory", reasonCodes: ["verified"] })),
+    coverage: normalizedSourceUnits(resolver).map((unit) => ({ coverageUnitId: unit.coverageUnitId, disposition: unit.kind === "meaningful" ? "covered" : "excluded", reasonCodes: [unit.kind === "meaningful" ? "verified" : unit.kind], candidateClaimIds: unit.kind === "meaningful" ? subject.claims.filter((claim) => claim.sourceRefs.some((ref) => ref.documentId === unit.documentId && ref.startLine <= unit.startLine && ref.endLine >= unit.endLine)).map((claim) => claim.claimId) : [] }))
   };
 }
 

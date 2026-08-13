@@ -12,17 +12,14 @@ const parse = (value, fallback) => (value ? JSON.parse(value) : fallback);
 const sourceIntakeDiagnostics = (diagnostics) => {
   if (!diagnostics || typeof diagnostics !== "object"
     || !["connect", "start_thread", "start_turn", "observe_terminal", "reconcile_terminal", "result_read"].includes(diagnostics.runtimeStage)
-    || !["timeout", "process_exit", "transport_failure", "terminal_receipt_missing", "terminal_alias_unresolved", "terminal_status_missing", "terminal_identity_mismatch", "final_result_unavailable"].includes(diagnostics.primaryReason)
+    || !["timeout", "process_exit", "transport_failure", "terminal_receipt_missing", "terminal_alias_unresolved", "terminal_status_missing", "terminal_identity_mismatch", "final_result_unavailable", "malformed_json", "candidate_canonicalization_failed", "candidate_semantics_invalid", "audit_result_invalid"].includes(diagnostics.primaryReason)
     || !["attemptedThreadId", "requestedTurnId"].every((key) => typeof diagnostics[key] === "string" && diagnostics[key].length <= 512)
     || (diagnostics.resolvedTurnId != null && (typeof diagnostics.resolvedTurnId !== "string" || diagnostics.resolvedTurnId.length > 512))
     || (diagnostics.errorClass != null && (typeof diagnostics.errorClass !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/i.test(diagnostics.errorClass)))
-    || !diagnostics.processState || typeof diagnostics.processState !== "object"
-    || typeof diagnostics.processState.alive !== "boolean" || typeof diagnostics.processState.exited !== "boolean"
-    || (diagnostics.processState.code != null && !Number.isInteger(diagnostics.processState.code))
-    || (diagnostics.processState.signal != null && (typeof diagnostics.processState.signal !== "string" || diagnostics.processState.signal.length > 64))
-    || typeof diagnostics.stderrTail !== "string" || diagnostics.stderrTail.length > 512
-    || !Array.isArray(diagnostics.protocolTail) || diagnostics.protocolTail.length > 20) return null;
-  const protocolTail = diagnostics.protocolTail.map((event) => {
+    || (diagnostics.processState != null && (typeof diagnostics.processState !== "object" || typeof diagnostics.processState.alive !== "boolean" || typeof diagnostics.processState.exited !== "boolean" || (diagnostics.processState.code != null && !Number.isInteger(diagnostics.processState.code)) || (diagnostics.processState.signal != null && (typeof diagnostics.processState.signal !== "string" || diagnostics.processState.signal.length > 64))))
+    || (diagnostics.stderrTail != null && (typeof diagnostics.stderrTail !== "string" || diagnostics.stderrTail.length > 512))
+    || (diagnostics.protocolTail != null && (!Array.isArray(diagnostics.protocolTail) || diagnostics.protocolTail.length > 20))) return null;
+  const protocolTail = (diagnostics.protocolTail ?? []).map((event) => {
     if (!event || typeof event !== "object") return null;
     const copy = {};
     for (const key of ["direction", "method", "threadId", "turnId", "requestedTurnId", "resolvedTurnId", "itemType", "itemStatus", "errorCode"]) {
@@ -37,8 +34,8 @@ const sourceIntakeDiagnostics = (diagnostics) => {
     attemptedThreadId: diagnostics.attemptedThreadId, requestedTurnId: diagnostics.requestedTurnId,
     resolvedTurnId: diagnostics.resolvedTurnId ?? null, runtimeStage: diagnostics.runtimeStage,
     primaryReason: diagnostics.primaryReason, ...(diagnostics.errorClass ? { errorClass: diagnostics.errorClass } : {}),
-    processState: { alive: diagnostics.processState.alive, exited: diagnostics.processState.exited, code: diagnostics.processState.code ?? null, signal: diagnostics.processState.signal ?? null },
-    stderrTail: diagnostics.stderrTail, protocolTail
+    processState: diagnostics.processState ? { alive: diagnostics.processState.alive, exited: diagnostics.processState.exited, code: diagnostics.processState.code ?? null, signal: diagnostics.processState.signal ?? null } : null,
+    stderrTail: diagnostics.stderrTail ?? "", protocolTail
   };
 };
 

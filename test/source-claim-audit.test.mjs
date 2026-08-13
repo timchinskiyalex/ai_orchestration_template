@@ -10,7 +10,7 @@ import { SwarmRouter } from "../src/router.mjs";
 import { DeliveryCoordinator } from "../src/delivery-coordinator.mjs";
 import { documentIdForPath, documentSetDigest, policyDigest } from "../src/product-blueprint.mjs";
 import { canonicalizeSourceClaimExtractionCandidate, createImportedSourceResolver, sourceClaimCandidateId, sourceFragmentDigest, validateSourceClaimExtraction } from "../src/source-evidence.mjs";
-import { admitAuditedSourceClaims, auditSubjectFromExtraction, normalizedSourceUnits, validateSourceClaimAudit } from "../src/source-claim-audit.mjs";
+import { admitAuditedSourceClaims, auditSubjectFromExtraction, canonicalizeSourceClaimAuditCandidate, normalizedSourceUnits, parseSourceClaimAuditCandidateResult, validateSourceClaimAudit } from "../src/source-claim-audit.mjs";
 import { provider } from "./execution-provider-test-adapter.mjs";
 import { CodexAppServerRuntime } from "../src/codex-app-server-runtime.mjs";
 import { ExecutionProviderError } from "../src/execution-provider-contract.mjs";
@@ -98,13 +98,13 @@ function auditFor({ root, extraction, variant = "admitted", policyRegistry }) {
   const resolver = createImportedSourceResolver({ repository: root, documentationDir: "docs/in" });
   const verified = canonicalizeSourceClaimExtractionCandidate(extraction, { sourceResolver: resolver }); const subject = auditSubjectFromExtraction(verified);
   const target = subject.claims[1];
-  const decisions = subject.claims.map((claim) => ({ claimId: claim.claimId, decision: claim.claimId === target.claimId && !["admitted", "omitted"].includes(variant) ? variant : "admitted", ...(claim.claimId === target.claimId && !["admitted", "omitted"].includes(variant) ? {} : { classification: "mandatory" }), reasonCodes: [claim.claimId === target.claimId && variant !== "admitted" ? variant.replace("-", "_") : "verified"], sourceRefs: claim.sourceRefs }));
+  const decisions = subject.claims.map((claim) => ({ claimId: claim.claimId, decision: claim.claimId === target.claimId && !["admitted", "omitted"].includes(variant) ? variant : "admitted", classification: claim.claimId === target.claimId && !["admitted", "omitted"].includes(variant) ? null : "mandatory", reasonCodes: [claim.claimId === target.claimId && variant !== "admitted" ? variant.replace("-", "_") : "verified"] }));
   const coverage = normalizedSourceUnits(resolver).map((unit) => {
     const candidateClaimIds = subject.claims.filter((claim) => claim.sourceRefs.some((ref) => ref.documentId === unit.documentId && ref.startLine <= unit.startLine && ref.endLine >= unit.endLine)).map((claim) => claim.claimId).filter((id) => variant !== "omitted" || id !== target.claimId);
     const blocked = candidateClaimIds.includes(target.claimId) && !["admitted", "omitted"].includes(variant);
-    return { ...unit, disposition: blocked ? "blocked" : "covered", reasonCodes: [blocked ? "requires_resolution" : "verified"], candidateClaimIds };
+    return { coverageUnitId: unit.coverageUnitId, disposition: blocked ? "blocked" : "covered", reasonCodes: [blocked ? "requires_resolution" : "verified"], candidateClaimIds };
   });
-  return { schemaVersion: 1, kind: "SourceClaimAudit", documentSetDigest: subject.documentSetDigest, candidateId: subject.candidateId, candidateDigest: subject.candidateDigest, decisions, coverage, policyRegistry };
+  return { decisions, coverage };
 }
 
 test("raw extraction is independently audited before Bootstrap and Planner admission", async () => {
@@ -139,7 +139,7 @@ test("source intake persists one exact alias receipt for extraction and independ
 test("independent audit receives canonical subjects and cannot substitute controller IDs or source refs", async () => {
   for (const [name, mutate] of [
     ["claim-id", (audit) => { audit.decisions[0].claimId = "claim-substituted"; }],
-    ["source-ref", (audit) => { audit.decisions[0].sourceRefs = [{ ...audit.decisions[0].sourceRefs[0], excerptDigest: "0".repeat(64) }]; }]
+    ["source-ref", (audit) => { audit.decisions[0].sourceRefs = [{ documentId: "forged", excerptDigest: "0".repeat(64) }]; }]
   ]) {
     const fx = fixture({ auditMutator: mutate }); const router = new SwarmRouter(fx.config);
     try {
@@ -177,6 +177,7 @@ test("source intake preserves exact bounded terminal diagnostics and fails close
       assert.ok(attempt, `${role}:${failure}:attempt`);
       assert.equal(attempt.attemptedThreadId, `thread-${role}`, `${role}:${failure}:attempt thread`);
       if (runtimeStage) {
+        assert.ok(persisted.diagnostics, `${role}:${failure}:diagnostics`);
         assert.equal(persisted.diagnostics.runtimeStage, runtimeStage, `${role}:${failure}:stage`);
         assert.equal(persisted.diagnostics.primaryReason, code, `${role}:${failure}:reason`);
         assert.equal(persisted.diagnostics.attemptedThreadId, attempt.attemptedThreadId, `${role}:${failure}:correlation`);
@@ -187,6 +188,10 @@ test("source intake preserves exact bounded terminal diagnostics and fails close
       if (failure === "final_result_unavailable") {
         assert.match(result.publish.reason, /final_result_unavailable/, `${role}:${failure}`);
         assert.ok(persisted.receiptIdentity, `${role}:${failure}`);
+      }
+      if (role === "source_claim_audit" && failure === "malformed_json") {
+        assert.deepEqual(persisted.receiptIdentity, { threadId: attempt.attemptedThreadId, requestedTurnId: attempt.requestedTurnId, resolvedTurnId: attempt.resolvedTurnId });
+        assert.equal(persisted.diagnostics.runtimeStage, "result_read"); assert.equal(persisted.diagnostics.primaryReason, "malformed_json");
       }
     } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }
   }
@@ -204,17 +209,41 @@ test("omitted material, contradiction, and split-required source fail closed bef
   }
 });
 
-test("trusted source-audit policy is exact and an auditor cannot self-authorize it", () => {
+test("controller, not the audit candidate, binds an exact trusted source-audit policy", () => {
   const fx = fixture();
   try {
     mkdirSync(join(fx.root, "docs/in"), { recursive: true }); writeFileSync(join(fx.root, "docs/in", fx.file.path), fx.text); writeFileSync(join(fx.root, "docs/in", "inventory.json"), JSON.stringify({ files: [fx.file], documentSetDigest: documentSetDigest([fx.file]) }));
     const resolver = createImportedSourceResolver({ repository: fx.root, documentationDir: "docs/in" }); const subject = auditSubjectFromExtraction(canonicalizeSourceClaimExtractionCandidate(fx.extraction(), { sourceResolver: resolver })); const target = subject.claims[1];
     const policy = { policyId: "resolve-token", version: "1", scope: { kind: "source_claim_audit", claimIds: [target.claimId] }, affectedRequirementIds: [], resolvedValue: "Use controller-managed deployment secret." }; policy.digest = policyDigest(policy);
-    const audit = auditFor({ root: fx.root, extraction: fx.extraction(), policyRegistry: { schemaVersion: 1, policies: [policy] } }); audit.decisions[1].policy = { policyId: policy.policyId, version: policy.version, digest: policy.digest, resolvedValue: policy.resolvedValue };
-    const admitted = validateSourceClaimAudit(audit, { subject, sourceResolver: resolver, policyRegistry: { schemaVersion: 1, policies: [policy] } }); assert.ok(admitAuditedSourceClaims({ subject, audit: admitted }).manifestId);
-    assert.throws(() => validateSourceClaimAudit(audit, { subject, sourceResolver: resolver, policyRegistry: { schemaVersion: 1, policies: [] } }), /untrusted_policy_binding/);
+    const candidate = auditFor({ root: fx.root, extraction: fx.extraction(), policyRegistry: { schemaVersion: 1, policies: [policy] } });
+    const admitted = canonicalizeSourceClaimAuditCandidate(candidate, { subject, sourceResolver: resolver, policyRegistry: { schemaVersion: 1, policies: [policy] } }); assert.ok(admitAuditedSourceClaims({ subject, audit: admitted }).manifestId); assert.equal(admitted.decisions.find((decision) => decision.claimId === target.claimId).policy.policyId, policy.policyId);
+    candidate.decisions[1].policy = { policyId: policy.policyId, version: policy.version, digest: policy.digest, resolvedValue: policy.resolvedValue };
+    assert.throws(() => canonicalizeSourceClaimAuditCandidate(candidate, { subject, sourceResolver: resolver, policyRegistry: { schemaVersion: 1, policies: [policy] } }), /candidate_claim_decision_invalid/);
     policy.scope.claimIds = [subject.claims[0].claimId]; policy.digest = policyDigest(policy);
-    assert.throws(() => validateSourceClaimAudit(audit, { subject, sourceResolver: resolver, policyRegistry: { schemaVersion: 1, policies: [policy] } }), /untrusted_policy_binding/);
+    const rebound = canonicalizeSourceClaimAuditCandidate(auditFor({ root: fx.root, extraction: fx.extraction(), policyRegistry: { schemaVersion: 1, policies: [policy] } }), { subject, sourceResolver: resolver, policyRegistry: { schemaVersion: 1, policies: [policy] } }); assert.equal(rebound.decisions.find((decision) => decision.claimId === target.claimId).policy, null);
+  } finally { rmSync(fx.root, { recursive: true, force: true }); }
+});
+
+test("audit candidate parser accepts one fenced or embedded object and fails closed on ambiguous JSON", () => {
+  const candidate = { decisions: [], coverage: [] };
+  assert.deepEqual(parseSourceClaimAuditCandidateResult(`Auditor notes.\n${JSON.stringify(candidate)}\nEnd.`), candidate);
+  assert.deepEqual(parseSourceClaimAuditCandidateResult(`\`\`\`json\n${JSON.stringify(candidate)}\n\`\`\``), candidate);
+  for (const text of [`${JSON.stringify(candidate)}\n${JSON.stringify(candidate)}`, "{", '{"decisions":"\\q","coverage":[]}', "\`\`\`json\n{\"decisions\":[]\n\`\`\`"]) assert.throws(() => parseSourceClaimAuditCandidateResult(text), /source_claim_audit:parse:malformed_json/);
+});
+
+test("candidate validation canonicalizes controller identity and rejects forged or incomplete mappings", () => {
+  const fx = fixture();
+  try {
+    mkdirSync(join(fx.root, "docs/in"), { recursive: true }); writeFileSync(join(fx.root, "docs/in", fx.file.path), fx.text); writeFileSync(join(fx.root, "docs/in", "inventory.json"), JSON.stringify({ files: [fx.file], documentSetDigest: documentSetDigest([fx.file]) }));
+    const resolver = createImportedSourceResolver({ repository: fx.root, documentationDir: "docs/in" }); const subject = auditSubjectFromExtraction(canonicalizeSourceClaimExtractionCandidate(fx.extraction(), { sourceResolver: resolver })); const candidate = auditFor({ root: fx.root, extraction: fx.extraction() });
+    const audit = canonicalizeSourceClaimAuditCandidate(candidate, { subject, sourceResolver: resolver }); assert.ok(Object.isFrozen(audit)); assert.ok(Object.isFrozen(audit.decisions)); assert.equal(audit.sourceDocuments[0].documentId, fx.file.documentId); assert.ok(audit.auditId && audit.digest);
+    for (const mutate of [
+      (value) => { value.digest = "0".repeat(64); },
+      (value) => { value.sourceRefs = []; },
+      (value) => { value.decisions.pop(); },
+      (value) => { value.decisions.push({ ...value.decisions[0] }); },
+      (value) => { value.coverage[0].coverageUnitId = "unknown"; }
+    ]) { const forged = structuredClone(candidate); mutate(forged); assert.throws(() => canonicalizeSourceClaimAuditCandidate(forged, { subject, sourceResolver: resolver }), /source_claim_audit:/); }
   } finally { rmSync(fx.root, { recursive: true, force: true }); }
 });
 

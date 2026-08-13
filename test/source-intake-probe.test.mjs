@@ -37,11 +37,11 @@ class ProbeRuntime {
     const directory = join(root, "docs", "orchestration-generated", "source-claim-extractions");
     const extraction = JSON.parse(readFileSync(join(directory, readdirSync(directory)[0]), "utf8"));
     const subject = auditSubjectFromExtraction(extraction);
-    const decisions = subject.claims.map((claim) => ({ claimId: claim.claimId, decision: "admitted", classification: claim.candidateClassification, reasonCodes: ["fixture_admitted"], sourceRefs: claim.sourceRefs }));
+    const decisions = subject.claims.map((claim) => ({ claimId: claim.claimId, decision: "admitted", classification: claim.candidateClassification, reasonCodes: ["fixture_admitted"] }));
     const coverage = normalizedSourceUnits(resolver).map((unit) => unit.kind === "meaningful"
-      ? { ...unit, disposition: "covered", reasonCodes: ["fixture_covered"], candidateClaimIds: subject.claims.map((claim) => claim.claimId) }
-      : { ...unit, disposition: "excluded", reasonCodes: [unit.kind], candidateClaimIds: [] });
-    return { threadId: this.threadId, turnId: this.turnId, resultText: JSON.stringify({ schemaVersion: 1, kind: "SourceClaimAudit", documentSetDigest: subject.documentSetDigest, candidateId: subject.candidateId, candidateDigest: subject.candidateDigest, decisions, coverage }) };
+      ? { coverageUnitId: unit.coverageUnitId, disposition: "covered", reasonCodes: ["fixture_covered"], candidateClaimIds: subject.claims.map((claim) => claim.claimId) }
+      : { coverageUnitId: unit.coverageUnitId, disposition: "excluded", reasonCodes: [unit.kind], candidateClaimIds: [] });
+    return { threadId: this.threadId, turnId: this.turnId, resultText: JSON.stringify({ decisions, coverage }) };
   }
 }
 
