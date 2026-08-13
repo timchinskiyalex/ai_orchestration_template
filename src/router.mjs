@@ -1525,7 +1525,7 @@ export class SwarmRouter extends EventEmitter {
       run.turnId = turn.turnId;
       this.store.setThread(task.id, { threadId: thread.threadId, turnId: turn.turnId });
       this.#lifecycle("migrated writer turn started", { taskId: task.id, threadId: thread.threadId, turnId: turn.turnId, runtime: "codex-app-server" });
-      const resultText = await this.#readMigratedWriterResult(runtime, thread.threadId, turn.turnId);
+      const resultText = await this.#readMigratedWriterResult(runtime, task, thread.threadId, turn.turnId);
       // Runtime text is retained solely as non-authoritative worker evidence.
       // WorktreeFinalizer reads Git and owns the only accepted artifact.
       this.store.setResultPath(task.id, this.#saveAgentResult(task, resultText));
@@ -1549,7 +1549,7 @@ export class SwarmRouter extends EventEmitter {
     }
   }
 
-  async #readMigratedWriterResult(runtime, threadId, turnId) {
+  async #readMigratedWriterResult(runtime, task, threadId, turnId) {
     let candidate;
     try { candidate = await runtime.observeTerminal({ threadId, turnId, timeoutMs: this.config.router.turnTimeoutMs }); }
     catch (error) { throw this.#migratedRuntimeFailure(error, "observe_terminal"); }
@@ -1563,11 +1563,22 @@ export class SwarmRouter extends EventEmitter {
       const code = durable.kind === "worker_cancelled" ? "worker_cancelled" : "worker_failed";
       throw new ExecutionProviderError(code, `migrated runtime terminal state: ${durable.terminalClass}`, { errorClass: "runtime" });
     }
+    // Persist the versioned provider receipt before reading prose or producing
+    // a Git-derived artifact.  The receipt grants no controller authority.
+    this.store.recordAppServerTerminalReceipt(task.id, durable.terminalReceipt);
     try {
       const result = await runtime.readFinalResult({ threadId, turnId: durable.turnId });
       if (typeof result.resultText !== "string" || !result.resultText.trim()) throw new Error("result_unavailable");
       return result.resultText;
-    } catch (error) { throw this.#migratedRuntimeFailure(error, "read_final_result"); }
+    } catch (error) {
+      // Worker prose is not finalization authority.  Once a verified receipt
+      // exists, a process-local thread/read loss cannot discard the real Git
+      // diff; its bounded diagnostics remain in the persisted receipt.
+      if (error instanceof ExecutionProviderError && error.errorCode === "execution_provider_terminal_unavailable") {
+        return `Codex App Server completed turn ${durable.turnId}; final prose was unavailable after terminal receipt.`;
+      }
+      throw this.#migratedRuntimeFailure(error, "read_final_result");
+    }
   }
 
   #migratedRuntimeFailure(error, operation) {
@@ -1576,7 +1587,9 @@ export class SwarmRouter extends EventEmitter {
       error.providerOperation = operation;
       return error;
     }
-    const failure = new ExecutionProviderError("transport_failure", String(error?.message ?? error), { errorClass: "runtime", diagnostics: error?.message });
+    const message = String(error?.message ?? error);
+    const errorCode = error?.errorCode ?? (message.toLowerCase().includes("thread not loaded") ? "execution_provider_terminal_unavailable" : "transport_failure");
+    const failure = new ExecutionProviderError(errorCode, message, { errorClass: error?.errorClass ?? "runtime", diagnostics: error?.diagnostics ?? error?.message });
     failure.migratedWriterFailure = true;
     failure.providerOperation = operation;
     return failure;
@@ -1606,7 +1619,7 @@ export class SwarmRouter extends EventEmitter {
         if (active) active.turnId = retry.turnId;
         this.store.setThread(task.id, { threadId, turnId: retry.turnId });
         this.#lifecycle("migrated writer repair turn started", { taskId: task.id, threadId, turnId: retry.turnId, attempt: attempt + 1 });
-        resultText = await this.#readMigratedWriterResult(runtime, threadId, retry.turnId);
+        resultText = await this.#readMigratedWriterResult(runtime, task, threadId, retry.turnId);
         this.store.setResultPath(task.id, this.#saveAgentResult(task, resultText));
       }
     }

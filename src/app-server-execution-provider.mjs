@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { AppServerClient } from "./app-server-client.mjs";
 import { EXECUTION_PROVIDER_VERSION, REQUIRED_EXECUTION_CAPABILITIES, envelope, lifecycleEvent, safeDiagnostics } from "./execution-provider-contract.mjs";
 
@@ -11,6 +12,8 @@ const usage = (params = {}) => {
 };
 const codeFor = (error) => {
   const text = String(error?.message ?? error).toLowerCase();
+  if (error?.errorCode) return error.errorCode;
+  if (text.includes("thread not loaded") || text.includes("terminal_reconciliation_unavailable")) return "execution_provider_terminal_unavailable";
   if (text.includes("timed out") || text.includes("timeout")) return "timeout";
   if (text.includes("exited")) return "process_exit";
   if (text.includes("closed") || text.includes("shutdown")) return "shutdown";
@@ -31,7 +34,8 @@ export class AppServerExecutionProvider extends EventEmitter {
   constructor({ cwd, client = null, clientFactory = null } = {}) {
     super();
     this.client = client ?? (clientFactory ? clientFactory({ cwd }) : new AppServerClient({ cwd }));
-    this.connected = false; this.closed = false; this.interrupted = new Set(); this.active = new Map(); this.approvalRequests = new Map();
+    this.connected = false; this.closed = false; this.interrupted = new Set(); this.active = new Map(); this.terminalReceipts = new Map(); this.approvalRequests = new Map();
+    this.providerConnectionId = randomUUID();
     this.client.on?.("notification", (message) => this.#notification(message));
     this.client.on?.("serverRequest", (message) => this.#serverRequest(message));
     this.client.on?.("protocol", (event) => this.#protocol(event));
@@ -62,35 +66,34 @@ export class AppServerExecutionProvider extends EventEmitter {
     return { threadId: args.data.threadId, turnId, providerRunId: `${args.data.threadId}:${turnId}`, terminalClass: turn.status, usage: usage(turn) };
   }); }
   async reconcileTerminal(args) { return this.#raw("reconcile_terminal", args, async () => {
-    // This is deliberately independent of lifecycle delivery: it is the
-    // controller-requested, bounded, read-only thread/read authority used
-    // before any task terminal state or review evidence is persisted.
-    const requestedTurnId = args.data.turnId;
-    let turn, reconciliationSource = "thread_read";
-    if (typeof this.client.readTerminalTurn === "function") {
-      turn = (await this.client.readTerminalTurn(args.data.threadId, requestedTurnId, args.data.timeoutMs))?.terminal;
-    } else {
-      const result = await this.client.readThread({ threadId: args.data.threadId, includeTurns: true });
-      const exact = (result?.thread?.turns ?? result?.turns ?? []).find((item) => item?.id === requestedTurnId);
-      // Older App Server schema fixtures omit the turn status but retain the
-      // exact, durable final agent message.  That is a narrowly defined
-      // equivalence contract for completed only; failed/interrupted still
-      // require an explicit durable terminal status.
-      const finalMessage = (exact?.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text;
-      turn = terminal.has(exact?.status) ? exact : (finalMessage?.trim() ? { ...exact, status: "completed" } : null);
-      if (turn?.status === "completed" && !terminal.has(exact?.status)) reconciliationSource = "thread_read_result_equivalence";
+    const { threadId, turnId: requestedTurnId, timeoutMs } = args.data;
+    const receipt = this.#terminalReceipt(threadId, requestedTurnId);
+    if (receipt) {
+      // `turn/completed` from this active provider connection is the terminal
+      // authority.  thread/read is useful corroboration only: Codex threads
+      // can be process-local and unavailable to a later server instance.
+      const corroboration = await this.#corroborateTerminal(threadId, requestedTurnId, timeoutMs, receipt.resolvedTurnId);
+      const terminalReceipt = { ...receipt, corroboration };
+      return {
+        threadId, turnId: receipt.resolvedTurnId, providerRunId: `${threadId}:${receipt.resolvedTurnId}`,
+        terminalClass: receipt.terminalClass, requestedTurnId, resolvedTurnId: receipt.resolvedTurnId,
+        reconciliationSource: "turn_completed_receipt",
+        verifiedEquivalence: receipt.resolvedTurnId === requestedTurnId ? "exact" : "observed_alias",
+        terminalReceipt
+      };
     }
-    if (!turn || !terminal.has(turn.status)) throw new Error("terminal_reconciliation_unavailable");
-    const resolvedTurnId = turn.id ?? requestedTurnId;
-    const resultText = (turn.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text;
-    this.#bind(args.data.threadId, resolvedTurnId, args.correlationId);
-    return {
-      threadId: args.data.threadId, turnId: resolvedTurnId, providerRunId: `${args.data.threadId}:${resolvedTurnId}`,
-      terminalClass: turn.status, requestedTurnId, resolvedTurnId,
-      reconciliationSource,
-      verifiedEquivalence: resolvedTurnId === requestedTurnId ? "exact" : "observed_alias",
-      ...(resultText?.trim() ? { resultText } : {})
-    };
+    const corroborated = await this.#readTerminalTurn(threadId, requestedTurnId, timeoutMs);
+    if (!corroborated.turn || !terminal.has(corroborated.turn.status)) {
+      throw Object.assign(new Error("no correlated terminal receipt or admissible thread/read corroboration"), { errorCode: "execution_provider_terminal_unavailable", errorClass: "protocol" });
+    }
+    const resolvedTurnId = corroborated.turn.id ?? requestedTurnId;
+    const active = this.#active(threadId, resolvedTurnId) ?? this.#active(threadId, requestedTurnId);
+    if (!active || (resolvedTurnId !== requestedTurnId && active.requestedTurnId !== requestedTurnId)) {
+      throw Object.assign(new Error("thread/read terminal is not correlated to the requested turn"), { errorCode: "execution_provider_terminal_unavailable", errorClass: "protocol" });
+    }
+    const resultText = (corroborated.turn.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text;
+    const terminalReceipt = this.#receipt({ threadId, requestedTurnId, resolvedTurnId, terminalClass: corroborated.turn.status, correlationId: active.correlationId, source: corroborated.source, corroboration: { available: true, source: corroborated.source, terminalClass: corroborated.turn.status } });
+    return { threadId, turnId: resolvedTurnId, providerRunId: `${threadId}:${resolvedTurnId}`, terminalClass: corroborated.turn.status, requestedTurnId, resolvedTurnId, reconciliationSource: corroborated.source, verifiedEquivalence: resolvedTurnId === requestedTurnId ? "exact" : "observed_alias", terminalReceipt, ...(resultText?.trim() ? { resultText } : {}) };
   }); }
   async readFinalResult(args) { return this.#raw("read_final_result", args, async () => { const result = await this.client.readThread({ threadId: args.data.threadId, includeTurns: true }); const turns = result?.thread?.turns ?? result?.turns ?? []; const turn = turns.find((item) => item?.id === args.data.turnId); const text = (turn?.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text; if (!text?.trim()) throw new Error("result_unavailable"); return { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: `${args.data.threadId}:${args.data.turnId}`, resultText: text }; }); }
   async interruptTurn(args) { const key = `${args.data.threadId}:${args.data.turnId}`; if (this.interrupted.has(key)) return this.#ok("interrupt_turn", args, { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: key, terminalClass: "interrupted" }); this.interrupted.add(key); return this.#raw("interrupt_turn", args, async () => { await this.client.interruptTurn(args.data); return { threadId: args.data.threadId, turnId: args.data.turnId, providerRunId: key, terminalClass: "interrupted" }; }); }
@@ -98,13 +101,17 @@ export class AppServerExecutionProvider extends EventEmitter {
   async shutdown(args) { if (!this.closed) { this.closed = true; await this.client.shutdown(); } return this.#ok("shutdown", args, { providerRunId: "app-server", terminalClass: "shutdown" }); }
   async diagnostics(args) { return this.#ok("diagnostics", args, { diagnostics: safeDiagnostics(this.client.diagnostics?.() ?? {}) }); }
 
-  #bind(threadId, turnId, correlationId) { if (typeof threadId === "string" && typeof turnId === "string" && typeof correlationId === "string") this.active.set(`${threadId}:${turnId}`, correlationId); }
-  #correlation(threadId, turnId) { return this.active.get(`${threadId}:${turnId}`) ?? null; }
+  #bind(threadId, turnId, correlationId, requestedTurnId = turnId) { if (typeof threadId === "string" && typeof turnId === "string" && typeof correlationId === "string") this.active.set(`${threadId}:${turnId}`, { correlationId, requestedTurnId }); }
+  #active(threadId, turnId) { return this.active.get(`${threadId}:${turnId}`) ?? null; }
+  #correlation(threadId, turnId) { return this.#active(threadId, turnId)?.correlationId ?? null; }
   #task(kind, params, data = {}) {
     const threadId = params?.threadId ?? params?.thread?.id;
     const turnId = params?.turnId ?? params?.turn?.id;
-    const correlationId = this.#correlation(threadId, turnId);
+    const active = this.#active(threadId, turnId); const correlationId = active?.correlationId ?? null;
     if (!correlationId || typeof threadId !== "string" || typeof turnId !== "string") return;
+    if (kind === "turn_completed" && terminal.has(data.terminalClass) && this.connected && !this.closed) {
+      this.terminalReceipts.set(`${threadId}:${turnId}`, this.#receipt({ threadId, requestedTurnId: active.requestedTurnId, resolvedTurnId: turnId, terminalClass: data.terminalClass, correlationId, source: "turn_completed" }));
+    }
     this.emit("lifecycle", lifecycleEvent({ kind, correlationId, data: { threadId, turnId, providerRunId: `${threadId}:${turnId}`, ...data } }));
   }
   #notification(message) {
@@ -118,7 +125,7 @@ export class AppServerExecutionProvider extends EventEmitter {
     if (event?.method !== "turn-id-alias" || typeof event.threadId !== "string" || typeof event.requestedTurnId !== "string" || typeof event.resolvedTurnId !== "string") return;
     const correlationId = this.#correlation(event.threadId, event.requestedTurnId);
     if (!correlationId) return;
-    this.#bind(event.threadId, event.resolvedTurnId, correlationId);
+    this.#bind(event.threadId, event.resolvedTurnId, correlationId, event.requestedTurnId);
     this.emit("lifecycle", lifecycleEvent({ kind: "turn_alias", correlationId, data: { threadId: event.threadId, turnId: event.resolvedTurnId, requestedTurnId: event.requestedTurnId, resolvedTurnId: event.resolvedTurnId, providerRunId: `${event.threadId}:${event.resolvedTurnId}` } }));
   }
   #serverRequest(message) {
@@ -137,5 +144,33 @@ export class AppServerExecutionProvider extends EventEmitter {
   async #raw(operation, args, fn) { try { return this.#ok(operation, args, await fn()); } catch (error) { return this.#caught(operation, args, error); } }
   #ok(operation, args, data) { return envelope({ operation, correlationId: args.correlationId, success: true, data }); }
   #failure(operation, args, errorCode, errorClass) { return envelope({ operation, correlationId: args.correlationId, success: false, errorCode, errorClass }); }
-  #caught(operation, args, error) { const errorCode = String(error?.message) === "result_unavailable" ? "result_unavailable" : String(error?.message) === "turn_failed" ? "turn_failed" : codeFor(error); return envelope({ operation, correlationId: args.correlationId, success: false, errorCode, errorClass: "transport", diagnostics: error?.message }); }
+  #receipt({ threadId, requestedTurnId, resolvedTurnId, terminalClass, correlationId, source, corroboration = null }) { return Object.freeze({ schemaVersion: 1, kind: "AppServerTerminalReceipt", source, capturedAt: new Date().toISOString(), providerConnectionId: this.providerConnectionId, correlationId, threadId, requestedTurnId, resolvedTurnId, terminalClass, corroboration }); }
+  #terminalReceipt(threadId, requestedTurnId) {
+    const exact = this.terminalReceipts.get(`${threadId}:${requestedTurnId}`);
+    if (exact?.requestedTurnId === requestedTurnId) return exact;
+    for (const receipt of this.terminalReceipts.values()) if (receipt.threadId === threadId && receipt.requestedTurnId === requestedTurnId) return receipt;
+    return null;
+  }
+  async #readTerminalTurn(threadId, turnId, timeoutMs) {
+    if (this.client.diagnostics?.().process?.exited === true) {
+      throw Object.assign(new Error("same-provider thread/read unavailable after provider exit"), { errorCode: "execution_provider_terminal_unavailable", errorClass: "transport" });
+    }
+    if (typeof this.client.readTerminalTurn === "function") return { turn: (await this.client.readTerminalTurn(threadId, turnId, timeoutMs))?.terminal ?? null, source: "same_provider_thread_read" };
+    const result = await this.client.readThread({ threadId, includeTurns: true }); const exact = (result?.thread?.turns ?? result?.turns ?? []).find((item) => item?.id === turnId);
+    const finalMessage = (exact?.items ?? []).filter((item) => item?.type === "agentMessage" && typeof item.text === "string").at(-1)?.text;
+    // Legacy fixtures may expose only an exact final message through the same
+    // live provider.  This remains bounded corroboration, never an accepted
+    // lifecycle receipt and never a cross-process authority.
+    if (finalMessage?.trim() && !terminal.has(exact?.status)) return { turn: { ...exact, status: "completed" }, source: "same_provider_thread_read_result_equivalence" };
+    return { turn: terminal.has(exact?.status) ? exact : null, source: "same_provider_thread_read" };
+  }
+  async #corroborateTerminal(threadId, requestedTurnId, timeoutMs, resolvedTurnId) {
+    try {
+      const corroborated = await this.#readTerminalTurn(threadId, requestedTurnId, timeoutMs);
+      const turn = corroborated.turn;
+      if (turn && terminal.has(turn.status) && turn.id === resolvedTurnId) return { available: true, source: corroborated.source, terminalClass: turn.status };
+      return { available: false, source: corroborated.source, reason: "terminal_not_found_or_identity_mismatch" };
+    } catch (error) { return { available: false, source: "same_provider_thread_read", reason: "unavailable", diagnostics: safeDiagnostics(error?.message ?? error) }; }
+  }
+  #caught(operation, args, error) { const errorCode = String(error?.message) === "result_unavailable" ? "result_unavailable" : String(error?.message) === "turn_failed" ? "turn_failed" : codeFor(error); return envelope({ operation, correlationId: args.correlationId, success: false, errorCode, errorClass: error?.errorClass ?? "transport", diagnostics: error?.diagnostics ?? error?.message }); }
 }

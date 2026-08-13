@@ -156,6 +156,7 @@ export async function runCodexRuntimeProbe({ args = [], runtimeFactory = ({ cwd 
     durableTerminal = await runtime.reconcileTerminal({ threadId, turnId: requestedTurnId, timeoutMs: 30_000 });
     resolvedTurnId = durableTerminal.turnId;
     if (durableTerminal.terminalClass !== "completed") throw new Error(`Probe requires a durable completed terminal, got ${durableTerminal.terminalClass}`);
+    if (durableTerminal.terminalReceipt?.schemaVersion !== 1 || durableTerminal.terminalReceipt?.kind !== "AppServerTerminalReceipt") throw new Error("Probe requires a versioned AppServerTerminalReceipt");
     stage = "durable terminal reconciled"; log(`[probe] ${stage}`);
     const changedPaths = assertAcceptedProbeDiff({ worktree: repository.worktree, baseSha: repository.baseSha });
     stage = "diff validated"; log(`[probe] ${stage}`);

@@ -149,7 +149,10 @@ export class CodexAppServerRuntime extends EventEmitter {
     try {
       response = await method.call(this.#transport, { contractVersion: EXECUTION_PROVIDER_VERSION, correlationId, data });
     } catch (error) {
-      throw new ExecutionProviderError("transport_failure", String(error?.message ?? error), { errorClass: "transport" });
+      if (error instanceof ExecutionProviderError) throw error;
+      const message = String(error?.message ?? error);
+      const errorCode = error?.errorCode ?? (message.toLowerCase().includes("thread not loaded") ? "execution_provider_terminal_unavailable" : "transport_failure");
+      throw new ExecutionProviderError(errorCode, message, { errorClass: error?.errorClass ?? "transport", diagnostics: error?.diagnostics ?? message });
     }
     return validateEnvelope(response, { operation, correlationId, requiredIds });
   }

@@ -11,9 +11,9 @@ import {
 import { EXECUTION_PROVIDER_VERSION, validateEnvelope } from "../src/execution-provider-contract.mjs";
 
 class FakeAppServerClient extends EventEmitter {
-  constructor({ alias = false, disconnect = false, timeout = false } = {}) {
+  constructor({ alias = false, disconnect = false, timeout = false, threadReadError = null } = {}) {
     super();
-    this.alias = alias; this.disconnect = disconnect; this.timeout = timeout; this.calls = []; this.closed = false;
+    this.alias = alias; this.disconnect = disconnect; this.timeout = timeout; this.threadReadError = threadReadError; this.calls = []; this.closed = false;
     this.threadId = "thread-controller-cwd"; this.requestedTurnId = "turn-requested";
     this.resolvedTurnId = alias ? "turn-resolved" : this.requestedTurnId;
   }
@@ -24,6 +24,7 @@ class FakeAppServerClient extends EventEmitter {
   async waitForTurn() { this.calls.push(["turn/wait"]); if (this.timeout) throw new Error("timed out"); return { id: this.requestedTurnId, status: "completed" }; }
   async readTerminalTurn(threadId, turnId, timeoutMs) {
     this.calls.push(["thread/read-terminal", { threadId, turnId, timeoutMs }]);
+    if (this.threadReadError) throw new Error(this.threadReadError);
     return { terminal: { id: this.resolvedTurnId, status: "completed", items: [{ type: "agentMessage", text: "final result" }] } };
   }
   async readThread({ threadId }) { this.calls.push(["thread/read", { threadId }]); return { thread: { turns: [{ id: this.resolvedTurnId, status: "completed", items: [{ type: "agentMessage", text: "final result" }] }] } }; }
@@ -87,6 +88,40 @@ test("runtime completion is a turn observation and cannot complete a controller 
   assert.equal(typeof modern.runtime.finalize, "undefined");
   assert.equal(typeof modern.runtime.transition, "undefined");
   assert.equal(typeof modern.runtime.recordWorkerArtifact, "undefined");
+});
+
+test("a correlated turn/completed receipt remains terminal authority when same-provider thread/read is unavailable", async () => {
+  const client = new FakeAppServerClient({ threadReadError: "thread/read: thread not loaded: thread-controller-cwd" });
+  const runtime = new CodexAppServerRuntime({ cwd: "D:/controller-authorized/worktree", client });
+  await runtime.connect(); const thread = await runtime.startThread(); const turn = await runtime.startGoalTurn({ threadId: thread.threadId, goal: {}, turn: {} });
+  client.emit("notification", { method: "turn/completed", params: { threadId: thread.threadId, turn: { id: turn.turnId, status: "completed" } } });
+  const durable = await runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 });
+  assert.equal(durable.terminalReceipt.schemaVersion, 1);
+  assert.equal(durable.terminalReceipt.source, "turn_completed");
+  assert.deepEqual(durable.terminalReceipt.corroboration.available, false);
+  assert.match(durable.terminalReceipt.corroboration.diagnostics, /thread\/read: thread not loaded/);
+  assert.equal(durable.reconciliationSource, "turn_completed_receipt");
+});
+
+test("a correlated terminal receipt records successful bounded same-provider corroboration", async () => {
+  const client = new FakeAppServerClient(); const runtime = new CodexAppServerRuntime({ cwd: "D:/controller-authorized/worktree", client });
+  await runtime.connect(); const thread = await runtime.startThread(); const turn = await runtime.startGoalTurn({ threadId: thread.threadId, goal: {}, turn: {} });
+  client.emit("notification", { method: "turn/completed", params: { threadId: thread.threadId, turn: { id: turn.turnId, status: "completed" } } });
+  const durable = await runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 });
+  assert.deepEqual(durable.terminalReceipt.corroboration, { available: true, source: "same_provider_thread_read", terminalClass: "completed" });
+});
+
+test("missing status, foreign identities, and untrusted aliases cannot create a terminal receipt", async () => {
+  for (const params of [
+    { threadId: "thread-controller-cwd", turn: { id: "turn-requested" } },
+    { threadId: "other-thread", turn: { id: "turn-requested", status: "completed" } },
+    { threadId: "thread-controller-cwd", turn: { id: "other-turn", status: "completed" } }
+  ]) {
+    const client = new FakeAppServerClient({ threadReadError: "thread/read: thread not loaded" }); const runtime = new CodexAppServerRuntime({ cwd: "D:/controller-authorized/worktree", client });
+    await runtime.connect(); const thread = await runtime.startThread(); const turn = await runtime.startGoalTurn({ threadId: thread.threadId, goal: {}, turn: {} });
+    client.emit("notification", { method: "turn/completed", params });
+    await assert.rejects(runtime.reconcileTerminal({ threadId: thread.threadId, turnId: turn.turnId, timeoutMs: 17 }), (error) => error?.errorCode === "execution_provider_terminal_unavailable");
+  }
 });
 
 test("thin runtime exposes only normalized progress, timeout/cancellation, and disconnect diagnostics", async () => {

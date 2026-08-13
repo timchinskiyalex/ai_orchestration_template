@@ -710,6 +710,14 @@ export class StateStore {
     catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
+  recordAppServerTerminalReceipt(taskId, receipt) {
+    if (!receipt || receipt.schemaVersion !== 1 || receipt.kind !== "AppServerTerminalReceipt") throw new Error("AppServerTerminalReceipt must be versioned");
+    if (!["turn_completed", "same_provider_thread_read", "same_provider_thread_read_result_equivalence"].includes(receipt.source)) throw new Error("AppServerTerminalReceipt source is not accepted");
+    if (!["completed", "failed", "interrupted", "cancelled"].includes(receipt.terminalClass)) throw new Error("AppServerTerminalReceipt terminal class is not explicit");
+    for (const key of ["threadId", "requestedTurnId", "resolvedTurnId", "correlationId", "providerConnectionId", "capturedAt"]) if (typeof receipt[key] !== "string" || !receipt[key]) throw new Error(`AppServerTerminalReceipt lacks ${key}`);
+    this.#mutate(taskId, "app-server/terminal-receipt", receipt, () => {});
+  }
+
   events({ after = 0, limit = 500 } = {}) {
     return this.db.prepare("SELECT sequence, task_id, type, payload_json, created_at FROM events WHERE sequence > ? ORDER BY sequence ASC LIMIT ?").all(after, limit)
       .map((row) => ({ sequence: row.sequence, taskId: row.task_id, type: row.type, payload: parse(row.payload_json, {}), createdAt: row.created_at }));

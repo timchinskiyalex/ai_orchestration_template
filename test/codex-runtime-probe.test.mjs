@@ -32,7 +32,7 @@ class QuotaFreeRuntime {
     return { turnId: "turn-requested" };
   }
   async observeTerminal() { this.calls.push("observe"); return { kind: "worker_terminal_candidate", terminalClass: "completed", turnId: "turn-requested" }; }
-  async reconcileTerminal() { this.calls.push("reconcile"); return { kind: "worker_completed", terminalClass: "completed", turnId: "turn-resolved", requestedTurnId: "turn-requested", resolvedTurnId: "turn-resolved" }; }
+  async reconcileTerminal() { this.calls.push("reconcile"); return { kind: "worker_completed", terminalClass: "completed", turnId: "turn-resolved", requestedTurnId: "turn-requested", resolvedTurnId: "turn-resolved", terminalReceipt: { schemaVersion: 1, kind: "AppServerTerminalReceipt", source: "turn_completed", threadId: "thread-probe", requestedTurnId: "turn-requested", resolvedTurnId: "turn-resolved", terminalClass: "completed" } }; }
   async diagnostics() { return { connected: true, closed: false, diagnostics: JSON.stringify({ process: { alive: true, exited: false, code: null, signal: null } }) }; }
   async shutdown() { this.calls.push("shutdown"); }
 }
@@ -71,6 +71,7 @@ test("quota-free compatibility harness passes only from exact cwd, actual diff, 
     assert.equal(result.taskId, CODEX_RUNTIME_PROBE_TASK_ID);
     assert.deepEqual(result.changedPaths, [CODEX_RUNTIME_PROBE_ALLOWED_PATH]);
     assert.equal(result.artifact.baseSha, result.baseSha);
+    assert.equal(runtime.calls.includes("reconcile"), true, "fake runtime exercises the terminal receipt path");
     assert.notEqual(result.artifact.headSha, result.baseSha);
     assert.deepEqual(result.artifact.changedPaths, [CODEX_RUNTIME_PROBE_ALLOWED_PATH]);
     assert.match(result.artifact.diffChecksum, /^[a-f0-9]{64}$/);

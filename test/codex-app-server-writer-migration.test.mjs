@@ -14,17 +14,18 @@ const deferred = () => { let resolve; const promise = new Promise((done) => { re
 const writerRoles = new Set(["frontend", "backend", "database", "devops"]);
 
 class RuntimeClient extends EventEmitter {
-  constructor({ onStart = null, resultText = "worker prose claims README.md changed", terminal = "completed", wait = null, timeout = false, disconnect = false } = {}) {
-    super(); this.onStart = onStart; this.resultText = resultText; this.terminal = terminal; this.wait = wait; this.timeout = timeout; this.disconnect = disconnect; this.sequence = 0; this.threads = new Map(); this.calls = [];
+  constructor({ onStart = null, resultText = "worker prose claims README.md changed", terminal = "completed", wait = null, timeout = false, disconnect = false, terminalNotification = null, readUnavailable = false, exitBeforeTerminal = false } = {}) {
+    super(); this.onStart = onStart; this.resultText = resultText; this.terminal = terminal; this.wait = wait; this.timeout = timeout; this.disconnect = disconnect; this.terminalNotification = terminalNotification; this.readUnavailable = readUnavailable; this.exitBeforeTerminal = exitBeforeTerminal; this.sequence = 0; this.threads = new Map(); this.calls = [];
   }
   async connect() { this.calls.push("connect"); if (this.disconnect) throw new Error("transport closed"); }
   async request() { return {}; }
   async startThread(data) { const id = `thread-${++this.sequence}`; this.threads.set(id, { cwd: data.cwd, goal: "", turnId: null }); this.calls.push(["thread", data]); return { thread: { id } }; }
   async setGoal(data) { this.threads.get(data.threadId).goal = data.objective ?? ""; this.calls.push(["goal", data]); }
-  async startTurn(data) { const thread = this.threads.get(data.threadId); const id = `turn-${data.threadId}-${++this.sequence}`; thread.turnId = id; this.calls.push(["turn", data]); await this.onStart?.({ cwd: thread.cwd, threadId: data.threadId, turnId: id, goal: thread.goal }); return { turn: { id } }; }
-  async waitForTurn(threadId, turnId) { this.calls.push("wait"); if (this.timeout) throw new Error("bounded timeout"); await this.wait?.promise; return { id: turnId, status: this.terminal }; }
-  async readTerminalTurn(threadId, turnId) { return { terminal: { id: turnId, status: this.terminal, items: [{ type: "agentMessage", text: this.resultText }] } }; }
-  async readThread({ threadId }) { const thread = this.threads.get(threadId); return { thread: { turns: [{ id: thread.turnId, status: this.terminal, items: [{ type: "agentMessage", text: this.resultText }] }] } }; }
+  async startTurn(data) { const thread = this.threads.get(data.threadId); const id = `turn-${data.threadId}-${++this.sequence}`; thread.turnId = id; this.calls.push(["turn", data]); await this.onStart?.({ cwd: thread.cwd, threadId: data.threadId, turnId: id, goal: thread.goal }); if (this.terminalNotification?.when === "before_start_result") this.#terminalNotification(data.threadId, id); return { turn: { id } }; }
+  async waitForTurn(threadId, turnId) { this.calls.push("wait"); if (this.timeout) throw new Error("bounded timeout"); if (this.exitBeforeTerminal) { this.emit("exit", { code: 17, signal: "SIGTERM" }); throw new Error("App Server exited during turn"); } await this.wait?.promise; if (this.terminalNotification?.when === "wait") this.#terminalNotification(threadId, turnId); return { id: turnId, status: this.terminal }; }
+  #terminalNotification(threadId, turnId) { const mode = this.terminalNotification?.mode ?? "valid"; const params = mode === "missing_status" ? { threadId, turn: { id: turnId } } : mode === "wrong_thread" ? { threadId: "other-thread", turn: { id: turnId, status: this.terminal } } : mode === "wrong_turn" || mode === "untrusted_alias" ? { threadId, turn: { id: "other-turn", status: this.terminal } } : { threadId, turn: { id: turnId, status: this.terminal } }; this.emit("notification", { method: "turn/completed", params }); }
+  async readTerminalTurn(threadId, turnId) { if (this.readUnavailable) throw new Error(`thread/read: thread not loaded: ${threadId}`); return { terminal: { id: turnId, status: this.terminal, items: [{ type: "agentMessage", text: this.resultText }] } }; }
+  async readThread({ threadId }) { if (this.readUnavailable) throw new Error(`thread/read: thread not loaded: ${threadId}`); const thread = this.threads.get(threadId); return { thread: { turns: [{ id: thread.turnId, status: this.terminal, items: [{ type: "agentMessage", text: this.resultText }] }] } }; }
   async interruptTurn() { this.terminal = "cancelled"; }
   async shutdown() { this.calls.push("shutdown"); }
   diagnostics() { return { process: { exited: this.disconnect } }; }
@@ -85,6 +86,32 @@ test("Phase 2: completion is non-authoritative; Git finalizer creates the artifa
     assert.deepEqual(during, { status: "running", artifact: null, cwd: fx.router.store.getTask(task.id).worktree });
     assert.deepEqual(artifact.changedPaths, ["src/value.mjs"]); assert.equal(fx.router.store.getTask(task.id).status, "done");
   } finally { fx.router.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Phase 2: verified turn/completed receipt survives thread/read loss and permits controller artifact finalization", async () => {
+  const { root } = repository(); const fx = subject(root, { clientOptions: { terminalNotification: { when: "wait" }, readUnavailable: true, onStart: ({ cwd }) => writeFileSync(join(cwd, "src", "value.mjs"), "export const value = 2;\n") } });
+  try {
+    const task = await writer(fx); await fx.router.runUntilIdle();
+    assert.equal(fx.router.store.getTask(task.id).status, "done"); assert.ok(fx.router.store.workerArtifact(task.id));
+    const receipt = fx.router.store.events().find((event) => event.taskId === task.id && event.type === "app-server/terminal-receipt")?.payload;
+    assert.equal(receipt?.source, "turn_completed"); assert.equal(receipt?.corroboration?.available, false); assert.match(receipt?.corroboration?.diagnostics ?? "", /thread\/read: thread not loaded/);
+  } finally { fx.router.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Phase 2: malformed, foreign, alias, or stale terminal events fail closed without an artifact", async () => {
+  for (const terminalNotification of [
+    { when: "wait", mode: "missing_status" }, { when: "wait", mode: "wrong_thread" }, { when: "wait", mode: "wrong_turn" }, { when: "wait", mode: "untrusted_alias" }, { when: "before_start_result", mode: "valid" }
+  ]) {
+    const { root } = repository(); const fx = subject(root, { clientOptions: { terminalNotification, readUnavailable: true, onStart: ({ cwd }) => writeFileSync(join(cwd, "src", "value.mjs"), "export const value = 2;\n") } });
+    try { const task = await writer(fx); await fx.router.runUntilIdle(); const stored = fx.router.store.getTask(task.id); assert.equal(stored.status, "failed"); assert.match(stored.error, /execution_provider_terminal_unavailable/); assert.equal(fx.router.store.workerArtifact(task.id), null); }
+    finally { fx.router.close(); rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test("Phase 2: process exit before a verified terminal receipt is a typed failure without an artifact", async () => {
+  const { root } = repository(); const fx = subject(root, { clientOptions: { exitBeforeTerminal: true, onStart: ({ cwd }) => writeFileSync(join(cwd, "src", "value.mjs"), "export const value = 2;\n") } });
+  try { const task = await writer(fx); await fx.router.runUntilIdle(); const stored = fx.router.store.getTask(task.id); assert.equal(stored.status, "failed"); assert.match(stored.error, /process_exit/); assert.equal(fx.router.store.workerArtifact(task.id), null); }
+  finally { fx.router.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
 for (const scenario of [
