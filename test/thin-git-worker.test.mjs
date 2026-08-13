@@ -40,6 +40,20 @@ test("rejects an empty worker diff", async () => {
   await worker(async ({ baseSha }, isolated) => assert.rejects(() => finalizeWorkerArtifact({ taskId: "empty", worktree: isolated.worktree, baseSha, allowedPaths: ["src"] }), /no diff/i));
 });
 
+test("excludes generated build and local database output from the committed artifact", async () => {
+  await worker(async ({ baseSha }, isolated) => {
+    writeFileSync(join(isolated.worktree, "src", "base.txt"), "changed\n");
+    mkdirSync(join(isolated.worktree, "src", "bin", "Debug"), { recursive: true });
+    mkdirSync(join(isolated.worktree, "src", "obj"), { recursive: true });
+    writeFileSync(join(isolated.worktree, "src", "bin", "Debug", "app.dll"), "generated");
+    writeFileSync(join(isolated.worktree, "src", "obj", "assets.json"), "generated");
+    writeFileSync(join(isolated.worktree, "src", "local.db"), "runtime-db");
+    const artifact = await finalizeWorkerArtifact({ taskId: "source-only", worktree: isolated.worktree, baseSha, allowedPaths: ["src"] });
+    assert.deepEqual(artifact.changedPaths, ["src/base.txt"]);
+    assert.equal(git(isolated.worktree, "show", "--format=", "--name-only", "HEAD"), "src/base.txt");
+  });
+});
+
 test("rejects an out-of-scope diff", async () => {
   await worker(async ({ baseSha }, isolated) => {
     writeFileSync(join(isolated.worktree, "outside.txt"), "no\n");

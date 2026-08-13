@@ -36,6 +36,12 @@ function parseStatus(buffer) {
 function allowed(path, allowedPaths) {
   return allowedPaths.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
 }
+function isGeneratedRuntimePath(path) {
+  const segments = path.split("/");
+  const file = segments.at(-1).toLowerCase();
+  return segments.some((segment) => ["bin", "obj", "node_modules", ".next", "coverage"].includes(segment.toLowerCase()))
+    || file.endsWith(".db") || file.endsWith(".db-shm") || file.endsWith(".db-wal");
+}
 
 /**
  * Controller-side only finalization. Worker code never receives Git identity.
@@ -51,8 +57,9 @@ export async function finalizeWorkerArtifact({ taskId, worktree, baseSha, allowe
     gitBuffer(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
   ]);
   if (head !== baseSha || mergeBase !== baseSha) throw new Error("Worker must not create commits before controller finalization");
-  const changedPaths = parseStatus(status);
-  if (!changedPaths.length) throw new Error("Worker produced no diff");
+  const observedPaths = parseStatus(status);
+  const changedPaths = observedPaths.filter((path) => !isGeneratedRuntimePath(path));
+  if (!changedPaths.length) throw new Error("Worker produced no diff after generated runtime output was excluded");
   const forbidden = changedPaths.filter((path) => !allowed(path, normalizedAllowed));
   if (forbidden.length) throw new Error(`Worker changed paths outside allowedPaths: ${forbidden.join(", ")}`);
 
@@ -73,4 +80,4 @@ export async function finalizeWorkerArtifact({ taskId, worktree, baseSha, allowe
   return { taskId, baseSha, headSha: commitSha, changedPaths: staged, commitSha, diffChecksum: createHash("sha256").update(diff).digest("hex") };
 }
 
-export const thinFinalizer = { normalizePath, parseStatus, RUNTIME_IDENTITY };
+export const thinFinalizer = { normalizePath, parseStatus, isGeneratedRuntimePath, RUNTIME_IDENTITY };

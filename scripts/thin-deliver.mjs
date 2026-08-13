@@ -95,9 +95,10 @@ export async function runThinDeliver({ argv = process.argv.slice(2), stdout = co
 
 async function runLive({ markdown, repository, verify, repairSurface, stdout }) {
   const runtimeDir = mkdtempSync(join(tmpdir(), "thin-orchestrator-runtime-"));
+  let result = null;
   try {
     stdout("[plan] started");
-    const result = await runThinOrchestrator({
+    result = await runThinOrchestrator({
       repository,
       runtimeDir,
       markdown,
@@ -119,7 +120,8 @@ async function runLive({ markdown, repository, verify, repairSurface, stdout }) 
     });
     return result;
   } finally {
-    rmSync(runtimeDir, { recursive: true, force: true });
+    if (result?.ok) rmSync(runtimeDir, { recursive: true, force: true });
+    else stdout(`[recovery] runtime preserved ${runtimeDir}`);
   }
 }
 
