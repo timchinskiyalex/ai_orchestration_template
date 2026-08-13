@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 import { dirname, join } from "node:path";
 import { ExecutionProviderError } from "../src/execution-provider-contract.mjs";
-import { auditSubjectFromExtraction, normalizedSourceUnits } from "../src/source-claim-audit.mjs";
+import { auditSubjectFromExtraction } from "../src/source-claim-audit.mjs";
 import { createImportedSourceResolver } from "../src/source-evidence.mjs";
 import { parseSourceIntakeProbeArgs, runSourceIntakeProbe, SOURCE_INTAKE_PROBE_CONFIRMATION } from "../src/source-intake-probe.mjs";
 
@@ -14,7 +14,7 @@ function receipt({ threadId, turnId }) {
 }
 
 class ProbeRuntime {
-  constructor({ cwd, role, failure = null }) { this.cwd = cwd; this.role = role; this.failure = failure; this.threadId = `thread-${role}`; this.turnId = `turn-${role}`; }
+  constructor({ cwd, role, failure = null, claimCount = 1 }) { this.cwd = cwd; this.role = role; this.failure = failure; this.claimCount = claimCount; this.threadId = `thread-${role}`; this.turnId = `turn-${role}`; }
   async connect() {}
   async shutdown() {}
   async diagnostics() {
@@ -32,20 +32,17 @@ class ProbeRuntime {
     const resolver = createImportedSourceResolver({ repository: root, documentationDir: "docs/orchestration-input" });
     if (this.role === "source_claim_extraction") {
       const document = resolver.sourceDocuments[0];
-      return { threadId: this.threadId, turnId: this.turnId, resultText: JSON.stringify({ schemaVersion: 1, kind: "SourceClaimExtractionCandidate", claims: [{ claimType: "constraint", normalizedStatement: "An admitted manifest must exist before engineering work is queued.", classification: "mandatory", sourceLocation: { documentId: document.documentId, startLine: 2, endLine: 2 } }] }) };
+      return { threadId: this.threadId, turnId: this.turnId, resultText: JSON.stringify({ schemaVersion: 1, kind: "SourceClaimExtractionCandidate", claims: Array.from({ length: this.claimCount }, (_, index) => ({ claimType: "constraint", normalizedStatement: `An admitted manifest requirement ${index + 1}.`, classification: "mandatory", sourceLocation: { documentId: document.documentId, startLine: index + 2, endLine: index + 2 } })) }) };
     }
     const directory = join(root, "docs", "orchestration-generated", "source-claim-extractions");
     const extraction = JSON.parse(readFileSync(join(directory, readdirSync(directory)[0]), "utf8"));
     const subject = auditSubjectFromExtraction(extraction);
     const decisions = subject.claims.map((claim) => ({ claimId: claim.claimId, decision: "admitted", classification: claim.candidateClassification, reasonCodes: ["fixture_admitted"] }));
-    const coverage = normalizedSourceUnits(resolver).map((unit) => unit.kind === "meaningful"
-      ? { coverageUnitId: unit.coverageUnitId, disposition: "covered", reasonCodes: ["fixture_covered"], candidateClaimIds: subject.claims.map((claim) => claim.claimId) }
-      : { coverageUnitId: unit.coverageUnitId, disposition: "excluded", reasonCodes: [unit.kind], candidateClaimIds: [] });
-    return { threadId: this.threadId, turnId: this.turnId, resultText: JSON.stringify({ decisions, coverage }) };
+    return { threadId: this.threadId, turnId: this.turnId, resultText: JSON.stringify({ decisions }) };
   }
 }
 
-const factory = (failure = null) => ({ cwd, role }) => new ProbeRuntime({ cwd, role, failure });
+const factory = (failure = null, claimCount = 1) => ({ cwd, role }) => new ProbeRuntime({ cwd, role, failure, claimCount });
 
 test("source intake probe requires the explicit quota-spend confirmation and accepts no worker argument", () => {
   assert.deepEqual(parseSourceIntakeProbeArgs([SOURCE_INTAKE_PROBE_CONFIRMATION]), { confirmed: true });
@@ -66,6 +63,17 @@ test("source intake probe success fixture persists only intake artifacts and cle
   assert.equal(existsSync(createdRoot), false, "passed probes remove their disposable root");
   assert.deepEqual(progress, ["extraction started", "extraction completed", "audit started", "audit completed", "manifest admitted", "probe passed"]);
   assert.equal(observed.taskCount, 0); assert.ok(observed.extraction?.artifactPath); assert.ok(observed.audit?.artifactPath); assert.ok(observed.manifest?.manifest); assert.ok(observed.extractionReceipt?.receipt); assert.ok(observed.auditReceipt?.receipt);
+});
+
+test("quota-free multiclaim probe accepts three decisions and controller-generates all coverage", async () => {
+  let observed = null;
+  const result = await runSourceIntakeProbe({ timeoutMs: 5_000, model: "fixture", sourceIntakeRuntimeFactory: factory(null, 3), fixture: { requirements: ["First controller requirement.", "Second controller requirement.", "Third controller requirement."] }, onPassed: ({ router, run }) => {
+    observed = { audit: router.store.sourceClaimAudit(run.sourceClaimAuditId).audit, manifest: router.store.sourceClaimManifest(run.sourceClaimManifestId).manifest };
+  } });
+  assert.equal(result.status, "passed"); assert.equal(observed.audit.decisions.length, 3); assert.equal(observed.manifest.claims.length, 3);
+  const meaningful = observed.audit.coverage.filter((unit) => unit.kind === "meaningful");
+  assert.equal(meaningful.length, 3); assert.deepEqual(meaningful.map((unit) => [unit.disposition, unit.reasonCodes, unit.candidateClaimIds.length]), [["covered", ["admitted_claim_coverage"], 1], ["covered", ["admitted_claim_coverage"], 1], ["covered", ["admitted_claim_coverage"], 1]]);
+  assert.deepEqual(observed.audit.coverage.find((unit) => unit.kind === "structural_header").reasonCodes, ["structural_header"]);
 });
 
 test("audit failure preserves a bounded redacted report and never queues Bootstrap", async () => {

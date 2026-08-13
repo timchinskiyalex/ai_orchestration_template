@@ -63,12 +63,13 @@ export function sourceIntakeProbeConfig({ root, timeoutMs, model, sourceIntakeRu
   };
 }
 
-function createProbeFixture(root) {
+function createProbeFixture(root, { requirements = ["The controller must persist an admitted source claim manifest before engineering work can be queued."] } = {}) {
+  if (!Array.isArray(requirements) || !requirements.length || requirements.some((item) => typeof item !== "string" || !item.trim())) throw new Error("Source intake probe fixture requirements must be non-empty strings");
   const source = join(root, "raw-markdown-package");
   git(root, ["init", "-b", "main"]);
   mkdirSync(source, { recursive: true });
   writeFileSync(join(root, "README.md"), "# Source intake probe repository\n", "utf8");
-  writeFileSync(join(source, "requirements.md"), "# Requirements\nThe controller must persist an admitted source claim manifest before engineering work can be queued.\n", "utf8");
+  writeFileSync(join(source, "requirements.md"), `# Requirements\n${requirements.join("\n")}\n`, "utf8");
   git(root, ["add", "."]);
   git(root, ["-c", "user.name=Source Intake Probe", "-c", "user.email=source-intake-probe@example.test", "commit", "-m", "probe fixture"]);
   return source;
@@ -165,7 +166,7 @@ async function withProbeTimeout({ timeoutMs, operation, onTimeout }) {
   } finally { clearTimeout(timer); }
 }
 
-export async function runSourceIntakeProbe({ timeoutMs = Number(process.env.CODEX_SOURCE_INTAKE_PROBE_TIMEOUT_MS ?? 180_000), model = process.env.CODEX_E2E_MODEL ?? "gpt-5.6-terra", progress = (message) => console.log(`[intake-probe] ${message}`), sourceIntakeRuntimeFactory = null, rootFactory = () => mkdtempSync(join(tmpdir(), ROOT_PREFIX)), onPassed = null } = {}) {
+export async function runSourceIntakeProbe({ timeoutMs = Number(process.env.CODEX_SOURCE_INTAKE_PROBE_TIMEOUT_MS ?? 180_000), model = process.env.CODEX_E2E_MODEL ?? "gpt-5.6-terra", progress = (message) => console.log(`[intake-probe] ${message}`), sourceIntakeRuntimeFactory = null, rootFactory = () => mkdtempSync(join(tmpdir(), ROOT_PREFIX)), onPassed = null, fixture = null } = {}) {
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000) throw new Error("CODEX_SOURCE_INTAKE_PROBE_TIMEOUT_MS must be an integer of at least 1000");
   const root = rootFactory();
   if (!isDisposableSourceIntakeProbeRoot(root)) throw new Error("Source intake probe root must be a disposable temporary directory");
@@ -174,7 +175,7 @@ export async function runSourceIntakeProbe({ timeoutMs = Number(process.env.CODE
   let passed = false;
   let reportPath = null;
   try {
-    const source = createProbeFixture(root);
+    const source = createProbeFixture(root, fixture ?? undefined);
     router = new SwarmRouter(sourceIntakeProbeConfig({ root, timeoutMs, model, sourceIntakeRuntimeFactory }));
     const intake = ingestDocumentation({ source, repository: root, destinationRelative: router.config.project.documentationDir });
     if (intake.sourceClaimInput !== "raw") throw new Error("source-intake-probe:fixture must use raw Markdown without source-claims.json");

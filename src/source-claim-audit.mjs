@@ -8,7 +8,6 @@ const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item) ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
 const decisionKinds = new Set(["admitted", "rejected", "split-required", "contradiction", "unresolved"]);
 const classifications = new Set(["mandatory", "non_mandatory", "ambiguous"]);
-const dispositions = new Set(["covered", "blocked", "excluded"]);
 const reason = /^[a-z][a-z0-9_:-]{0,95}$/;
 
 function fail(message) { throw new Error(`source_claim_audit:${message}`); }
@@ -55,8 +54,22 @@ function controllerPolicy(policyRegistry, claimId) {
   return policy ? { policyId: policy.policyId, version: policy.version, digest: policy.digest, resolvedValue: policy.resolvedValue } : null;
 }
 
+function controllerCoverage(subject, sourceResolver, decisionsById) {
+  return normalizedSourceUnits(sourceResolver).map((unit) => {
+    if (unit.kind !== "meaningful") return { documentId: unit.documentId, startLine: unit.startLine, endLine: unit.endLine, excerptDigest: unit.excerptDigest, kind: unit.kind, coverageUnitId: unit.coverageUnitId, disposition: "excluded", reasonCodes: [unit.kind], candidateClaimIds: [] };
+    const spanningClaimIds = subject.claims.filter((claim) => claim.sourceRefs.some((ref) => ref.documentId === unit.documentId && ref.startLine <= unit.startLine && ref.endLine >= unit.endLine)).map((claim) => claim.claimId).sort();
+    const admittedClaimIds = spanningClaimIds.filter((claimId) => decisionsById.get(claimId)?.decision === "admitted");
+    return {
+      documentId: unit.documentId, startLine: unit.startLine, endLine: unit.endLine, excerptDigest: unit.excerptDigest, kind: unit.kind, coverageUnitId: unit.coverageUnitId,
+      disposition: admittedClaimIds.length ? "covered" : "blocked",
+      reasonCodes: [admittedClaimIds.length ? "admitted_claim_coverage" : "meaningful_source_material_unresolved"],
+      candidateClaimIds: admittedClaimIds.length ? admittedClaimIds : spanningClaimIds
+    };
+  });
+}
+
 function buildAudit(candidate, { subject, sourceResolver, policyRegistry = null }) {
-  if (!exactKeys(candidate, ["decisions", "coverage"]) || !Array.isArray(candidate.decisions) || !Array.isArray(candidate.coverage)) fail("candidate_schema_invalid");
+  if (!exactKeys(candidate, ["decisions"]) || !Array.isArray(candidate.decisions)) fail("candidate_schema_invalid");
   const candidates = new Map(subject.claims.map((claim) => [claim.claimId, claim]));
   const seenClaims = new Set();
   const parsedDecisions = candidate.decisions.map((item) => {
@@ -71,21 +84,8 @@ function buildAudit(candidate, { subject, sourceResolver, policyRegistry = null 
   });
   if (seenClaims.size !== candidates.size) fail("candidate_decision_incomplete");
   const decisionsById = new Map(parsedDecisions.map((item) => [item.claimId, item]));
-  const expectedUnits = normalizedSourceUnits(sourceResolver);
-  const expectedById = new Map(expectedUnits.map((unit) => [unit.coverageUnitId, unit]));
-  const seenUnits = new Set();
-  const parsedCoverage = candidate.coverage.map((item) => {
-    if (!exactKeys(item, ["coverageUnitId", "disposition", "reasonCodes", "candidateClaimIds"]) || !expectedById.has(item.coverageUnitId) || seenUnits.has(item.coverageUnitId) || !dispositions.has(item.disposition) || !validReasonCodes(item.reasonCodes) || !Array.isArray(item.candidateClaimIds) || new Set(item.candidateClaimIds).size !== item.candidateClaimIds.length || item.candidateClaimIds.some((id) => !candidates.has(id))) fail("candidate_coverage_invalid");
-    const unit = expectedById.get(item.coverageUnitId); const ids = item.candidateClaimIds;
-    if (unit.kind === "meaningful") {
-      const covers = (decision) => ids.some((id) => decisionsById.get(id).decision === decision && candidates.get(id).sourceRefs.some((ref) => ref.documentId === unit.documentId && ref.startLine <= unit.startLine && ref.endLine >= unit.endLine));
-      if (!ids.length || !["covered", "blocked"].includes(item.disposition) || (item.disposition === "covered" && !covers("admitted")) || (item.disposition === "blocked" && !ids.some((id) => decisionsById.get(id).decision !== "admitted"))) fail("meaningful_source_material_unresolved");
-    } else if (item.disposition !== "excluded" || ids.length || !item.reasonCodes.includes(unit.kind)) fail("excluded_source_policy_invalid");
-    seenUnits.add(item.coverageUnitId);
-    return { documentId: unit.documentId, startLine: unit.startLine, endLine: unit.endLine, excerptDigest: unit.excerptDigest, kind: unit.kind, coverageUnitId: unit.coverageUnitId, disposition: item.disposition, reasonCodes: [...item.reasonCodes].sort(), candidateClaimIds: [...ids].sort() };
-  });
-  if (seenUnits.size !== expectedUnits.length) fail("source_coverage_incomplete");
-  const unsigned = { schemaVersion: 1, kind: "SourceClaimAudit", documentSetDigest: subject.documentSetDigest, sourceDocuments: sortedDocuments(subject.sourceDocuments), candidateId: subject.candidateId, candidateDigest: subject.candidateDigest, decisions: parsedDecisions.sort((a, b) => a.claimId.localeCompare(b.claimId)), coverage: parsedCoverage.sort((a, b) => a.documentId.localeCompare(b.documentId) || a.startLine - b.startLine) };
+  const coverage = controllerCoverage(subject, sourceResolver, decisionsById);
+  const unsigned = { schemaVersion: 2, kind: "SourceClaimAudit", documentSetDigest: subject.documentSetDigest, sourceDocuments: sortedDocuments(subject.sourceDocuments), candidateId: subject.candidateId, candidateDigest: subject.candidateDigest, decisions: parsedDecisions.sort((a, b) => a.claimId.localeCompare(b.claimId)), coverage: coverage.sort((a, b) => a.documentId.localeCompare(b.documentId) || a.startLine - b.startLine) };
   const digest = sha256(canonical(unsigned));
   return deepFreeze({ ...unsigned, auditId: `sca-${digest.slice(0, 24)}`, digest });
 }
@@ -94,10 +94,9 @@ export function canonicalizeSourceClaimAuditCandidate(candidate, options) { retu
 
 export function validateSourceClaimAudit(value, options) {
   const finalKeys = ["schemaVersion", "kind", "documentSetDigest", "sourceDocuments", "candidateId", "candidateDigest", "decisions", "coverage", "auditId", "digest"];
-  if (!exactKeys(value, finalKeys) || value.schemaVersion !== 1 || value.kind !== "SourceClaimAudit" || !Array.isArray(value.sourceDocuments)) fail("schema_or_subject_invalid");
+  if (!exactKeys(value, finalKeys) || value.schemaVersion !== 2 || value.kind !== "SourceClaimAudit" || !Array.isArray(value.sourceDocuments)) fail("schema_or_subject_invalid");
   const candidate = {
-    decisions: value.decisions?.map((item) => exactKeys(item, ["claimId", "decision", "classification", "reasonCodes", "sourceRefs", "policy"]) ? ({ claimId: item.claimId, decision: item.decision, classification: item.classification, reasonCodes: item.reasonCodes }) : item),
-    coverage: value.coverage?.map((item) => exactKeys(item, ["documentId", "startLine", "endLine", "excerptDigest", "kind", "coverageUnitId", "disposition", "reasonCodes", "candidateClaimIds"]) ? ({ coverageUnitId: item.coverageUnitId, disposition: item.disposition, reasonCodes: item.reasonCodes, candidateClaimIds: item.candidateClaimIds }) : item)
+    decisions: value.decisions?.map((item) => exactKeys(item, ["claimId", "decision", "classification", "reasonCodes", "sourceRefs", "policy"]) ? ({ claimId: item.claimId, decision: item.decision, classification: item.classification, reasonCodes: item.reasonCodes }) : item)
   };
   const expected = buildAudit(candidate, options);
   if (canonical(value) !== canonical(expected)) fail("final_audit_not_canonical");
@@ -106,18 +105,14 @@ export function validateSourceClaimAudit(value, options) {
 
 export function deterministicSuppliedSourceClaimAudit(subject, sourceResolver) {
   return buildAudit({
-    decisions: subject.claims.map((claim) => ({ claimId: claim.claimId, decision: "admitted", classification: claim.fixedClassification, reasonCodes: ["supplied_high_assurance_validated"] })),
-    coverage: normalizedSourceUnits(sourceResolver).map((unit) => {
-      if (unit.kind !== "meaningful") return { coverageUnitId: unit.coverageUnitId, disposition: "excluded", reasonCodes: [unit.kind], candidateClaimIds: [] };
-      const candidateClaimIds = subject.claims.filter((claim) => claim.sourceRefs.some((ref) => ref.documentId === unit.documentId && ref.startLine <= unit.startLine && ref.endLine >= unit.endLine)).map((claim) => claim.claimId);
-      return { coverageUnitId: unit.coverageUnitId, disposition: candidateClaimIds.length ? "covered" : "blocked", reasonCodes: [candidateClaimIds.length ? "supplied_claim_coverage" : "missing_supplied_claim_coverage"], candidateClaimIds };
-    })
+    decisions: subject.claims.map((claim) => ({ claimId: claim.claimId, decision: "admitted", classification: claim.fixedClassification, reasonCodes: ["supplied_high_assurance_validated"] }))
   }, { subject, sourceResolver });
 }
 
 export function admitAuditedSourceClaims({ subject, audit }) {
   const blocked = audit.decisions.filter((item) => item.decision !== "admitted");
-  if (blocked.length) fail(`admission_blocked:${blocked.map((item) => `${item.decision}:${item.claimId}`).join(",")}`);
+  const unresolvedUnits = audit.coverage.filter((item) => item.kind === "meaningful" && item.disposition !== "covered");
+  if (blocked.length || unresolvedUnits.length) fail(`admission_blocked:${[...blocked.map((item) => `${item.decision}:${item.claimId}`), ...unresolvedUnits.map((item) => `meaningful_source_material_unresolved:${item.coverageUnitId}`)].join(",")}`);
   const decisionsById = new Map(audit.decisions.map((item) => [item.claimId, item]));
   const claims = subject.claims.map((claim) => ({ claimId: claim.claimId, classification: decisionsById.get(claim.claimId).classification, sourceRefs: claim.sourceRefs })).sort((a, b) => a.claimId.localeCompare(b.claimId));
   const unsigned = { schemaVersion: 1, kind: "SourceClaimManifest", documentSetDigest: subject.documentSetDigest, sourceDocuments: subject.sourceDocuments, claims, audit: { auditId: audit.auditId, digest: audit.digest, candidateId: subject.candidateId, candidateDigest: subject.candidateDigest } };
@@ -156,16 +151,15 @@ export class SourceClaimAuditExecutor {
   constructor(config) { this.config = config; }
   async audit(subject, { recordTerminalReceipt = null, recordAttempt = null, recordFailure = null } = {}) {
     const resolver = createImportedSourceResolver({ repository: this.config.repository, documentationDir: this.config.project.documentationDir });
-    const coverageUnits = normalizedSourceUnits(resolver);
-    const skeleton = { decisions: subject.claims.map((claim) => ({ claimId: claim.claimId, decision: "admitted|rejected|split-required|contradiction|unresolved", classification: "mandatory|non_mandatory|ambiguous when admitted; otherwise null", reasonCodes: ["reason_code"] })), coverage: coverageUnits.map((unit) => ({ coverageUnitId: unit.coverageUnitId, disposition: unit.kind === "meaningful" ? "covered|blocked" : "excluded", reasonCodes: [unit.kind === "meaningful" ? "reason_code" : unit.kind], candidateClaimIds: [] })) };
+    const skeleton = { decisions: subject.claims.map((claim) => ({ claimId: claim.claimId, decision: "admitted|rejected|split-required|contradiction|unresolved", classification: "mandatory|non_mandatory|ambiguous when admitted; otherwise null", reasonCodes: ["reason_code"] })) };
     const prompt = [
       "Return exactly one fenced JSON block containing a SourceClaimAuditCandidate. This is an independent audit turn, separate from extraction.",
-      "Schema (and no other fields): { decisions: [{ claimId, decision, classification, reasonCodes }], coverage: [{ coverageUnitId, disposition, reasonCodes, candidateClaimIds }] }. Use null classification for non-admitted decisions.",
-      "Use only exact controller IDs from the skeleton. Decide every claim and every coverage unit exactly once. Do not return schemaVersion, kind, auditId, document identity, source documents, source refs, excerpts, digests, hashes, policies, or any extra fields. Meaningful units are covered only by an admitted claim spanning the unit; otherwise blocked. Structural/boilerplate units are excluded with their exact reason code.",
+      "Schema (and no other fields): { decisions: [{ claimId, decision, classification, reasonCodes }] }. Use null classification for non-admitted decisions.",
+      "Use only exact controller claim IDs from the skeleton and decide every claim exactly once. Do not return coverage, coverage IDs, document identity, source documents, source refs, ranges, excerpts, digests, hashes, policies, schemaVersion, kind, auditId, or any extra fields. The controller alone binds verified source references and creates final coverage.",
       `Controller-derived skeleton to fill: ${JSON.stringify(skeleton)}`,
-      `Controlled semantic subject: ${JSON.stringify({ claims: subject.claims.map(({ claimId, candidateClassification, claimType, normalizedStatement }) => ({ claimId, candidateClassification, claimType, normalizedStatement })), coverageUnits: coverageUnits.map(({ coverageUnitId, kind }) => ({ coverageUnitId, kind })) })}`
+      `Controlled semantic subject: ${JSON.stringify({ claims: subject.claims.map(({ claimId, candidateClassification, claimType, normalizedStatement }) => ({ claimId, candidateClassification, claimType, normalizedStatement })) })}`
     ].join("\n\n");
-    const result = await runSourceIntakeTurn({ config: this.config, role: "source_claim_audit", developerInstructions: "You are the independent Specification Auditor. Audit only controller-provided candidate semantics and coverage; do not plan engineering work or authorize invented product decisions.", objective: "Independently audit source claims and source coverage.", tokenBudget: this.config.delivery?.sourceClaimAuditTokenBudget ?? 6000, prompt, recordTerminalReceipt, recordAttempt, recordFailure });
+    const result = await runSourceIntakeTurn({ config: this.config, role: "source_claim_audit", developerInstructions: "You are the independent Specification Auditor. Audit only controller-provided candidate claim semantics; the controller alone creates coverage. Do not plan engineering work or authorize invented product decisions.", objective: "Independently audit source claim decisions.", tokenBudget: this.config.delivery?.sourceClaimAuditTokenBudget ?? 6000, prompt, recordTerminalReceipt, recordAttempt, recordFailure });
     let candidate;
     try { candidate = parseResult(result.resultText); }
     catch {
@@ -173,8 +167,9 @@ export class SourceClaimAuditExecutor {
       await recordFailure?.(failure.sourceIntakeFailure); throw failure;
     }
     try { return buildAudit(candidate, { subject, sourceResolver: resolver, policyRegistry: this.config.specificationResolution?.policyRegistry }); }
-    catch {
-      const failure = sourceIntakeFailure({ role: "source_claim_audit", phase: "validate", code: "audit_result_invalid", receipt: result.terminalReceipt, diagnostics: resultDiagnostics(result, "audit_result_invalid") });
+    catch (error) {
+      const code = /^source_claim_audit:(candidate_schema_invalid|candidate_claim_decision_invalid|candidate_admitted_classification_invalid|candidate_nonadmitted_classification_invalid|candidate_decision_incomplete|meaningful_source_material_unresolved)$/.exec(String(error?.message ?? error))?.[1] ?? "audit_result_invalid";
+      const failure = sourceIntakeFailure({ role: "source_claim_audit", phase: "validate", code, receipt: result.terminalReceipt, diagnostics: resultDiagnostics(result, code) });
       await recordFailure?.(failure.sourceIntakeFailure); throw failure;
     }
   }

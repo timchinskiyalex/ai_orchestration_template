@@ -12,7 +12,7 @@ const parse = (value, fallback) => (value ? JSON.parse(value) : fallback);
 const sourceIntakeDiagnostics = (diagnostics) => {
   if (!diagnostics || typeof diagnostics !== "object"
     || !["connect", "start_thread", "start_turn", "observe_terminal", "reconcile_terminal", "result_read"].includes(diagnostics.runtimeStage)
-    || !["timeout", "process_exit", "transport_failure", "terminal_receipt_missing", "terminal_alias_unresolved", "terminal_status_missing", "terminal_identity_mismatch", "final_result_unavailable", "malformed_json", "candidate_canonicalization_failed", "candidate_semantics_invalid", "audit_result_invalid"].includes(diagnostics.primaryReason)
+    || !["timeout", "process_exit", "transport_failure", "terminal_receipt_missing", "terminal_alias_unresolved", "terminal_status_missing", "terminal_identity_mismatch", "final_result_unavailable", "malformed_json", "candidate_canonicalization_failed", "candidate_semantics_invalid", "audit_result_invalid", "candidate_schema_invalid", "candidate_claim_decision_invalid", "candidate_admitted_classification_invalid", "candidate_nonadmitted_classification_invalid", "candidate_decision_incomplete", "meaningful_source_material_unresolved"].includes(diagnostics.primaryReason)
     || !["attemptedThreadId", "requestedTurnId"].every((key) => typeof diagnostics[key] === "string" && diagnostics[key].length <= 512)
     || (diagnostics.resolvedTurnId != null && (typeof diagnostics.resolvedTurnId !== "string" || diagnostics.resolvedTurnId.length > 512))
     || (diagnostics.errorClass != null && (typeof diagnostics.errorClass !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/i.test(diagnostics.errorClass)))

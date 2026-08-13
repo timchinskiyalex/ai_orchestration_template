@@ -98,13 +98,11 @@ function auditFor({ root, extraction, variant = "admitted", policyRegistry }) {
   const resolver = createImportedSourceResolver({ repository: root, documentationDir: "docs/in" });
   const verified = canonicalizeSourceClaimExtractionCandidate(extraction, { sourceResolver: resolver }); const subject = auditSubjectFromExtraction(verified);
   const target = subject.claims[1];
-  const decisions = subject.claims.map((claim) => ({ claimId: claim.claimId, decision: claim.claimId === target.claimId && !["admitted", "omitted"].includes(variant) ? variant : "admitted", classification: claim.claimId === target.claimId && !["admitted", "omitted"].includes(variant) ? null : "mandatory", reasonCodes: [claim.claimId === target.claimId && variant !== "admitted" ? variant.replace("-", "_") : "verified"] }));
-  const coverage = normalizedSourceUnits(resolver).map((unit) => {
-    const candidateClaimIds = subject.claims.filter((claim) => claim.sourceRefs.some((ref) => ref.documentId === unit.documentId && ref.startLine <= unit.startLine && ref.endLine >= unit.endLine)).map((claim) => claim.claimId).filter((id) => variant !== "omitted" || id !== target.claimId);
-    const blocked = candidateClaimIds.includes(target.claimId) && !["admitted", "omitted"].includes(variant);
-    return { coverageUnitId: unit.coverageUnitId, disposition: blocked ? "blocked" : "covered", reasonCodes: [blocked ? "requires_resolution" : "verified"], candidateClaimIds };
+  const decisions = subject.claims.map((claim) => {
+    const decision = claim.claimId === target.claimId && variant !== "admitted" ? (variant === "omitted" ? "unresolved" : variant) : "admitted";
+    return { claimId: claim.claimId, decision, classification: decision === "admitted" ? "mandatory" : null, reasonCodes: [decision === "admitted" ? "verified" : decision.replace("-", "_")] };
   });
-  return { decisions, coverage };
+  return { decisions };
 }
 
 test("raw extraction is independently audited before Bootstrap and Planner admission", async () => {
@@ -115,8 +113,8 @@ test("raw extraction is independently audited before Bootstrap and Planner admis
     assert.ok(result.sourceClaimExtractionId); assert.ok(result.sourceClaimAuditId); assert.ok(result.sourceClaimManifestId);
     assert.ok(router.store.deliveryRun(result.id).bootstrapTaskId, "admitted manifest is required before Bootstrap is created");
     assert.equal(fx.client.calls.filter((item) => item === "Extract atomic candidate source claims only.").length, 1);
-    assert.equal(fx.client.calls.filter((item) => item === "Independently audit source claims and source coverage.").length, 1);
-    assert.ok(fx.client.calls.indexOf("extraction_result") < fx.client.calls.indexOf("Independently audit source claims and source coverage."));
+    assert.equal(fx.client.calls.filter((item) => item === "Independently audit source claim decisions.").length, 1);
+    assert.ok(fx.client.calls.indexOf("extraction_result") < fx.client.calls.indexOf("Independently audit source claim decisions."));
     assert.equal(fx.client.calls.some((item) => /^Plan /.test(item)), false);
     assert.equal(JSON.stringify({ status: router.statusSnapshot(), run: result }).includes("SUPERSECRET"), false);
   } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }
@@ -136,15 +134,17 @@ test("source intake persists one exact alias receipt for extraction and independ
   } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }
 });
 
-test("independent audit receives canonical subjects and cannot substitute controller IDs or source refs", async () => {
+test("independent audit receives canonical subjects and cannot supply controller-owned fields", async () => {
   for (const [name, mutate] of [
     ["claim-id", (audit) => { audit.decisions[0].claimId = "claim-substituted"; }],
-    ["source-ref", (audit) => { audit.decisions[0].sourceRefs = [{ documentId: "forged", excerptDigest: "0".repeat(64) }]; }]
+    ["source-ref", (audit) => { audit.decisions[0].sourceRefs = [{ documentId: "forged", excerptDigest: "0".repeat(64) }]; }],
+    ["coverage", (audit) => { audit.coverage = []; }]
   ]) {
     const fx = fixture({ auditMutator: mutate }); const router = new SwarmRouter(fx.config);
     try {
       const result = await new DeliveryCoordinator(router).begin({ source: fx.raw }); const failure = router.store.sourceIntakeFailureForRun({ deliveryRunId: result.id });
-      assert.equal(result.state, "blocked_specification", name); assert.equal(result.publish.reason, "source_claim_audit:validate:audit_result_invalid", name); assert.equal(router.list().length, 0, name); assert.ok(result.sourceClaimExtractionId, name); assert.equal(result.sourceClaimManifestId, null, name); assert.equal(failure.role, "audit", name); assert.equal(failure.phase, "validate", name); assert.equal(failure.code, "audit_result_invalid", name);
+      const expectedCode = name === "coverage" ? "candidate_schema_invalid" : "candidate_claim_decision_invalid";
+      assert.equal(result.state, "blocked_specification", name); assert.equal(result.publish.reason, `source_claim_audit:validate:${expectedCode}`, name); assert.equal(router.list().length, 0, name); assert.ok(result.sourceClaimExtractionId, name); assert.equal(result.sourceClaimManifestId, null, name); assert.equal(failure.role, "audit", name); assert.equal(failure.phase, "validate", name); assert.equal(failure.code, expectedCode, name); assert.equal(failure.diagnostics.primaryReason, failure.code, name);
     } finally { router.close(); rmSync(fx.root, { recursive: true, force: true }); }
   }
 });
@@ -225,13 +225,13 @@ test("controller, not the audit candidate, binds an exact trusted source-audit p
 });
 
 test("audit candidate parser accepts one fenced or embedded object and fails closed on ambiguous JSON", () => {
-  const candidate = { decisions: [], coverage: [] };
+  const candidate = { decisions: [] };
   assert.deepEqual(parseSourceClaimAuditCandidateResult(`Auditor notes.\n${JSON.stringify(candidate)}\nEnd.`), candidate);
   assert.deepEqual(parseSourceClaimAuditCandidateResult(`\`\`\`json\n${JSON.stringify(candidate)}\n\`\`\``), candidate);
   for (const text of [`${JSON.stringify(candidate)}\n${JSON.stringify(candidate)}`, "{", '{"decisions":"\\q","coverage":[]}', "\`\`\`json\n{\"decisions\":[]\n\`\`\`"]) assert.throws(() => parseSourceClaimAuditCandidateResult(text), /source_claim_audit:parse:malformed_json/);
 });
 
-test("candidate validation canonicalizes controller identity and rejects forged or incomplete mappings", () => {
+test("candidate validation canonicalizes controller identity and rejects forged or incomplete decisions", () => {
   const fx = fixture();
   try {
     mkdirSync(join(fx.root, "docs/in"), { recursive: true }); writeFileSync(join(fx.root, "docs/in", fx.file.path), fx.text); writeFileSync(join(fx.root, "docs/in", "inventory.json"), JSON.stringify({ files: [fx.file], documentSetDigest: documentSetDigest([fx.file]) }));
@@ -242,17 +242,68 @@ test("candidate validation canonicalizes controller identity and rejects forged 
       (value) => { value.sourceRefs = []; },
       (value) => { value.decisions.pop(); },
       (value) => { value.decisions.push({ ...value.decisions[0] }); },
-      (value) => { value.coverage[0].coverageUnitId = "unknown"; }
+      (value) => { value.coverage = []; }
     ]) { const forged = structuredClone(candidate); mutate(forged); assert.throws(() => canonicalizeSourceClaimAuditCandidate(forged, { subject, sourceResolver: resolver }), /source_claim_audit:/); }
   } finally { rmSync(fx.root, { recursive: true, force: true }); }
+});
+
+test("controller deterministically derives complete coverage from verified three-claim decisions", () => {
+  const root = mkdtempSync(join(tmpdir(), "source-claim-audit-coverage-"));
+  try {
+    const text = "First requirement.\nSecond requirement.\nThird requirement.\n";
+    const file = { documentId: documentIdForPath("requirements.md"), path: "requirements.md", sha256: digest(text) };
+    mkdirSync(join(root, "docs/in"), { recursive: true }); writeFileSync(join(root, "docs/in", file.path), text); writeFileSync(join(root, "docs/in", "inventory.json"), JSON.stringify({ files: [file], documentSetDigest: documentSetDigest([file]) }));
+    const resolver = createImportedSourceResolver({ repository: root, documentationDir: "docs/in" });
+    const extraction = canonicalizeSourceClaimExtractionCandidate({ schemaVersion: 1, kind: "SourceClaimExtractionCandidate", claims: [1, 2, 3].map((line) => ({ claimType: "functional", normalizedStatement: `Requirement ${line}.`, classification: "mandatory", sourceLocation: { documentId: file.documentId, startLine: line, endLine: line } })) }, { sourceResolver: resolver });
+    const subject = auditSubjectFromExtraction(extraction);
+    const admitted = { decisions: subject.claims.map((claim) => ({ claimId: claim.claimId, decision: "admitted", classification: "mandatory", reasonCodes: ["fixture_admitted"] })) };
+    const audit = canonicalizeSourceClaimAuditCandidate(admitted, { subject, sourceResolver: resolver });
+    assert.equal(audit.schemaVersion, 2); assert.deepEqual(audit.coverage.filter((unit) => unit.kind === "meaningful").map((unit) => [unit.disposition, unit.candidateClaimIds.length, unit.reasonCodes]), [["covered", 1, ["admitted_claim_coverage"]], ["covered", 1, ["admitted_claim_coverage"]], ["covered", 1, ["admitted_claim_coverage"]]]);
+    const manifest = admitAuditedSourceClaims({ subject, audit }); assert.ok(manifest.manifestId);
+    assert.deepEqual(validateSourceClaimAudit(audit, { subject, sourceResolver: resolver }), audit);
+    const legacy = structuredClone(audit); legacy.schemaVersion = 1; assert.throws(() => validateSourceClaimAudit(legacy, { subject, sourceResolver: resolver }), /schema_or_subject_invalid/);
+
+    const missing = { decisions: admitted.decisions.slice(0, 2) };
+    const duplicate = { decisions: [admitted.decisions[0], admitted.decisions[0], admitted.decisions[2]] };
+    const unknown = { decisions: [{ ...admitted.decisions[0], claimId: "unknown-claim" }, ...admitted.decisions.slice(1)] };
+    assert.throws(() => canonicalizeSourceClaimAuditCandidate(missing, { subject, sourceResolver: resolver }), /candidate_decision_incomplete/);
+    assert.throws(() => canonicalizeSourceClaimAuditCandidate(duplicate, { subject, sourceResolver: resolver }), /candidate_claim_decision_invalid/);
+    assert.throws(() => canonicalizeSourceClaimAuditCandidate(unknown, { subject, sourceResolver: resolver }), /candidate_claim_decision_invalid/);
+
+    const nonAdmitted = structuredClone(admitted); nonAdmitted.decisions[1] = { ...nonAdmitted.decisions[1], decision: "unresolved", classification: null, reasonCodes: ["requires_resolution"] };
+    const unresolvedAudit = canonicalizeSourceClaimAuditCandidate(nonAdmitted, { subject, sourceResolver: resolver });
+    const unresolvedUnit = unresolvedAudit.coverage.find((unit) => unit.startLine === subject.claims[1].sourceRefs[0].startLine);
+    assert.deepEqual(unresolvedUnit.disposition, "blocked"); assert.deepEqual(unresolvedUnit.reasonCodes, ["meaningful_source_material_unresolved"]); assert.throws(() => admitAuditedSourceClaims({ subject, audit: unresolvedAudit }), /meaningful_source_material_unresolved/);
+
+    const oneClaimExtraction = canonicalizeSourceClaimExtractionCandidate({ schemaVersion: 1, kind: "SourceClaimExtractionCandidate", claims: [{ claimType: "functional", normalizedStatement: "Requirement one.", classification: "mandatory", sourceLocation: { documentId: file.documentId, startLine: 1, endLine: 1 } }] }, { sourceResolver: resolver });
+    const oneClaimSubject = auditSubjectFromExtraction(oneClaimExtraction);
+    const oneClaimAudit = canonicalizeSourceClaimAuditCandidate({ decisions: [{ claimId: oneClaimSubject.claims[0].claimId, decision: "admitted", classification: "mandatory", reasonCodes: ["fixture_admitted"] }] }, { subject: oneClaimSubject, sourceResolver: resolver });
+    assert.deepEqual(oneClaimAudit.coverage.filter((unit) => unit.startLine > 1).map((unit) => [unit.disposition, unit.candidateClaimIds]), [["blocked", []], ["blocked", []]], "an admitted claim cannot cover outside its verified range");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("structural source units are excluded only by the controller", () => {
+  const root = mkdtempSync(join(tmpdir(), "source-claim-audit-structural-"));
+  try {
+    const text = "# Overview\nController requirement.\n"; const file = { documentId: documentIdForPath("requirements.md"), path: "requirements.md", sha256: digest(text) };
+    mkdirSync(join(root, "docs/in"), { recursive: true }); writeFileSync(join(root, "docs/in", file.path), text); writeFileSync(join(root, "docs/in", "inventory.json"), JSON.stringify({ files: [file], documentSetDigest: documentSetDigest([file]) }));
+    const resolver = createImportedSourceResolver({ repository: root, documentationDir: "docs/in" }); const subject = auditSubjectFromExtraction(canonicalizeSourceClaimExtractionCandidate({ schemaVersion: 1, kind: "SourceClaimExtractionCandidate", claims: [{ claimType: "functional", normalizedStatement: "Controller requirement.", classification: "mandatory", sourceLocation: { documentId: file.documentId, startLine: 2, endLine: 2 } }] }, { sourceResolver: resolver }));
+    const audit = canonicalizeSourceClaimAuditCandidate({ decisions: subject.claims.map((claim) => ({ claimId: claim.claimId, decision: "admitted", classification: "mandatory", reasonCodes: ["fixture_admitted"] })) }, { subject, sourceResolver: resolver });
+    const structural = audit.coverage.find((unit) => unit.kind === "structural_header"); assert.deepEqual(structural, { ...structural, disposition: "excluded", reasonCodes: ["structural_header"], candidateClaimIds: [] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("restart/source mutation and supplied manifests retain one audit-admission lineage", async () => {
   const raw = fixture(); let router = new SwarmRouter(raw.config);
   try {
-    const run = await new DeliveryCoordinator(router).begin({ source: raw.raw }); const storedAudit = router.store.sourceClaimAudit(run.sourceClaimAuditId);
+    const run = await new DeliveryCoordinator(router).begin({ source: raw.raw }); const storedAudit = router.store.sourceClaimAudit(run.sourceClaimAuditId); const storedManifest = router.store.sourceClaimManifest(run.sourceClaimManifestId);
     assert.equal(storedAudit.candidateId, router.store.sourceClaimExtraction(run.sourceClaimExtractionId).extraction.extractionId);
     router.close(); router = null;
+    const restartedForAdmission = new SwarmRouter(raw.config);
+    try {
+      const admitted = await restartedForAdmission.auditAndAdmitSourceClaimsForRun(restartedForAdmission.store.deliveryRun(run.id));
+      assert.equal(admitted.audit.auditId, storedAudit.audit.auditId); assert.equal(admitted.audit.digest, storedAudit.digest); assert.equal(admitted.manifest.manifestId, storedManifest.manifest.manifestId); assert.equal(admitted.manifest.digest, storedManifest.digest);
+    } finally { restartedForAdmission.close(); }
     writeFileSync(join(raw.root, "docs/in", raw.file.path), "# Product\nChanged source.\nUsers must sign in.\n");
     const restarted = new SwarmRouter(raw.config);
     try { assert.throws(() => restarted.assertBootstrapSourceIntake(restarted.store.deliveryRun(run.id)), /source_claim_contract/); }
@@ -263,6 +314,6 @@ test("restart/source mutation and supplied manifests retain one audit-admission 
   try {
     const intake = await new DeliveryCoordinator(suppliedRouter).begin({ source: supplied.raw });
     assert.equal(intake.sourceClaimInputMode, "supplied"); assert.ok(intake.sourceClaimAuditId); assert.ok(intake.sourceClaimManifestId);
-    assert.equal(supplied.client.calls.includes("Independently audit source claims and source coverage."), false);
+    assert.equal(supplied.client.calls.includes("Independently audit source claim decisions."), false);
   } finally { suppliedRouter.close(); rmSync(supplied.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); }
 });
