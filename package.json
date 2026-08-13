@@ -21,6 +21,7 @@
                     "test":  "node --test",
                     "e2e:live":  "node scripts/e2e-live.mjs",
                     "thin:deliver": "node scripts/thin-deliver.mjs",
+                    "thin:live-probe": "node scripts/thin-live-probe.mjs",
                     "e2e:g2g3-local-candidate": "node scripts/e2e-g2g3-local-candidate.mjs",
                     "e2e:source-intake-probe": "node scripts/e2e-source-intake-probe.mjs",
                     "e2e:g1-writer-parity":  "node scripts/e2e-live.mjs --workers 2",
