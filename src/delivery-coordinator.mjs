@@ -204,6 +204,9 @@ export class DeliveryCoordinator {
       return this.#blockedAcceptance(run, integration, acceptance, { reason: "Final acceptance did not pass; candidate and evidence are retained." });
     }
     const merged = await this.router.publishCandidate(integration, { ...adapters, acceptanceReportId: acceptance.id });
+    if (merged.terminalState === "completed_candidate_ready" && this.router.config.remote?.enabled === false) {
+      return this.router.store.completeDeliveryWithLocalAcceptance({ deliveryRunId: run.id, reportId: acceptance.id, publish: merged });
+    }
     if (merged.terminalState !== "merge_verified") return this.router.store.updateDeliveryRun(run.id, { state: merged.terminalState, integrationPath: integration.path, publish: merged, confirmRemotePush: this.router.isAutonomous() });
     return this.router.store.completeDeliveryWithAcceptance({ deliveryRunId: run.id, reportId: acceptance.id, merge: merged.merge, publish: merged });
   }

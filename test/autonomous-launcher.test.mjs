@@ -15,6 +15,12 @@ test("autonomous launcher has no interactive prompt and starts the complete deli
   assert.match(script, /Checking stale delivery leases before starting/);
   assert.match(script, /src\/index\.mjs', 'deliver/);
   assert.match(script, /completed_merged/);
+  assert.match(script, /\[string\]\$Source/);
+  assert.match(script, /Provide -Source <requirements-dir>/);
+  assert.match(script, /Resolve-Path -LiteralPath \$Source/);
+  assert.match(script, /\$deliveryArgs \+= @\('--source', \$source\)/);
+  assert.match(script, /\$localCandidateSuccess = \$final\.deliveryRun\.state -eq 'completed_candidate_ready'/);
+  assert.match(script, /publish\.localCandidate -eq \$true/);
   assert.match(script, /\$resumable = @\('interrupted', 'blocked_credentials', 'blocked_ci', 'blocked_branch_protection'/);
   assert.match(script, /\$resume = \$status\.deliveryRun -and \(\$resumable -contains \$status\.deliveryRun\.state\)/);
   assert.doesNotMatch(script, /\$resumable = @[^\n]*'failed'/);

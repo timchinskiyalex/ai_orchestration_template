@@ -1,14 +1,20 @@
 param(
+  [string]$Source,
   [ValidateRange(250, 60000)]
   [int]$IntervalMs = 1000
 )
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$source = Join-Path $projectRoot 'docs\project-specifications'
+$defaultSource = Join-Path $projectRoot 'docs\project-specifications'
+if ([string]::IsNullOrWhiteSpace($Source)) {
+  if (-not (Test-Path -LiteralPath $defaultSource -PathType Container)) { throw "Project documentation directory is missing. Provide -Source <requirements-dir>." }
+  $source = (Resolve-Path -LiteralPath $defaultSource -ErrorAction Stop).Path
+} else {
+  if (-not (Test-Path -LiteralPath $Source -PathType Container)) { throw "Project documentation directory is missing: $Source" }
+  $source = (Resolve-Path -LiteralPath $Source -ErrorAction Stop).Path
+}
 $env:NODE_NO_WARNINGS = '1'
-
-if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw "Project documentation directory is missing: $source" }
 
 $dirty = & git -C $projectRoot status --porcelain
 if ($LASTEXITCODE -ne 0) { throw "Cannot inspect Git status for $projectRoot" }
@@ -65,4 +71,5 @@ if (-not $final.deliveryRun) { throw "Delivery state was not found after executi
 Write-Host "Delivery state: $($final.deliveryRun.state)"
 if ($final.deliveryRun.state -eq 'interrupted') { Write-Host "Ctrl+C or controller exit was recovered. Thread/turn/token history remains in runtime state." }
 if ($final.deliveryRun.state -notin $terminal) { throw "Delivery ended without a machine-readable terminal state: $($final.deliveryRun.state)" }
-if ($final.deliveryRun.state -ne 'completed_merged') { exit 1 }
+$localCandidateSuccess = $final.deliveryRun.state -eq 'completed_candidate_ready' -and $final.deliveryRun.completionContractVersion -ge 2 -and $final.deliveryRun.publish.localCandidate -eq $true -and $final.deliveryRun.publish.remoteEnabled -eq $false -and $null -ne $final.deliveryRun.candidate.sha -and $null -ne $final.deliveryRun.publish.acceptanceReportId
+if ($final.deliveryRun.state -ne 'completed_merged' -and -not $localCandidateSuccess) { exit 1 }

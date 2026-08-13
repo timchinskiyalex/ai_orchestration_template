@@ -18,11 +18,13 @@ From an instance repository, start the complete lifecycle with one command:
 
 It opens a live monitor and exits only with a machine-readable terminal delivery state. The monitor includes task status, actual concurrency, token use, local budget/P50/P90, App Server quota windows, artifacts, candidate SHA, PR, CI checks, and merge SHA.
 
-`npm run develop` runs the same launcher. `npm run deliver -- --source <requirements-dir>` is the non-interactive CLI equivalent. `npm run status -- --json` and `npm run watch` are read-only operational views.
+`npm run develop` runs the same launcher. Pass the documentation directory explicitly with `npm run start:delivery -- -Source <requirements-dir>`; `npm run deliver -- --source <requirements-dir>` is the non-interactive CLI equivalent. The launcher retains its legacy default only when `docs/project-specifications` actually exists. `npm run status -- --json` and `npm run watch` are read-only operational views.
 
 ## Strict documentation input
 
-Autonomous delivery requires a documentation package containing Markdown files **and exactly one root-level `source-claims.json`**. It is an explicit controller input, not an LLM extraction hint. The declaration binds the current Markdown inventory digest and gives every normalized line of every imported document exactly one claimed coverage range.
+Autonomous delivery requires a documentation package containing Markdown files. Raw Markdown without `source-claims.json` is the normal intake path: the controller extracts atomic claims, then runs an independent source-coverage audit before Bootstrap. No source excerpts are persisted in controller state.
+
+An optional root-level `source-claims.json` is the high-assurance input route. It is an explicit controller input, not an LLM extraction hint. The declaration binds the current Markdown inventory digest and gives every normalized line of every imported document exactly one claimed coverage range.
 
 ```text
 requirements/
@@ -33,7 +35,7 @@ requirements/
 
 `source-claims.json` has `schemaVersion: 1`, `kind: "SourceClaimsDeclaration"`, the exact `documentSetDigest`, a `documents` entry (document ID, path, SHA-256, and exhaustive non-overlapping `coverage`) for every Markdown file, and stable `claims`. A claim is classified only as `mandatory`, `non_mandatory`, or `ambiguous`; each coverage range has its exact normalized UTF-8 line digest. Mandatory claims must map exactly once to a ProductBlueprint requirement with non-empty acceptance criteria, an explicitly blocking question/contradiction, or a configured trusted-policy resolution. Ambiguous claims remain blocked unless that exact trusted policy binds the claim ID.
 
-The controller persists only safe IDs, hashes, ranges, classifications, and reason codes in its SourceClaimManifest. It does not persist source excerpts. Missing, stale, incomplete, substituted, or invalid declarations stop at `blocked_specification` before Planner, workers, resume, or candidate publication. Re-import the package and run Bootstrap again; old Blueprints/runs remain visible but cannot resume autonomously.
+The controller persists only safe IDs, hashes, ranges, classifications, and reason codes in its SourceClaimManifest. For raw intake, malformed or stale extraction, an invalid/failed independent audit, contradictory claims, unresolved ambiguity, or incomplete source coverage fail closed as `blocked_specification` before Bootstrap, Planner, workers, resume, or candidate publication. The same fail-closed rule applies to a supplied declaration that is missing, stale, incomplete, substituted, or invalid. Re-import the package and run Bootstrap again; old Blueprints/runs remain visible but cannot resume autonomously.
 
 ## Default configuration
 
@@ -66,6 +68,8 @@ App Server quota is always a hard stop, reported as `blocked_quota`; the runtime
 Remote automation uses authenticated local Git and GitHub CLI credentials; credentials are never stored in config or runtime state. It pushes only an exact verified `swarm/candidate/*` SHA, creates or finds the candidate-to-`main` PR idempotently, polls remote CI with a bounded timeout, and merges only after local integration, Security, QA, and required CI pass. It never force-pushes, writes worker branches to `main`, rewrites `main`, bypasses protection, or merges missing/failed CI.
 
 Missing or invalid GitHub credentials ends as `blocked_credentials`. Required CI failure/timed-out checks end as `blocked_ci`. A branch-protection refusal ends as `blocked_branch_protection`. These states retain the candidate, structured remote action data, and recovery instruction.
+
+When `remote.enabled` is `false`, no push, PR, remote CI, or merge is attempted. A run instead reaches `completed_candidate_ready` only after a locally verified exact candidate SHA has passed Security, QA, integration verification, criterion-linked product evidence, and a persisted passing `ProductAcceptanceReport`. This is a successful local terminal state; enabled remote behavior and its terminal states are unchanged.
 
 ## Greenfield products
 
@@ -105,3 +109,5 @@ git diff --check
 ```
 
 The regular test suite is deterministic and quota-free. The real App Server E2E remains opt-in and is never run by the launcher.
+
+The raw-Markdown local-candidate live acceptance fixture is also opt-in: `npm run e2e:g2g3-local-candidate -- --confirm-spend-quota --workers 2`. It refuses to run without the explicit quota confirmation, uses `remote.enabled: false`, verifies two parallel writer turns, and never pushes, creates a PR, polls remote CI, or merges.

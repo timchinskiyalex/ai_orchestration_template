@@ -1555,6 +1555,21 @@ export class StateStore {
     return this.deliveryRun(deliveryRunId);
   }
 
+  completeDeliveryWithLocalAcceptance({ deliveryRunId, reportId, publish = {} }) {
+    const run = this.deliveryRun(deliveryRunId); const stored = this.productAcceptanceReport(reportId);
+    if (!run || !stored?.passing) throw new Error("Local candidate completion requires a persisted passing ProductAcceptanceReport");
+    const report = stored.report; const blueprint = this.productBlueprint(report.blueprintId); const manifest = this.integrationManifest(report.integrationManifestPath);
+    if (!blueprint || !manifest || run.blueprintId !== report.blueprintId || run.candidate?.sha?.toLowerCase() !== report.candidateSha.toLowerCase() || manifest.id !== report.integrationManifestId || manifest.candidateSha?.toLowerCase() !== report.candidateSha.toLowerCase()) throw new Error("Local candidate completion acceptance identity mismatch");
+    this.assertRequirementLedgerCompletion(deliveryRunId);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE delivery_runs SET state = 'completed_candidate_ready', publish_json = ?, completion_contract_version = 2, owner_pid = NULL, owner_session_id = NULL, heartbeat_at = NULL, updated_at = ? WHERE id = ?").run(JSON.stringify({ ...publish, acceptanceReportId: reportId, candidate: run.candidate, localCandidate: true, remoteEnabled: false }), now(), deliveryRunId);
+      this.#insertEvent(run.bootstrapTaskId, "delivery/completed-local-candidate", { deliveryRunId, reportId, candidateSha: report.candidateSha });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.deliveryRun(deliveryRunId);
+  }
+
   #addColumnIfMissing(table, column, definition) {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
     if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);

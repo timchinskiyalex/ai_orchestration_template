@@ -1,4 +1,10 @@
-export function deliveryExitCode(delivery) { return (delivery?.state ?? delivery?.terminalState) === "completed_merged" && delivery?.completionContractVersion >= 2 && Boolean(delivery?.publish?.acceptanceReportId) ? 0 : 1; }
+export function deliveryExitCode(delivery) {
+  const state = delivery?.state ?? delivery?.terminalState;
+  const accepted = delivery?.completionContractVersion >= 2 && Boolean(delivery?.publish?.acceptanceReportId);
+  const merged = state === "completed_merged" && accepted;
+  const localCandidate = state === "completed_candidate_ready" && accepted && delivery?.publish?.localCandidate === true && delivery?.publish?.remoteEnabled === false && Boolean(delivery?.candidate?.sha ?? delivery?.publish?.candidate?.sha);
+  return merged || localCandidate ? 0 : 1;
+}
 
 export function deliveryFinalSummary(router, delivery) {
   const snapshot = router.statusSnapshot(); const tasks = snapshot.tasks ?? []; const count = (status) => tasks.filter((task) => task.status === status).length; const publish = delivery.publish ?? snapshot.deliveryRun?.publish ?? {};
